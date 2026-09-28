@@ -1,10 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-const destination = join(
-  import.meta.dir,
-  '../packages/cli-plugin-platform/dist/assets/sqlite',
-);
+const destination = join(import.meta.dir, '../packages/cli-plugin-platform/dist/assets/sqlite');
 const source =
   process.env.DI_FRAMEWORK_SQLITE_DIST ??
   join(import.meta.dir, '../../platform/platform/sqlite-component/dist');
