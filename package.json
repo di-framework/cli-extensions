@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "postinstall": "git config core.hooksPath .githooks",
-    "build": "bun --filter @di-framework/cli-plugin-platform build",
+    "build": "bun --filter './packages/*' build",
     "test": "bun run build && bun test",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",

@@ -46,7 +46,7 @@ jobs:
           fi
 
       - name: Test
-        run: bun test --coverage ./packages/cli-plugin-platform ./tests ./scripts
+        run: bun test --coverage ./packages/cli-plugin-platform ./packages/cli-plugin-ai ./tests ./scripts
 
       - uses: actions/setup-node@v7
         with:

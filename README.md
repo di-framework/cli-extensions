@@ -2,7 +2,7 @@
 
 Installable `di-framework` command groups.
 
-First-party plugin: `@di-framework/cli-plugin-platform` (`di-framework extensions install platform`).
+First-party plugins: `@di-framework/cli-plugin-platform` (`di-framework extensions install platform`) and `@di-framework/cli-plugin-ai` (`di-framework extensions install ai`).
 
 Community plugins use `di-framework-cli-plugin-<name>` (unscoped or `@scope/di-framework-cli-plugin-<name>`).
 
