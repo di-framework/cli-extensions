@@ -1,0 +1,10 @@
+package local:p3-canary@0.1.0;
+
+interface store {
+  put: async func(key: string, value: stream<u8>) -> result<_, string>;
+}
+
+world application {
+  import store;
+  export probe: async func() -> string;
+}

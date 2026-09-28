@@ -1,0 +1,26 @@
+// Pinned from wasmCloud/wasmCloud 68ebece9c537f8bb4b5c9999f274ec68d60f35a9:
+// crates/wash-runtime/tests/fixtures/p3-wit-deps/wasi-tls-0.3.0-draft/{world,types,client}.wit
+package wasi:tls@0.3.0-draft;
+
+interface types {
+    resource error {
+        to-debug-string: func() -> string;
+    }
+}
+
+interface client {
+    use types.{error};
+
+    resource connector {
+        constructor();
+
+        /// Encrypt application data. Closing cleartext emits close_notify.
+        send: func(cleartext: stream<u8>) -> tuple<stream<u8>, future<result<_, error>>>;
+
+        /// Decrypt network data.
+        receive: func(ciphertext: stream<u8>) -> tuple<stream<u8>, future<result<_, error>>>;
+
+        /// Both stream transforms must be established before the handshake.
+        connect: static async func(this: connector, server-name: string) -> result<_, error>;
+    }
+}

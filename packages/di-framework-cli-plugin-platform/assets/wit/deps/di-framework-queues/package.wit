@@ -1,0 +1,18 @@
+package di-framework:queues@0.1.0;
+
+interface dispatch {
+  record job {
+    id: string,
+    queue: string,
+    payload: string,
+    attempt: u32,
+    created-at: s64,
+  }
+
+  /// Dispatch a job payload to the worker handler.
+  dispatch: async func(job: job) -> result<_, string>;
+}
+
+world worker {
+  export dispatch;
+}

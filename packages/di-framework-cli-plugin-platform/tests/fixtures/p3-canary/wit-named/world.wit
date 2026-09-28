@@ -1,0 +1,11 @@
+package local:p3-canary@0.1.0;
+
+interface store {
+  open: func(name: string) -> string;
+}
+
+world application {
+  import cache: store;
+  import durable: store;
+  export probe: async func() -> string;
+}

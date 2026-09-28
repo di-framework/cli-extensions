@@ -1,16 +1,69 @@
 {
-  "name": "@di-framework/di-framework-cli-plugin-platform",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@di-framework/cli-plugin-platform",
+  "version": "6.0.0",
+  "description": "di-framework CLI extension that builds, serves, and deploys DI Framework apps as platform WebAssembly components.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "module": "./dist/index.js",
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
-  "description": "Stub. Source lands in the v6 extract.",
+  "author": "@di-framework Contributors",
   "repository": {
     "type": "git",
     "url": "https://github.com/di-framework/cli-extensions",
     "directory": "packages/di-framework-cli-plugin-platform"
   },
+  "bugs": {
+    "url": "https://github.com/di-framework/cli-extensions/issues"
+  },
+  "homepage": "https://github.com/di-framework/cli-extensions",
+  "keywords": [
+    "cli-plugin-platform",
+    "wasmcloud",
+    "webassembly",
+    "wasi",
+    "component-model",
+    "cli-extension",
+    "di-framework"
+  ],
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "build": "rm -rf dist && bun x tsc -p tsconfig.dist.json && bun build assets/http-adapter.ts --outfile dist/assets/http-adapter.js --packages bundle --external 'wasi:*' --external 'wasmcloud:*' --external 'di-framework:*' --external '@di-framework/actors' --external '@di-framework/actors/portable' --external '@di-framework/repo' --external '@di-framework/repo/portable' --external '@di-framework/queues' --external '@di-framework/queues/portable' --external 'virtual:di-framework-application' --external 'virtual:di-framework-wasmcloud-guests' --external 'virtual:di-framework-wasmcloud-actors' --external 'virtual:di-framework-wasmcloud-cron' --external 'virtual:di-framework-wasmcloud-queues' --external 'virtual:di-framework-wasmcloud-runtime' && bun build assets/queue-adapter.ts --outfile dist/assets/queue-adapter.js --packages bundle --external 'wasi:*' --external 'wasmcloud:*' --external 'di-framework:*' --external '@di-framework/actors' --external '@di-framework/actors/portable' --external 'virtual:di-framework-application' --external 'virtual:di-framework-wasmcloud-guests' --external 'virtual:di-framework-wasmcloud-actors' && cp -R assets/wit dist/assets/wit && cp -R assets/platform dist/assets/platform && bun ../../scripts/copy-sqlite-asset.ts && bun ../../scripts/fix-esm-imports.ts dist"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@bytecodealliance/jco": "1.33.0",
+    "@di-framework/cli-extension": "^5",
+    "@di-framework/componentize-qjs": "0.4.4-di.3",
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "rolldown": "1.2.8",
+    "typescript": "^5",
+    "unenv": "2.0.0-rc.24",
+    "@babel/core": "7.29.7",
+    "@babel/plugin-transform-async-to-generator": "7.29.7",
+    "@di-framework/actors": "^5",
+    "@di-framework/platform": "file:../../../platform/platform/platform"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@di-framework/config": "^5",
+    "@di-framework/core": "^5",
+    "@di-framework/bindings": "file:../../../platform/platform/bindings",
+    "@types/babel__core": "^7.20.5"
   }
 }
