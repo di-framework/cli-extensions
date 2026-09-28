@@ -1,6 +1,9 @@
 # dependencies (bun install)
 node_modules
 
+# CI checkout of di-framework/platform, used only to build the sqlite provider
+sqlite-src
+
 # output
 out
 dist
