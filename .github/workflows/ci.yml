@@ -54,4 +54,4 @@ jobs:
         run: bun scripts/publish-workspace.ts --dry-run
 
       - name: Test
-        run: bun test --coverage packages tests scripts
+        run: bun test --coverage ./packages/cli-plugin-platform ./tests ./scripts
