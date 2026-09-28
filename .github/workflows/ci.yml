@@ -12,9 +12,26 @@ jobs:
   build-and-test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      DI_FRAMEWORK_SQLITE_DIST: ${{ github.workspace }}/sqlite-src/platform/sqlite-component/dist
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Checkout SQLite component
+        uses: actions/checkout@v7
+        with:
+          repository: di-framework/platform
+          path: sqlite-src
+
+      - name: Install SQLite build toolchain
+        run: |
+          bash sqlite-src/platform/sqlite-component/scripts/install-tools.sh --rust
+          echo "$GITHUB_WORKSPACE/sqlite-src/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Build SQLite provider
+        working-directory: sqlite-src/platform/sqlite-component
+        run: make build
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
