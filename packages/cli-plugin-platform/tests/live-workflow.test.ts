@@ -49,7 +49,7 @@ liveDescribe('packed blank-workspace live deployment', () => {
         'di-framework-core',
         'di-framework-codegen',
         'di-framework-cli-extension',
-        'di-framework-cli-plugin-platform',
+        'cli-plugin-platform',
         'di-framework-cli',
       ];
       for (const directory of packageDirectories) {

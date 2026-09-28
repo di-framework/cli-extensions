@@ -3,7 +3,7 @@ import { join } from 'node:path';
 
 const destination = join(
   import.meta.dir,
-  '../packages/di-framework-cli-plugin-platform/dist/assets/sqlite',
+  '../packages/cli-plugin-platform/dist/assets/sqlite',
 );
 const source =
   process.env.DI_FRAMEWORK_SQLITE_DIST ??

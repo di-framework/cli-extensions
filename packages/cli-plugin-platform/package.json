@@ -11,7 +11,7 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/di-framework/cli-extensions",
-    "directory": "packages/di-framework-cli-plugin-platform"
+    "directory": "packages/cli-plugin-platform"
   },
   "bugs": {
     "url": "https://github.com/di-framework/cli-extensions/issues"

@@ -288,7 +288,7 @@ The opt-in test packs the CLI and extension dependencies, installs those tarball
 temporary workspace, and runs the full platform/application lifecycle against Docker:
 
 ```sh
-DI_FRAMEWORK_WASMCLOUD_LIVE=1 bun test packages/di-framework-cli-plugin-platform/tests/live-workflow.test.ts
+DI_FRAMEWORK_WASMCLOUD_LIVE=1 bun test packages/cli-plugin-platform/tests/live-workflow.test.ts
 ```
 
 It requires Docker, Pulumi, kubectl, ORAS, npm, Bun, and curl. The test selects unused loopback
