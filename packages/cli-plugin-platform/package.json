@@ -51,7 +51,7 @@
     "@babel/core": "7.29.7",
     "@babel/plugin-transform-async-to-generator": "7.29.7",
     "@di-framework/actors": "^5",
-    "@di-framework/platform": "file:../../../platform/platform/platform"
+    "@di-framework/platform": "^6"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -63,7 +63,7 @@
   "devDependencies": {
     "@di-framework/config": "^5",
     "@di-framework/core": "^5",
-    "@di-framework/bindings": "file:../../../platform/platform/bindings",
+    "@di-framework/bindings": "^6",
     "@types/babel__core": "^7.20.5"
   }
 }
