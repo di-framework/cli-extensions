@@ -147,14 +147,14 @@ describe('service argument parsing', () => {
   });
 
   it('parses get/delete name args and list connection flags', () => {
-    expect(
-      parseServiceNameArgs(['stock', '--target=development'], 'platform service get'),
-    ).toEqual({
-      name: 'stock',
-      target: 'development',
-      namespace: undefined,
-      context: undefined,
-    });
+    expect(parseServiceNameArgs(['stock', '--target=development'], 'platform service get')).toEqual(
+      {
+        name: 'stock',
+        target: 'development',
+        namespace: undefined,
+        context: undefined,
+      },
+    );
     expect(parseServiceListArgs(['--namespace=tenant-a', '--context=user'])).toEqual({
       target: undefined,
       namespace: 'tenant-a',

@@ -55,11 +55,7 @@ describe('parsePlatformCommandArgs', () => {
       target: 'local',
       yes: true,
     });
-    expectFailure(
-      () => parsePlatformCommandArgs([], 'platform cluster up'),
-      'INVALID_USAGE',
-      2,
-    );
+    expectFailure(() => parsePlatformCommandArgs([], 'platform cluster up'), 'INVALID_USAGE', 2);
     expectFailure(
       () => parsePlatformCommandArgs(['local', 'extra'], 'platform cluster up'),
       'INVALID_USAGE',
