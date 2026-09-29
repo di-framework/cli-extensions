@@ -228,7 +228,12 @@ function repeated(options: ParsedOptions, option: string): readonly string[] | u
 
 function numeric(options: ParsedOptions, option: string): number | undefined {
   const raw = value(options, option);
-  return raw == null ? undefined : Number(raw);
+  if (raw == null) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    invalidUsage(`Invalid numeric value for ${option}: ${raw}`, option);
+  }
+  return parsed;
 }
 
 function resultPresentation(result: object, text: string, exitCode: 0 | 1 = 0): CommandResult {

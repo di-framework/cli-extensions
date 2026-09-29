@@ -348,6 +348,34 @@ describe('skills index CLI commands', () => {
     );
   });
 
+  it('rejects non-numeric option values before delegation', async () => {
+    const api = operations({
+      buildSkillsIndex: async () => {
+        throw new Error('build should not be called');
+      },
+      querySkillsIndex: async () => {
+        throw new Error('query should not be called');
+      },
+    });
+    const cases = [
+      ['build', ['--threshold', 'abc']],
+      ['build', ['--limit', 'x']],
+      ['build', ['--batch-size', 'nope']],
+      ['build', ['--chunk-tokens', 'foo']],
+      ['build', ['--chunk-overlap', 'bar']],
+      ['query', ['--query', 'review', '--limit', 'x']],
+      ['query', ['--query', 'review', '--min-score', 'bad']],
+      ['query', ['--query', 'review', '--abstention-threshold', 'bad']],
+    ] as const;
+    for (const [command, args] of cases) {
+      await expect(runSkillsIndexCommand(command, args, api)).rejects.toMatchObject({
+        code: 'INVALID_USAGE',
+        exitCode: 2,
+        message: `Invalid numeric value for ${args[args.length - 2]}: ${args[args.length - 1]}`,
+      });
+    }
+  });
+
   it('rejects unknown, missing, and duplicate options before delegation', async () => {
     const api = operations();
     await expect(runSkillsIndexCommand('inspect', ['extra'], api)).rejects.toMatchObject({
