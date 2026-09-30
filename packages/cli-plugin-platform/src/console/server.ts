@@ -114,6 +114,10 @@ export function startConsoleServer(options: ConsoleServerOptions): Promise<Conso
         url: `http://${options.host}:${port}`,
         close: () =>
           new Promise((done, fail) => {
+            if (!server.listening) {
+              done();
+              return;
+            }
             server.close((error) => (error ? fail(error) : done()));
           }),
       });
@@ -253,6 +257,7 @@ async function routeApi(
 
   if (url.pathname === '/api/services' && method === 'GET') {
     const target = requiredQueryTarget(url);
+    assertKnownTarget(options, target);
     sendJson(response, 200, { target, services: await options.services.list(target) });
     return;
   }

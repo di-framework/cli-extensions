@@ -114,10 +114,7 @@ function toView(service: Record<string, JsonValue | undefined>, target: string):
 }
 
 function record(value: JsonValue | undefined): Record<string, JsonValue | undefined> {
-  if (value === null || value === undefined || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-  return value;
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
 function readServices(value: JsonValue | undefined): Array<Record<string, JsonValue | undefined>> {
