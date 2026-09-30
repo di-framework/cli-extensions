@@ -268,16 +268,21 @@ For the selected project the extension:
 
 ## Console
 
-`di-framework platform console` serves a local operator console for every target in
-`di-framework.deploy.toml`. It lists deployed workloads, readiness, host interfaces, schedules,
-queue runtime settings, and backing services. You can change replica count, queue concurrency and
-retry settings that are already declared on a workload, allowed DNS lookups, cron suspension, and
-backing services. It does not show control tokens, secret values, or kubeconfig contents.
+`di-framework platform console` serves a local control panel for one tenant. It uses that
+target’s kubeconfig, namespace, and host group — the same credential a tenant already uses to
+deploy — and does not open other targets. It lists that tenant’s workloads, readiness, host
+interfaces, schedules, queue runtime settings, and backing services. You can change replica count,
+queue concurrency and retry settings that are already declared on a workload, allowed DNS lookups,
+cron suspension, and backing services. It does not show control tokens, secret values, or kubeconfig
+contents.
 
 ```bash
-di-framework platform console
-di-framework platform console --host 127.0.0.1 --port 8787
+di-framework platform console --target warehouse
+di-framework platform console --target warehouse --host 127.0.0.1 --port 8787
 ```
+
+`--target` defaults to `default-target`. The target must be a tenant target (`kubeconfig`,
+`namespace`, and `hostgroup`), not the platform admin credential.
 
 The console binds to loopback unless you choose another specific host. Set `DI_CONSOLE_PASSWORD`
 (12 to 200 characters) before using a non-loopback host. On loopback, a one-time password is printed

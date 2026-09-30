@@ -147,18 +147,16 @@ export function App(): JSX.Element {
 function Shell({ onSignedOut }: { onSignedOut: () => void }): JSX.Element {
   const [section, setSection] = useState<Section>('apps');
   const [targets, setTargets] = useState<TargetView[]>([]);
-  const [target, setTarget] = useState('');
   const [error, setError] = useState<string | undefined>();
 
   useEffect(() => {
     void loadTargets()
-      .then((result) => {
-        setTargets(result.targets);
-        const preferred = result.targets.find((entry) => entry.default) ?? result.targets[0];
-        if (preferred !== undefined) setTarget(preferred.name);
-      })
+      .then((result) => setTargets(result.targets))
       .catch((reason: unknown) => setError(message(reason)));
   }, []);
+
+  const tenant = targets[0];
+  const target = tenant?.name ?? '';
 
   async function signOut() {
     try {
@@ -185,20 +183,15 @@ function Shell({ onSignedOut }: { onSignedOut: () => void }): JSX.Element {
         <Toolbar>
           <ToolbarContent>
             <ToolbarItem>
-              <FormSelect
-                aria-label="Deployment target"
-                value={target}
-                onChange={(_event, value) => setTarget(value)}
-              >
-                {targets.map((entry) => (
-                  <FormSelectOption
-                    key={entry.name}
-                    value={entry.name}
-                    label={`${entry.name} (${entry.kind})`}
-                  />
-                ))}
-              </FormSelect>
+              <Label color="blue" id="console-tenant">
+                {tenant?.namespace ?? 'Tenant'}
+              </Label>
             </ToolbarItem>
+            {tenant?.hostgroup !== undefined ? (
+              <ToolbarItem>
+                <Label id="console-hostgroup">{tenant.hostgroup}</Label>
+              </ToolbarItem>
+            ) : null}
             <ToolbarItem>
               <Button variant="secondary" onClick={() => void signOut()}>
                 Sign out
@@ -244,14 +237,15 @@ function Shell({ onSignedOut }: { onSignedOut: () => void }): JSX.Element {
     >
       <PageSection>
         {error !== undefined ? (
-          <Alert variant="danger" title="Could not load deployment targets" isInline>
+          <Alert variant="danger" title="Could not load the tenant" isInline>
             {error}
           </Alert>
         ) : null}
         {target.length === 0 ? (
-          <EmptyState titleText="No deployment targets" headingLevel="h2">
+          <EmptyState titleText="No tenant credential" headingLevel="h2">
             <EmptyStateBody>
-              Add a target to di-framework.deploy.toml, then refresh this page.
+              Start the console with a tenant target. That target’s kubeconfig, namespace, and host
+              group are the only credentials this console uses.
             </EmptyStateBody>
           </EmptyState>
         ) : section === 'apps' ? (
@@ -360,8 +354,8 @@ function Applications({ target, targets }: { target: string; targets: TargetView
         <EmptyState titleText="No deployed applications" headingLevel="h2">
           <EmptyStateBody>
             Deploy an application with <code>di-framework platform deploy</code>. The console lists
-            workloads on{' '}
-            {targets.find((entry) => entry.name === target)?.namespace ?? 'the selected target'}.
+            workloads in{' '}
+            {targets.find((entry) => entry.name === target)?.namespace ?? 'this tenant'}.
           </EmptyStateBody>
         </EmptyState>
       ) : null}

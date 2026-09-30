@@ -58,11 +58,12 @@ di-framework platform cluster init            # generate deploy/platform and a l
 di-framework platform cluster up local --yes  # provision the platform
 di-framework platform deploy greeter --target local
 curl -H 'Host: greeter' http://127.0.0.1:28180/
-di-framework platform console                 # observe and configure deployed apps
+di-framework platform console --target warehouse
 ```
 
-`di-framework platform console` opens a PatternFly console on `127.0.0.1:8787` for the targets in
-the deployment manifest. The generated `di-framework.deploy.toml` describes deployment targets. Named
+`di-framework platform console` opens a PatternFly console on `127.0.0.1:8787` for one tenant
+target. It uses that target’s kubeconfig, namespace, and host group. The generated
+`di-framework.deploy.toml` describes deployment targets. Named
 projects are discovered by their configured `name` within the workspace. The
 HTTP example uses the generated platform's default port.
 

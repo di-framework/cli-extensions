@@ -8,6 +8,7 @@ import { createSessionStore, readCookie, sessionCookie } from '../src/console/au
 import {
   assertResourceName,
   type CronJobDocument,
+  cronInTenantScope,
   isSensitiveConfigKey,
   listTargetViews,
   parseAppUpdate,
@@ -21,6 +22,7 @@ import {
   summarizeWorkload,
   unassignedCronJobs,
   type WorkloadDocument,
+  workloadInTenantScope,
 } from '../src/console/catalog';
 import { createKubectlConsoleCluster } from '../src/console/cluster';
 import { sanitizePublicText } from '../src/console/errors';
@@ -139,7 +141,7 @@ describe('console branches', () => {
 
     const manifest = parseDeployManifest(
       '/workspace/di-framework.deploy.toml',
-      `default-target = "local"\n[targets.local]\nplatform = "deploy/platform"\nstack = "dev"\n[targets.edge]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "wasmcloud"\nregistry = "registry.example.com/team"\n`,
+      `default-target = "local"\n[targets.local]\nplatform = "deploy/platform"\nstack = "dev"\n[targets.edge]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
       {},
     );
     expect(listTargetViews(manifest).map((target) => target.kind)).toEqual(['external', 'managed']);
@@ -171,6 +173,31 @@ describe('console branches', () => {
       }),
     ).toBe(true);
     expect(storagePinsReplicas({})).toBe(false);
+    expect(
+      workloadInTenantScope(
+        { metadata: { namespace: 'di-tenant-other' } },
+        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
+      ),
+    ).toBe(false);
+    expect(
+      workloadInTenantScope(
+        {
+          metadata: { namespace: 'di-tenant-warehouse' },
+          spec: { template: { spec: { hostSelector: { hostgroup: 'other' } } } },
+        },
+        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
+      ),
+    ).toBe(false);
+    expect(
+      workloadInTenantScope(
+        { metadata: { namespace: 'di-tenant-warehouse' } },
+        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
+      ),
+    ).toBe(true);
+    expect(
+      cronInTenantScope({ metadata: { namespace: 'di-tenant-other' } }, 'di-tenant-warehouse'),
+    ).toBe(false);
+    expect(cronInTenantScope({}, 'di-tenant-warehouse')).toBe(true);
 
     const bare: WorkloadDocument = {
       metadata: {
@@ -378,7 +405,7 @@ describe('console branches', () => {
 
   it('reads backing services through the service commands', async () => {
     const workspace = makeWorkspace({
-      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nregistry = "registry.example.com/team"\n`,
+      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
     });
     const listed = JSON.stringify({
       items: [
@@ -449,7 +476,7 @@ describe('console branches', () => {
 
   it('serves the remaining console routes and rejects bad requests', async () => {
     const workspace = makeWorkspace({
-      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nregistry = "registry.example.com/team"\n[targets.other]\nkubeconfig = "\${kubeconfig}"\nnamespace = "other"\nregistry = "registry.example.com/team"\n`,
+      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n[targets.other]\nkubeconfig = "\${kubeconfig}"\nnamespace = "other"\nregistry = "registry.example.com/team"\n`,
     });
     const assets = mkdtempSync(join(tmpdir(), 'console-assets-'));
     writeFileSync(join(assets, 'index.html'), '<!doctype html><title>console</title>');
@@ -466,6 +493,7 @@ describe('console branches', () => {
     const defaults = await startConsoleServer({
       host: '127.0.0.1',
       port: 0,
+      target: 'development',
       password: 'correct horse battery',
       assetsDirectory: assets,
       deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
@@ -475,6 +503,7 @@ describe('console branches', () => {
     const server = await startConsoleServer({
       host: '127.0.0.1',
       port: 0,
+      target: 'development',
       password: 'correct horse battery',
       assetsDirectory: assets,
       deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
@@ -559,6 +588,7 @@ describe('console branches', () => {
       const broken = await startConsoleServer({
         host: '127.0.0.1',
         port: 0,
+        target: 'development',
         password: 'correct horse battery',
         assetsDirectory: null as unknown as string,
         deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
@@ -601,6 +631,7 @@ describe('console branches', () => {
       const missingPage = await startConsoleServer({
         host: '127.0.0.1',
         port: 0,
+        target: 'development',
         password: 'correct horse battery',
         assetsDirectory: emptyAssets,
         deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
@@ -688,6 +719,7 @@ describe('console branches', () => {
       const fresh = await startConsoleServer({
         host: '127.0.0.1',
         port: 0,
+        target: 'development',
         password: 'correct horse battery',
         assetsDirectory: assets,
         deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
@@ -992,7 +1024,10 @@ describe('console branches', () => {
       expect((await request(fresh.port, { path: '/api/nope', headers: auth })).status).toBe(404);
       failList = true;
       expect(
-        (await request(fresh.port, { path: '/api/apps?target=other', headers: auth })).body,
+        (await request(fresh.port, { path: '/api/apps?target=other', headers: auth })).status,
+      ).toBe(404);
+      expect(
+        (await request(fresh.port, { path: '/api/apps?target=development', headers: auth })).body,
       ).toContain('cluster request failed');
       expect(
         (await request(fresh.port, { path: '/api/logout', method: 'POST', headers: auth })).status,
@@ -1024,7 +1059,7 @@ describe('console branches', () => {
     expect(consoleAssetsDirectory()).toContain('console-ui');
 
     const workspace = makeWorkspace({
-      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nregistry = "registry.example.com/team"\n`,
+      manifest: `default-target = "development"\n[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
     });
     const bundle = join(import.meta.dir, '../dist/console-ui');
     mkdirSync(bundle, { recursive: true });
@@ -1050,6 +1085,8 @@ describe('console branches', () => {
     const stopped = await running;
     expect(stopped.text).toContain('Console stopped');
     expect(captured.stdout.join('')).toContain('DI_CONSOLE_PASSWORD');
+    expect(captured.stdout.join('')).toContain('namespace wasmcloud');
+    expect(captured.stdout.join('')).toContain('tenant-development');
 
     const generated = captureIo();
     const again = runWasmcloudConsole(

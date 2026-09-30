@@ -11,9 +11,10 @@ import {
   type WorkloadDocument,
 } from '../src/console/catalog';
 import type { ConsoleCluster } from '../src/console/cluster';
-import { consolePassword, parseConsoleArgs } from '../src/console/run';
+import { consolePassword, parseConsoleArgs, selectConsoleTenant } from '../src/console/run';
 import { startConsoleServer } from '../src/console/server';
 import type { ConsoleServices, ServiceCreateInput } from '../src/console/services';
+import { parseDeployManifest } from '../src/manifest';
 import { fakeDeps, makeWorkspace } from './helpers';
 
 const SECRET = 'super-secret-token-value';
@@ -196,6 +197,10 @@ describe('console catalog', () => {
 describe('console command options', () => {
   it('defaults to loopback and requires a password off-loopback', () => {
     expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 8787 });
+    expect(parseConsoleArgs(['--target', 'warehouse'])).toMatchObject({ target: 'warehouse' });
+    expect(() => parseConsoleArgs(['--target', 'warehouse', '--target', 'other'])).toThrow(
+      CommandFailure,
+    );
     expect(() => parseConsoleArgs(['--host', '0.0.0.0'])).toThrow(CommandFailure);
     expect(() => parseConsoleArgs(['--port', '0'])).toThrow(CommandFailure);
     const generated = consolePassword({}, '127.0.0.1');
@@ -206,6 +211,20 @@ describe('console command options', () => {
       password: 'correct horse battery',
       generated: false,
     });
+    const tenant = parseDeployManifest(
+      '/workspace/di-framework.deploy.toml',
+      `default-target = "local"\n[targets.local]\nplatform = "deploy/platform"\n[targets.warehouse]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "di-tenant-warehouse"\nhostgroup = "tenant-warehouse"\nregistry = "registry.example.com/warehouse"\n`,
+      {},
+    );
+    expect(selectConsoleTenant(tenant, 'warehouse').namespace).toBe('di-tenant-warehouse');
+    expect(() => selectConsoleTenant(tenant, 'local')).toThrow('tenant kubeconfig');
+    expect(() => selectConsoleTenant(tenant, undefined)).toThrow('tenant kubeconfig');
+    const unscoped = parseDeployManifest(
+      '/workspace/di-framework.deploy.toml',
+      `[targets.edge]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "wasmcloud"\nregistry = "registry.example.com/team"\n`,
+      {},
+    );
+    expect(() => selectConsoleTenant(unscoped, 'edge')).toThrow('tenant kubeconfig');
   });
 });
 
@@ -218,10 +237,28 @@ describe('console server', () => {
 kubeconfig = "\${kubeconfig}"
 context = "team-development"
 namespace = "wasmcloud"
+hostgroup = "storage"
 registry = "https://user:${SECRET}@registry.example.com/team"
 `,
     });
-    const documents = [workload()];
+    const documents = [
+      workload(),
+      {
+        metadata: {
+          name: 'other-tenant-app',
+          namespace: 'di-tenant-other',
+          labels: { 'app.kubernetes.io/managed-by': 'di-framework' },
+        },
+        spec: {
+          template: {
+            spec: {
+              hostSelector: { hostgroup: 'tenant-other' },
+              components: [{ name: 'other-tenant-app' }],
+            },
+          },
+        },
+      },
+    ];
     const cronJobs = [
       {
         metadata: {
@@ -303,6 +340,7 @@ registry = "https://user:${SECRET}@registry.example.com/team"
     const server = await startConsoleServer({
       host: '127.0.0.1',
       port: 0,
+      target: 'development',
       password: 'correct horse battery',
       assetsDirectory: assets(),
       deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
@@ -354,6 +392,7 @@ registry = "https://user:${SECRET}@registry.example.com/team"
       });
       expect(listed.status).toBe(200);
       expect(listed.body).toContain('greeter');
+      expect(listed.body).not.toContain('other-tenant-app');
       expect(listed.body).not.toContain(SECRET);
       expect(listed.body).not.toContain('greeter-control');
 

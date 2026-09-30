@@ -4,6 +4,7 @@ export type TargetView = {
   default: boolean;
   namespace?: string;
   context?: string;
+  hostgroup?: string;
   stack?: string;
   platform?: string;
   registryHost?: string;

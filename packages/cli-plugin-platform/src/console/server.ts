@@ -20,6 +20,7 @@ import {
 import {
   assertResourceName,
   type CronJobDocument,
+  cronInTenantScope,
   listTargetViews,
   parseAppUpdate,
   parseCronUpdate,
@@ -28,6 +29,7 @@ import {
   summarizeWorkload,
   unassignedCronJobs,
   type WorkloadDocument,
+  workloadInTenantScope,
 } from './catalog';
 import { type ConsoleCluster, createKubectlConsoleCluster } from './cluster';
 import { ConsoleError, sanitizePublicText } from './errors';
@@ -63,6 +65,8 @@ export type ConsoleServerOptions = {
   host: string;
   port: number;
   password: string;
+  /** Deployment target whose kubeconfig, namespace, and host group are the tenant credential. */
+  target: string;
   deps: WasmcloudDeps;
   assetsDirectory: string;
   io?: CliIo;
@@ -224,7 +228,11 @@ async function routeApi(
     return;
   }
   if (method === 'GET' && url.pathname === '/api/targets') {
-    sendJson(response, 200, { targets: listTargetViews(loadManifest(options)) });
+    const manifest = loadManifest(options);
+    assertTenantTarget(options, options.target);
+    sendJson(response, 200, {
+      targets: listTargetViews(manifest).filter((view) => view.name === options.target),
+    });
     return;
   }
   if (method === 'GET' && url.pathname === '/api/apps') {
@@ -257,19 +265,19 @@ async function routeApi(
 
   if (url.pathname === '/api/services' && method === 'GET') {
     const target = requiredQueryTarget(url);
-    assertKnownTarget(options, target);
+    assertTenantTarget(options, target);
     sendJson(response, 200, { target, services: await options.services.list(target) });
     return;
   }
   if (url.pathname === '/api/services' && method === 'POST') {
     const input = parseServiceCreate(await readBody(request));
-    assertKnownTarget(options, input.target);
+    assertTenantTarget(options, input.target);
     sendJson(response, 201, { service: await options.services.create(input) });
     return;
   }
   if (url.pathname === '/api/service-classes' && method === 'GET') {
     const target = requiredQueryTarget(url);
-    assertKnownTarget(options, target);
+    assertTenantTarget(options, target);
     sendJson(response, 200, await options.services.classes(target));
     return;
   }
@@ -283,7 +291,7 @@ async function routeApi(
       );
     }
     const target = requiredQueryTarget(url);
-    assertKnownTarget(options, target);
+    assertTenantTarget(options, target);
     sendJson(response, 200, await options.services.delete(target, serviceName));
     return;
   }
@@ -324,9 +332,7 @@ async function listApps(
   options: HandlerOptions,
   target: string | undefined,
 ): Promise<{ results: TargetGroup[] }> {
-  const manifest = loadManifest(options);
-  const names =
-    target === undefined ? Object.keys(manifest.targets) : [assertKnownTarget(options, target)];
+  const names = [assertTenantTarget(options, target ?? options.target)];
   const results: TargetGroup[] = [];
   for (const name of names) {
     try {
@@ -347,6 +353,7 @@ async function listApps(
 }
 
 async function oneApp(options: HandlerOptions, target: string, name: string) {
+  assertTenantTarget(options, target);
   const loaded = await loadTarget(options, target);
   const app = loaded.apps.find((entry) => entry?.name === name);
   if (app === undefined)
@@ -363,7 +370,7 @@ async function updateApp(
   name: string,
   update: ReturnType<typeof parseAppUpdate>,
 ) {
-  assertKnownTarget(options, update.target);
+  assertTenantTarget(options, update.target);
   const loaded = await loadTarget(options, update.target);
   const document = loaded.documents.find((entry) => entry.metadata?.name === name);
   if (document === undefined) {
@@ -391,7 +398,7 @@ async function updateCron(
   name: string,
   update: { target: string; suspend: boolean },
 ) {
-  assertKnownTarget(options, update.target);
+  assertTenantTarget(options, update.target);
   const loaded = await loadTarget(options, update.target);
   const cron = loaded.cronJobs.map(summarizeCron).find((entry) => entry?.name === name);
   if (cron === undefined)
@@ -404,10 +411,14 @@ async function updateCron(
 
 async function loadTarget(options: HandlerOptions, target: string) {
   const connection = await connectionFor(options, target);
-  const [documents, cronJobs] = await Promise.all([
+  const [listedDocuments, listedCronJobs] = await Promise.all([
     options.cluster.listWorkloads(connection),
     options.cluster.listCronJobs(connection),
   ]);
+  const documents = listedDocuments.filter((document) =>
+    workloadInTenantScope(document, connection),
+  );
+  const cronJobs = listedCronJobs.filter((job) => cronInTenantScope(job, connection.namespace));
   const apps = documents
     .map((document) => summarizeWorkload(document, target, cronJobs))
     .filter((app): app is NonNullable<typeof app> => app !== undefined)
@@ -439,10 +450,11 @@ function loadManifest(options: HandlerOptions) {
   return loadDeployManifest(options.deps.cwd(), options.deps.env);
 }
 
-function assertKnownTarget(options: HandlerOptions, target: string): string {
-  const manifest = loadManifest(options);
-  if (manifest.targets[target] === undefined) {
-    throw new ConsoleError(404, 'TARGET_NOT_FOUND', 'Unknown deployment target.');
+function assertTenantTarget(options: HandlerOptions, target: string): string {
+  const selected = loadManifest(options).targets[target];
+  const tenant = selected?.kind === 'external' && selected.hostgroup !== undefined;
+  if (target !== options.target || !tenant) {
+    throw new ConsoleError(404, 'TENANT_SCOPE', 'This console is scoped to one tenant.');
   }
   return target;
 }

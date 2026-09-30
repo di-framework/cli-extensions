@@ -88,9 +88,11 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
       },
       console: {
         description:
-          'Open a local console to observe and configure deployed applications on manifest targets',
-        usage: 'di-framework platform console [--host <address>] [--port <port>]',
+          'Open a local console for one tenant, using that tenant’s kubeconfig, namespace, and host group',
+        usage:
+          'di-framework platform console [--target <tenant>] [--host <address>] [--port <port>]',
         options: [
+          '--target <tenant>  Tenant target (default: default-target). Uses that target’s kubeconfig only',
           '--host <address>  Bind address (default: 127.0.0.1). A non-loopback host requires DI_CONSOLE_PASSWORD',
           '--port <port>  Listen port (default: 8787)',
         ],

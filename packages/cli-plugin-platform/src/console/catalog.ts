@@ -78,6 +78,7 @@ export type TargetView = {
   default: boolean;
   namespace?: string;
   context?: string;
+  hostgroup?: string;
   stack?: string;
   platform?: string;
   registryHost?: string;
@@ -126,7 +127,7 @@ type WorkloadComponent = {
 };
 
 export type CronJobDocument = {
-  metadata?: { name?: string; labels?: Record<string, string> };
+  metadata?: { name?: string; namespace?: string; labels?: Record<string, string> };
   spec?: { schedule?: string; suspend?: boolean; concurrencyPolicy?: string };
 };
 
@@ -175,8 +176,28 @@ function targetView(target: DeployTarget, defaultTarget: string | undefined): Ta
     default: target.name === defaultTarget,
     namespace: target.namespace,
     ...(target.context ? { context: target.context } : {}),
+    ...(target.hostgroup ? { hostgroup: target.hostgroup } : {}),
     registryHost: publicRegistryHost(registry.pull),
   };
+}
+
+/** A tenant credential is one namespace and, when set, one host group. */
+export function workloadInTenantScope(
+  document: WorkloadDocument,
+  scope: { namespace: string; hostgroup?: string },
+): boolean {
+  const namespace = document.metadata?.namespace;
+  if (namespace !== undefined && namespace !== scope.namespace) return false;
+  const hostgroup = document.spec?.template?.spec?.hostSelector?.hostgroup;
+  if (scope.hostgroup !== undefined && hostgroup !== undefined && hostgroup !== scope.hostgroup) {
+    return false;
+  }
+  return true;
+}
+
+export function cronInTenantScope(document: CronJobDocument, namespace: string): boolean {
+  const actual = document.metadata?.namespace;
+  return actual === undefined || actual === namespace;
 }
 
 export function publicRegistryHost(reference: string): string {

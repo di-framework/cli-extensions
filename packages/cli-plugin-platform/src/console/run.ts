@@ -4,13 +4,16 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { type CliIo, CommandFailure, type CommandResult } from '@di-framework/cli-extension';
 import { DEFAULT_DEPS, type WasmcloudDeps } from '../deps';
+import { type DeployManifest, type ExternalTarget, loadDeployManifest } from '../manifest';
 import { invalidUsage, readOptionValue } from '../support';
+import { resolveConnection, resolveTarget } from '../target';
 import { generateConsolePassword } from './auth';
 import { startConsoleServer } from './server';
 
 export type ConsoleOptions = {
   host: string;
   port: number;
+  target?: string;
 };
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -18,6 +21,7 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 export function parseConsoleArgs(args: readonly string[]): ConsoleOptions {
   let host: string | undefined;
   let port: string | undefined;
+  let target: string | undefined;
   for (let position = 0; position < args.length; position++) {
     const token = args[position] ?? '';
     switch (token) {
@@ -28,6 +32,10 @@ export function parseConsoleArgs(args: readonly string[]): ConsoleOptions {
       case '--port':
         if (port !== undefined) invalidUsage(`Option may be provided only once: ${token}`, token);
         port = readOptionValue(args, ++position, token);
+        break;
+      case '--target':
+        if (target !== undefined) invalidUsage(`Option may be provided only once: ${token}`, token);
+        target = readOptionValue(args, ++position, token);
         break;
       default:
         invalidUsage(`Unknown option or argument: ${token}`, token, {
@@ -49,7 +57,24 @@ export function parseConsoleArgs(args: readonly string[]): ConsoleOptions {
       command: 'platform console',
     });
   }
-  return { host: resolvedHost, port: resolvedPort };
+  return { host: resolvedHost, port: resolvedPort, ...(target !== undefined ? { target } : {}) };
+}
+
+/** The console uses one tenant kubeconfig, namespace, and host group. */
+export function selectConsoleTenant(
+  manifest: DeployManifest,
+  requested: string | undefined,
+): ExternalTarget {
+  const target = resolveTarget(manifest, requested);
+  if (target.kind !== 'external' || target.hostgroup === undefined) {
+    throw new CommandFailure(
+      'WASMCLOUD_CONSOLE_TENANT_REQUIRED',
+      `Target "${target.name}" is not a tenant credential. Start the console with the tenant kubeconfig, namespace, and hostgroup.`,
+      2,
+      { target: target.name },
+    );
+  }
+  return target;
 }
 
 export function consolePassword(
@@ -100,15 +125,22 @@ export async function runWasmcloudConsole(
       { directory: assetsDirectory },
     );
   }
+  const manifest = loadDeployManifest(deps.cwd(), deps.env);
+  const tenant = selectConsoleTenant(manifest, options.target);
+  const connection = await resolveConnection(tenant, manifest.workspaceRoot, manifest.path, deps);
   const server = await startConsoleServer({
     host: options.host,
     port: options.port,
     password,
+    target: tenant.name,
     deps,
     assetsDirectory,
     io,
   });
   io.stdout.write(`Console listening on ${server.url}\n`);
+  io.stdout.write(
+    `Scoped to tenant namespace ${connection.namespace} on host group ${connection.hostgroup}.\n`,
+  );
   if (generated) {
     io.stdout.write(
       'Sign in with this one-time password. It is shown once and is not written to the cluster:\n' +
