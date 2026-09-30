@@ -42,6 +42,7 @@ export {
   WASI_HTTP_VERSION,
 } from './build';
 export { createWasmcloudCommand } from './command';
+export { runWasmcloudConsole } from './console/run';
 export {
   runWasmcloudDeploy,
   type WasmcloudDeployData,

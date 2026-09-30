@@ -266,6 +266,27 @@ For the selected project the extension:
 4. Configures `wasi:http/handler@0.3.0` with the project name as its host, applies the resources,
    and waits for current `Ready=True` or compatible older readiness schemas.
 
+## Console
+
+`di-framework platform console` serves a local operator console for every target in
+`di-framework.deploy.toml`. It lists deployed workloads, readiness, host interfaces, schedules,
+queue runtime settings, and backing services. You can change replica count, queue concurrency and
+retry settings that are already declared on a workload, allowed DNS lookups, cron suspension, and
+backing services. It does not show control tokens, secret values, or kubeconfig contents.
+
+```bash
+di-framework platform console
+di-framework platform console --host 127.0.0.1 --port 8787
+```
+
+The console binds to loopback unless you choose another specific host. Set `DI_CONSOLE_PASSWORD`
+(12 to 200 characters) before using a non-loopback host. On loopback, a one-time password is printed
+when that variable is unset. Sign-in uses an HttpOnly session cookie and a per-session token on
+every change. Cluster credentials stay in the console process.
+
+SQLite-backed workloads stay at one replica. Queue settings can be edited only when the workload
+already declares them.
+
 For the generated local platform the result reports the HTTP URL and required Host header. It is
 directly reachable without `kubectl port-forward`, for example:
 

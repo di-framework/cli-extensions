@@ -1,5 +1,6 @@
 import type { CommandNode } from '@di-framework/cli-extension';
 import { runWasmcloudBuild } from './build';
+import { runWasmcloudConsole } from './console/run';
 import { runWasmcloudDeploy } from './deploy';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { runWasmcloudDestroy } from './destroy';
@@ -84,6 +85,16 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
         description: 'Check the project and local toolchain for wasmCloud readiness',
         usage: 'di-framework platform doctor',
         run: ({ args, io }) => runWasmcloudDoctor(args, io, deps),
+      },
+      console: {
+        description:
+          'Open a local console to observe and configure deployed applications on manifest targets',
+        usage: 'di-framework platform console [--host <address>] [--port <port>]',
+        options: [
+          '--host <address>  Bind address (default: 127.0.0.1). A non-loopback host requires DI_CONSOLE_PASSWORD',
+          '--port <port>  Listen port (default: 8787)',
+        ],
+        run: ({ args, io }) => runWasmcloudConsole(args, io, deps),
       },
       service: {
         description:
