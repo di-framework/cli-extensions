@@ -26,6 +26,7 @@ const Route = types.model('Route', {
   host: types.string,
   path: types.string,
   enabled: types.boolean,
+  url: types.maybe(types.string),
 });
 
 const EnvironmentEntry = types.model('EnvironmentEntry', {

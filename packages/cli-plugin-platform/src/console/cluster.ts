@@ -11,6 +11,8 @@ import type { BindingDocument, HostFailure, JsonPatchOp, WorkloadDocument } from
 import { ConsoleError, sanitizePublicText } from './errors';
 
 const BINDING_RESOURCE = 'servicebindings.platform.di-framework.dev';
+/** Published by the platform controller in each tenant namespace (contract C-ROUTES). */
+const ROUTES_CONFIG_MAP = 'di-platform-routes';
 
 export type SignalView = {
   success: number;
@@ -37,6 +39,8 @@ export type ConsoleCluster = {
   canWrite(connection: ClusterConnection): Promise<boolean>;
   readLogs(connection: ClusterConnection, application: string): Promise<string[] | undefined>;
   readSignals(connection: ClusterConnection, application: string): Promise<SignalView | undefined>;
+  /** `data.urlTemplate` of the tenant's `di-platform-routes` ConfigMap, if the platform has one. */
+  readRouteTemplate(connection: ClusterConnection): Promise<string | undefined>;
   /** Host failures by WorkloadDeployment name, from every logs projection in the namespace. */
   readFailures(connection: ClusterConnection): Promise<Map<string, HostFailure>>;
   bindService(connection: ClusterConnection, input: BindInput): Promise<void>;
@@ -145,6 +149,28 @@ export function createKubectlConsoleCluster(
         const compute = series(data.compute);
         return { success, error, ...(compute ? { compute } : {}) };
       });
+    },
+    async readRouteTemplate(connection) {
+      const result = await captureKubectl(
+        deps,
+        connection,
+        ['get', 'configmap', ROUTES_CONFIG_MAP, '-o', 'json'],
+        deps.cwd(),
+      );
+      if (result.exitCode !== 0) {
+        // No ConfigMap means no gateway is known; the console then shows hosts as text.
+        if (/not ?found|forbidden/i.test(result.stderr)) return undefined;
+        log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));
+        return undefined;
+      }
+      try {
+        const template = (JSON.parse(result.stdout) as { data?: { urlTemplate?: unknown } } | null)
+          ?.data?.urlTemplate;
+        return typeof template === 'string' && template.length > 0 ? template : undefined;
+      } catch {
+        log('The route address template could not be read.');
+        return undefined;
+      }
     },
     async readFailures(connection) {
       const result = await captureKubectl(

@@ -11,6 +11,8 @@ export type RouteView = {
   host: string;
   path: string;
   enabled: boolean;
+  /** Gateway address, when the platform publishes one for this tenant. */
+  url?: string;
 };
 
 export type ApplicationSummary = {

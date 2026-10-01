@@ -274,6 +274,43 @@ describe('console branches', () => {
     await expect(malformed.cluster.readFailures(connection)).rejects.toMatchObject({ status: 502 });
   });
 
+  it('reads the route address template', async () => {
+    const published = clusterFrom((args) => {
+      expect(args).toEqual(expect.arrayContaining(['configmap', 'di-platform-routes']));
+      return {
+        stdout: JSON.stringify({
+          data: { urlTemplate: 'http://{host}.development.localhost:28180' },
+        }),
+      };
+    });
+    expect(await published.cluster.readRouteTemplate(connection)).toBe(
+      'http://{host}.development.localhost:28180',
+    );
+    const missing = clusterFrom(() => ({
+      exitCode: 1,
+      stderr: 'Error from server (NotFound): configmaps "di-platform-routes" not found',
+    }));
+    expect(await missing.cluster.readRouteTemplate(connection)).toBeUndefined();
+    expect(missing.logs).toEqual([]);
+    const failed = clusterFrom(() => ({ exitCode: 1, stderr: 'connection timed out' }));
+    expect(await failed.cluster.readRouteTemplate(connection)).toBeUndefined();
+    expect(failed.logs.join('\n')).toContain('timed out');
+    const silent = clusterFrom(() => ({ exitCode: 1 }));
+    expect(await silent.cluster.readRouteTemplate(connection)).toBeUndefined();
+    const malformed = clusterFrom(() => ({ stdout: '{' }));
+    expect(await malformed.cluster.readRouteTemplate(connection)).toBeUndefined();
+    for (const stdout of [
+      'null',
+      '{}',
+      '{"data":{"urlTemplate":""}}',
+      '{"data":{"urlTemplate":3}}',
+    ]) {
+      expect(
+        await clusterFrom(() => ({ stdout })).cluster.readRouteTemplate(connection),
+      ).toBeUndefined();
+    }
+  });
+
   it('reads backing services through the service commands', async () => {
     const workspace = makeWorkspace({
       manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
@@ -383,6 +420,9 @@ describe('console branches', () => {
               status: { readyReplicas: 1 },
             },
           ] as WorkloadDocument[];
+        },
+        async readRouteTemplate() {
+          return 'http://{host}.development.localhost:28180';
         },
         async readFailures() {
           throw new Error('projection list failed');
@@ -867,6 +907,9 @@ function idleCluster(canWrite: ConsoleCluster['canWrite'] = async () => true): C
     },
     async readFailures() {
       return new Map();
+    },
+    async readRouteTemplate() {
+      return undefined;
     },
     async listBindings() {
       return [];
