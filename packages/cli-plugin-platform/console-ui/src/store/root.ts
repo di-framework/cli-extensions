@@ -268,16 +268,16 @@ export const ConsoleStore = types
           (name) => `${enabled ? 'Enabled' : 'Disabled'} route ${label} on ${name}.`,
         );
       },
-      setEnvironment(key: string, value: string) {
+      setEnvironment(key: string, value: string, part: string) {
         return changeApplication(
-          (name) => client.setEnvironment(name, key, value),
-          (name) => `Set ${key} on ${name}.`,
+          (name) => client.setEnvironment(name, key, value, part),
+          (name) => `Set ${key} on ${part} in ${name}.`,
         );
       },
-      deleteEnvironment(key: string) {
+      deleteEnvironment(key: string, part: string) {
         return changeApplication(
-          (name) => client.deleteEnvironment(name, key),
-          (name) => `Removed ${key} from ${name}.`,
+          (name) => client.deleteEnvironment(name, key, part),
+          (name) => `Removed ${key} from ${part} in ${name}.`,
         );
       },
       reassignSecret(secret: string, value: string) {

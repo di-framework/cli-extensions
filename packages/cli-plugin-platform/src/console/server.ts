@@ -304,7 +304,7 @@ async function routeApplication(
     return;
   }
   if (rest.length === 1 && rest[0] === 'environment' && method === 'PUT') {
-    const body = recordBody(await readBody(request), ['key', 'value']);
+    const body = recordBody(await readBody(request), ['key', 'value', 'part']);
     if (typeof body.key !== 'string' || typeof body.value !== 'string') {
       throw new ConsoleError(
         400,
@@ -312,16 +312,25 @@ async function routeApplication(
         'An environment variable needs a name and a value.',
       );
     }
+    if (body.part !== undefined && typeof body.part !== 'string') {
+      throw new ConsoleError(400, 'INVALID_BODY', 'part must be the name of a part.');
+    }
     const loaded = await loadApplications(options);
-    const change = planEnvironmentSet(membersOf(loaded, name), body.key, body.value);
+    const change = planEnvironmentSet(membersOf(loaded, name), body.key, body.value, body.part);
     if (change.ops.length > 0)
       await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
     sendJson(response, 200, { application: await present(options, name) });
     return;
   }
-  if (rest.length === 2 && rest[0] === 'environment' && method === 'DELETE') {
+  // DELETE environment/<key> removes the first match; environment/<part>/<key> names the part.
+  if (
+    (rest.length === 2 || rest.length === 3) &&
+    rest[0] === 'environment' &&
+    method === 'DELETE'
+  ) {
     const loaded = await loadApplications(options);
-    const change = planEnvironmentDelete(membersOf(loaded, name), rest[1] ?? '');
+    const [part, key] = rest.length === 3 ? [rest[1], rest[2]] : [undefined, rest[1]];
+    const change = planEnvironmentDelete(membersOf(loaded, name), key ?? '', part);
     await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
     sendJson(response, 200, { application: await present(options, name) });
     return;

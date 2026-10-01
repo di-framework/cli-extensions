@@ -56,7 +56,8 @@ export type RouteView = {
   enabled: boolean;
 };
 
-export type EnvView = { key: string; value: string };
+/** One variable on one part; the same name can be set on several parts. */
+export type EnvView = { key: string; value: string; part: string };
 export type SecretView = { name: string };
 
 export type BackingBindingView = {
@@ -333,10 +334,12 @@ export function planRouteUpdate(
   return { workload: located.workload, ops };
 }
 
+/** Sets a variable on the named part, or where it is already set, or on the first part. */
 export function planEnvironmentSet(
   documents: readonly WorkloadDocument[],
   key: string,
   value: string,
+  part?: string,
 ): WorkloadChange {
   assertEnvKey(key);
   if (value.length === 0 || value.length > 4096) {
@@ -353,20 +356,29 @@ export function planEnvironmentSet(
       'Add that credential under Secrets. Environment values cannot contain passwords.',
     );
   }
-  const existing = findConfigKey(documents, key);
-  const target = existing ?? firstConfigurable(documents);
+  const locations = partLocations(documents);
+  const target =
+    part !== undefined
+      ? requirePart(locations, part)
+      : (locations.find((entry) => entry.config[key] !== undefined) ?? locations[0]);
   if (target === undefined) {
     throw new ConsoleError(400, 'NOT_CONFIGURABLE', 'This application has no configurable part.');
   }
   return { workload: target.workload, ops: configValueOps(target, key, value) };
 }
 
+/** Removes a variable from the named part, or from the first part that sets it. */
 export function planEnvironmentDelete(
   documents: readonly WorkloadDocument[],
   key: string,
+  part?: string,
 ): WorkloadChange {
   assertEnvKey(key);
-  const existing = findConfigKey(documents, key);
+  const locations = partLocations(documents);
+  const existing =
+    part !== undefined
+      ? requirePart(locations, part)
+      : locations.find((entry) => entry.config[key] !== undefined);
   if (existing === undefined || existing.config[key] === undefined) {
     throw new ConsoleError(404, 'ENV_NOT_FOUND', `No environment variable named ${key}.`);
   }
@@ -390,7 +402,7 @@ export function planSecretReassign(
     throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
   }
   if (match.kind === 'secret') return { secret: name };
-  const located = findConfigKey(documents, name);
+  const located = partLocations(documents).find((entry) => entry.config[name] !== undefined);
   if (located === undefined) {
     throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
   }
@@ -742,20 +754,17 @@ function annotationOps(
 }
 
 function environmentFrom(members: readonly WorkloadDocument[]): EnvView[] {
-  const values = new Map<string, string>();
-  for (const member of members) {
-    for (const config of configs(member)) {
-      for (const key of Object.keys(config).sort()) {
-        const value = config[key] ?? '';
-        if (HIDDEN_CONFIG.test(key) || isSensitiveConfigKey(key) || containsCredential(value))
-          continue;
-        values.set(key, value);
-      }
+  const entries: EnvView[] = [];
+  for (const located of partLocations(members)) {
+    for (const [key, value] of Object.entries(located.config)) {
+      if (HIDDEN_CONFIG.test(key) || isSensitiveConfigKey(key) || containsCredential(value))
+        continue;
+      entries.push({ key, value, part: located.name });
     }
   }
-  return [...values.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => ({ key, value }));
+  return entries.sort(
+    (left, right) => left.key.localeCompare(right.key) || left.part.localeCompare(right.part),
+  );
 }
 
 function secretsFrom(members: readonly WorkloadDocument[]): SecretSource[] {
@@ -884,28 +893,48 @@ function location(workload: string, part: WorkloadPart, pointer: string): Config
   };
 }
 
-function configs(document: WorkloadDocument): Record<string, string>[] {
-  return configLocations(document).map((entry) => entry.config);
-}
+type PartLocation = ConfigLocation & { name: string };
 
-function findConfigKey(
-  documents: readonly WorkloadDocument[],
-  key: string,
-): ConfigLocation | undefined {
-  for (const document of documents) {
-    for (const located of configLocations(document)) {
-      if (located.config[key] !== undefined) return located;
+/**
+ * Config locations named like the Overview parts: members by name, a member's service before its
+ * components, and repeated names numbered the same way.
+ */
+function partLocations(documents: readonly WorkloadDocument[]): PartLocation[] {
+  const members = [...documents].sort((left, right) =>
+    (left.metadata?.name ?? '').localeCompare(right.metadata?.name ?? ''),
+  );
+  const named: PartLocation[] = [];
+  for (const member of members) {
+    const workload = member.metadata?.name;
+    const spec = member.spec?.template?.spec;
+    if (workload === undefined) continue;
+    if (spec?.service !== undefined && typeof spec.service === 'object') {
+      named.push({
+        ...location(workload, spec.service, '/spec/template/spec/service'),
+        name: spec.service.name || workload,
+      });
     }
+    spec?.components?.forEach((component, index) => {
+      named.push({
+        ...location(workload, component, `/spec/template/spec/components/${index}`),
+        name: component.name || 'component',
+      });
+    });
   }
-  return undefined;
+  const seen = new Map<string, number>();
+  return named.map((entry) => {
+    const count = seen.get(entry.name) ?? 0;
+    seen.set(entry.name, count + 1);
+    return count === 0 ? entry : { ...entry, name: `${entry.name}-${count + 1}` };
+  });
 }
 
-function firstConfigurable(documents: readonly WorkloadDocument[]): ConfigLocation | undefined {
-  for (const document of documents) {
-    const located = configLocations(document)[0];
-    if (located !== undefined) return located;
+function requirePart(locations: readonly PartLocation[], part: string): PartLocation {
+  const found = locations.find((entry) => entry.name === part);
+  if (found === undefined) {
+    throw new ConsoleError(404, 'PART_NOT_FOUND', `No part named ${part}.`);
   }
-  return undefined;
+  return found;
 }
 
 function configValueOps(located: ConfigLocation, key: string, value: string): JsonPatchOp[] {

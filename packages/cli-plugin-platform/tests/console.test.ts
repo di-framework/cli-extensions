@@ -314,7 +314,7 @@ describe('console catalog', () => {
     expect(edge?.components).toBe(1);
     expect(edge?.services).toBe(0);
     expect(edge?.ready).toBe(true);
-    expect(edge?.environment).toEqual([{ key: 'COLOR', value: 'blue' }]);
+    expect(edge?.environment).toEqual([{ key: 'COLOR', value: 'blue', part: 'http' }]);
     expect(edge?.secrets.map((entry) => entry.name)).toEqual([
       'API_TOKEN',
       'DATABASE_URL',
@@ -802,6 +802,85 @@ describe('console route changes', () => {
   });
 });
 
+describe('console environment parts', () => {
+  const site = managed('mesh-site', {
+    metadata: { labels: { 'di-framework.dev/workload': 'mesh' } },
+    spec: {
+      template: {
+        spec: {
+          components: [
+            { name: 'mesh-site', localResources: { environment: { config: { MODE: 'site' } } } },
+            { name: 'mesh-site' },
+          ],
+        },
+      },
+    },
+  });
+  const collector = managed('mesh-collector', {
+    metadata: { labels: { 'di-framework.dev/workload': 'mesh' } },
+    spec: {
+      template: {
+        spec: {
+          service: {
+            image: 'collector',
+            localResources: { environment: { config: { MODE: 'c' } } },
+          },
+          components: [{}],
+        },
+      },
+    },
+  });
+
+  it('lists each variable with its part, named like the parts', () => {
+    const [view] = summarizeApplications([site, collector]);
+    expect(view?.parts.map((part) => part.name)).toEqual([
+      'mesh-collector',
+      'component',
+      'mesh-site',
+      'mesh-site-2',
+    ]);
+    expect(view?.environment).toEqual([
+      { key: 'MODE', value: 'c', part: 'mesh-collector' },
+      { key: 'MODE', value: 'site', part: 'mesh-site' },
+    ]);
+  });
+
+  it('sets and removes a variable on the chosen part', () => {
+    expect(planEnvironmentSet([site, collector], 'TOPICS', 'a', 'mesh-site-2')).toEqual({
+      workload: 'mesh-site',
+      ops: [
+        {
+          op: 'add',
+          path: '/spec/template/spec/components/1/localResources',
+          value: { environment: { config: { TOPICS: 'a' } } },
+        },
+      ],
+    });
+    // Without a part a new variable goes to the first part, and an existing one stays where it is.
+    expect(planEnvironmentSet([site, collector], 'TOPICS', 'a').workload).toBe('mesh-collector');
+    expect(planEnvironmentSet([collector, site], 'MODE', 'b').ops[0]?.path).toBe(
+      '/spec/template/spec/service/localResources/environment/config/MODE',
+    );
+    expect(() => planEnvironmentSet([site], 'TOPICS', 'a', 'missing')).toThrow(
+      expect.objectContaining({ status: 404, code: 'PART_NOT_FOUND' }),
+    );
+    expect(planEnvironmentDelete([site, collector], 'MODE', 'mesh-site')).toEqual({
+      workload: 'mesh-site',
+      ops: [
+        {
+          op: 'remove',
+          path: '/spec/template/spec/components/0/localResources/environment/config/MODE',
+        },
+      ],
+    });
+    expect(() => planEnvironmentDelete([site, collector], 'MODE', 'mesh-site-2')).toThrow(
+      'No environment variable',
+    );
+    expect(() => planEnvironmentDelete([site], 'MODE', 'missing')).toThrow('No part');
+    expect(planEnvironmentDelete([managed('nameless'), site], 'MODE').workload).toBe('mesh-site');
+  });
+});
+
 describe('console command options', () => {
   it('binds loopback and requires a tenant credential', () => {
     expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 0 });
@@ -1117,6 +1196,43 @@ registry = "registry.example.com/team"
         body: JSON.stringify({ key: 'COLOR', value: 'green' }),
       });
       expect(env.status).toBe(200);
+      const onPart = await request(server.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: auth,
+        body: JSON.stringify({ key: 'SIZE', value: '2', part: 'http' }),
+      });
+      expect(onPart.status).toBe(200);
+      expect(patches.at(-1)).toEqual({
+        name: 'greeter',
+        ops: [
+          {
+            op: 'add',
+            path: '/spec/template/spec/components/0/localResources/environment/config/SIZE',
+            value: '2',
+          },
+        ],
+      });
+      const badPart = await request(server.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: auth,
+        body: JSON.stringify({ key: 'SIZE', value: '2', part: 3 }),
+      });
+      expect(badPart.status).toBe(400);
+      const unknownPart = await request(server.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: auth,
+        body: JSON.stringify({ key: 'SIZE', value: '2', part: 'nope' }),
+      });
+      expect(unknownPart.status).toBe(404);
+      const removedFromPart = await request(server.port, {
+        path: '/api/applications/greeter/environment/http/COLOR',
+        method: 'DELETE',
+        headers: auth,
+      });
+      expect(removedFromPart.status).toBe(200);
       const removed = await request(server.port, {
         path: '/api/applications/greeter/environment/COLOR',
         method: 'DELETE',
