@@ -401,6 +401,29 @@ describe('console branches', () => {
       () => undefined,
     );
     await expect(notAList.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
+
+    const base = fakeDeps({
+      cwd: '/tmp',
+      capturedStdout: { 'kubectl get': '{"items":[{"metadata":{"name":"greeter"}}]}' },
+    });
+    const forbiddenCron = createKubectlConsoleCluster(
+      {
+        ...base,
+        runCaptured: async (command, args, options) => {
+          if (args.includes('cronjob')) {
+            return {
+              exitCode: 1,
+              stdout: '',
+              stderr:
+                'Error from server (Forbidden): cronjobs.batch is forbidden: User cannot list resource "cronjobs"',
+            };
+          }
+          return base.runCaptured(command, args, options);
+        },
+      },
+      (line) => logs.push(line),
+    );
+    expect(await forbiddenCron.listCronJobs(connection)).toEqual([]);
   });
 
   it('reads backing services through the service commands', async () => {

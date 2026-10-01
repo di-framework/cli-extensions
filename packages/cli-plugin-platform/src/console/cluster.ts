@@ -32,13 +32,23 @@ export function createKubectlConsoleCluster(
       return items(body) as WorkloadDocument[];
     },
     async listCronJobs(connection) {
-      const body = await kubectlJson(
-        deps,
-        connection,
-        ['get', 'cronjob', '-l', label, '-o', 'json'],
-        log,
-      );
-      return items(body) as CronJobDocument[];
+      const args = ['get', 'cronjob', '-l', label, '-o', 'json'] as const;
+      const result = await captureKubectl(deps, connection, args, deps.cwd());
+      // Tenant roles can manage workloads without batch/cronjob permission.
+      if (result.exitCode !== 0 && /forbidden/i.test(result.stderr)) {
+        log(sanitizePublicText(result.stderr));
+        return [];
+      }
+      if (result.exitCode !== 0) {
+        log(sanitizePublicText(result.stderr || result.stdout || 'kubectl failed'));
+        throw new ConsoleError(502, 'CLUSTER_REQUEST_FAILED', 'The cluster request failed.');
+      }
+      try {
+        return items(JSON.parse(result.stdout) as unknown) as CronJobDocument[];
+      } catch {
+        log('kubectl returned unparseable JSON');
+        throw new ConsoleError(502, 'CLUSTER_REQUEST_FAILED', 'The cluster request failed.');
+      }
     },
     async patchWorkload(connection, name, ops) {
       await kubectlOk(
