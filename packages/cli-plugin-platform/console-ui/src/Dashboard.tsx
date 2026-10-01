@@ -31,31 +31,44 @@ import {
   ExclamationTriangleIcon,
   InfoCircleIcon,
 } from '@patternfly/react-icons';
+import { observer } from 'mobx-react-lite';
 import type { JSX } from 'react';
 import { Sparkline } from './Sparkline';
+import { useStore } from './StoreContext';
 import { countPhrase, formatTime } from './shared';
 import type {
-  ActivityEntry,
-  ActivityStatus,
-  ApplicationSignals,
-  ApplicationSummary,
-  BackingService,
-  Section,
-  SessionView,
-} from './types';
+  ActivityNode,
+  ApplicationSignalsNode,
+  ApplicationSummaryNode,
+  BackingServiceNode,
+  SessionNode,
+} from './store';
+import type { ActivityStatus, Section } from './types';
 
 type DashboardProps = {
-  session: SessionView;
-  apps: ApplicationSummary[];
-  services: BackingService[];
-  signals: ApplicationSignals[] | undefined;
-  activity: ActivityEntry[];
+  session: SessionNode;
+  apps: readonly ApplicationSummaryNode[];
+  services: readonly BackingServiceNode[];
+  signals: readonly ApplicationSignalsNode[] | undefined;
+  activity: readonly ActivityNode[];
   onNavigate: (section: Section) => void;
   onOpenApplication: (name: string) => void;
   onClearActivity: () => void;
 };
 
-export function Dashboard(props: DashboardProps): JSX.Element {
+export const Dashboard = observer(function Dashboard(): JSX.Element | null {
+  const store = useStore();
+  if (store.session === undefined) return null;
+  const props: DashboardProps = {
+    session: store.session,
+    apps: store.applications,
+    services: store.services,
+    signals: store.signals,
+    activity: store.activity,
+    onNavigate: (section) => store.navigate(section),
+    onOpenApplication: (name) => void store.openApplication(name),
+    onClearActivity: () => store.clearActivity(),
+  };
   return (
     <Grid hasGutter>
       <GridItem span={12} lg={3}>
@@ -83,7 +96,7 @@ export function Dashboard(props: DashboardProps): JSX.Element {
       </GridItem>
     </Grid>
   );
-}
+});
 
 function DetailsCard({ session, apps, services, onNavigate }: DashboardProps): JSX.Element {
   return (
@@ -383,7 +396,10 @@ function SignalsCard({ apps, signals, onOpenApplication }: DashboardProps): JSX.
                   </GridItem>
                   <GridItem span={12} md={7}>
                     {entry.compute && entry.compute.length > 0 ? (
-                      <Sparkline values={entry.compute} label={`${entry.application} compute`} />
+                      <Sparkline
+                        values={[...entry.compute]}
+                        label={`${entry.application} compute`}
+                      />
                     ) : (
                       <div className="console-metric">No compute samples yet.</div>
                     )}
