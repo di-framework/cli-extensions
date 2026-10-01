@@ -1,7 +1,6 @@
 import {
   ActionGroup,
   Button,
-  Content,
   Form,
   FormGroup,
   FormSelect,
@@ -40,10 +39,10 @@ export const BackingServiceCreateForm = observer(function BackingServiceCreateFo
   return (
     <>
       {classes.length === 0 ? (
-        <Content component="p">No service classes are available on this host group.</Content>
+        <p className="console-note">No service classes are available on this host group.</p>
       ) : null}
-      <Form onSubmit={(event) => void submit(event)}>
-        <FormGroup label="Name" isRequired fieldId="service-name">
+      <Form className="console-form console-form--stacked" onSubmit={(event) => void submit(event)}>
+        <FormGroup label="Name" isRequired fieldId="service-name" className="console-form__wide">
           <TextInput
             id="service-name"
             value={name}
@@ -51,7 +50,7 @@ export const BackingServiceCreateForm = observer(function BackingServiceCreateFo
             isDisabled={!writable}
           />
         </FormGroup>
-        <FormGroup label="Class" isRequired fieldId="service-class">
+        <FormGroup label="Class" isRequired fieldId="service-class" className="console-form__wide">
           <FormSelect
             id="service-class"
             value={className}
@@ -90,7 +89,7 @@ export const BackingServiceCreateForm = observer(function BackingServiceCreateFo
             isDisabled={!writable}
           />
         </FormGroup>
-        <ActionGroup>
+        <ActionGroup className="console-form__actions console-form__wide">
           <Button
             type="submit"
             isDisabled={!writable || name.length === 0 || className.length === 0}

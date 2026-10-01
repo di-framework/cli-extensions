@@ -1,12 +1,10 @@
 import {
-  Content,
   DescriptionList,
   DescriptionListDescription,
   DescriptionListGroup,
   DescriptionListTerm,
   Grid,
   GridItem,
-  Title,
 } from '@patternfly/react-core';
 import { observer } from 'mobx-react-lite';
 import type { JSX } from 'react';
@@ -32,13 +30,11 @@ export const SignalsTab = observer(function SignalsTab(): JSX.Element | null {
         </DescriptionList>
       </GridItem>
       <GridItem span={12} md={8}>
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mb-sm">
-          Compute
-        </Title>
+        <h2 className="console-heading">Compute</h2>
         {signals.compute && signals.compute.length > 0 ? (
           <Sparkline values={[...signals.compute]} label={`${app.name} compute`} />
         ) : (
-          <Content component="p">No compute samples yet.</Content>
+          <p className="console-note">No compute samples yet.</p>
         )}
       </GridItem>
     </Grid>

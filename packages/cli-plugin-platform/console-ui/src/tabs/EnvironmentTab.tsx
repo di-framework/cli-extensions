@@ -1,14 +1,4 @@
-import {
-  ActionGroup,
-  Button,
-  Content,
-  Form,
-  FormGroup,
-  Grid,
-  GridItem,
-  TextInput,
-  Title,
-} from '@patternfly/react-core';
+import { ActionGroup, Button, Form, FormGroup, TextInput } from '@patternfly/react-core';
 import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import { observer } from 'mobx-react-lite';
 import { type FormEvent, type JSX, useState } from 'react';
@@ -30,12 +20,15 @@ export const EnvironmentTab = observer(function EnvironmentTab(): JSX.Element {
   }
 
   return (
-    <Grid hasGutter>
-      <GridItem span={12} xl={8}>
+    <>
+      <section aria-labelledby="environment-variables">
+        <h2 id="environment-variables" className="console-heading">
+          Variables
+        </h2>
         {app.environment.length === 0 ? (
-          <Content component="p">No environment variables are set.</Content>
+          <p className="console-note">No environment variables are set.</p>
         ) : (
-          <Table aria-label="Environment" variant="compact">
+          <Table aria-label="Environment" variant="compact" className="console-table">
             <Thead>
               <Tr>
                 <Th>Name</Th>
@@ -53,6 +46,7 @@ export const EnvironmentTab = observer(function EnvironmentTab(): JSX.Element {
                       variant="secondary"
                       size="sm"
                       isDisabled={!writable}
+                      aria-label={`Remove ${entry.key}`}
                       onClick={() => void store.deleteEnvironment(entry.key)}
                     >
                       Remove
@@ -63,12 +57,12 @@ export const EnvironmentTab = observer(function EnvironmentTab(): JSX.Element {
             </Tbody>
           </Table>
         )}
-      </GridItem>
-      <GridItem span={12} xl={4}>
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mb-sm">
+      </section>
+      <section aria-labelledby="environment-set">
+        <h2 id="environment-set" className="console-heading">
           Set a variable
-        </Title>
-        <Form onSubmit={(event) => void submit(event)}>
+        </h2>
+        <Form className="console-form" onSubmit={(event) => void submit(event)}>
           <FormGroup label="Name" isRequired fieldId="env-name">
             <TextInput
               id="env-name"
@@ -85,13 +79,13 @@ export const EnvironmentTab = observer(function EnvironmentTab(): JSX.Element {
               isDisabled={!writable}
             />
           </FormGroup>
-          <ActionGroup>
+          <ActionGroup className="console-form__actions">
             <Button type="submit" isDisabled={!writable || key.length === 0 || value.length === 0}>
               Set variable
             </Button>
           </ActionGroup>
         </Form>
-      </GridItem>
-    </Grid>
+      </section>
+    </>
   );
 });

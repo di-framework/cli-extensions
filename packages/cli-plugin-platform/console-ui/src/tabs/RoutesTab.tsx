@@ -9,13 +9,18 @@ export const RoutesTab = observer(function RoutesTab(): JSX.Element {
   const app = useApplication();
   if (app.routes.length === 0) {
     return (
-      <EmptyState variant="sm" titleText="No HTTP routes" headingLevel="h3">
+      <EmptyState
+        variant="xs"
+        titleText="No HTTP routes"
+        headingLevel="h2"
+        className="console-empty"
+      >
         <EmptyStateBody>This application has no HTTP routes.</EmptyStateBody>
       </EmptyState>
     );
   }
   return (
-    <Table aria-label="Routes" variant="compact">
+    <Table aria-label="Routes" variant="compact" className="console-table">
       <Thead>
         <Tr>
           <Th>Host</Th>
@@ -30,7 +35,8 @@ export const RoutesTab = observer(function RoutesTab(): JSX.Element {
             <Td dataLabel="Path">{route.path}</Td>
             <Td dataLabel="Enabled">
               <Switch
-                aria-label={`${route.host} ${route.path}`}
+                id={`route-${route.id}`}
+                aria-label={`Route ${route.host}${route.path} enabled`}
                 isChecked={route.enabled}
                 isDisabled={!store.writable}
                 onChange={(_event, enabled) =>

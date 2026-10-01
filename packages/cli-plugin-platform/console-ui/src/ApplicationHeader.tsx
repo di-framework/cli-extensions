@@ -2,17 +2,14 @@ import {
   Breadcrumb,
   BreadcrumbItem,
   Button,
-  Content,
-  Flex,
-  FlexItem,
-  PageSection,
   Tab,
   Tabs,
   TabTitleText,
-  Title,
 } from '@patternfly/react-core';
+import { SyncAltIcon } from '@patternfly/react-icons';
 import { observer } from 'mobx-react-lite';
 import type { JSX } from 'react';
+import { PageHeader } from './PageHeader';
 import { useStore } from './StoreContext';
 import { ReadyLabel } from './shared';
 import type { ApplicationTab } from './types';
@@ -27,14 +24,15 @@ const TABS: Array<{ key: ApplicationTab; title: string }> = [
   { key: 'signals', title: 'Signals' },
 ];
 
+/** The application name, status, and tabs, with the selected tab's actions on the same bar. */
 export const ApplicationHeader = observer(function ApplicationHeader(): JSX.Element {
   const store = useStore();
   const { application: app, ui } = store;
   const name = ui.selectedApplication ?? '';
   const tabs = TABS.filter((tab) => tab.key !== 'signals' || app?.signals !== undefined);
   return (
-    <>
-      <PageSection hasBodyWrapper={false} type="breadcrumb">
+    <PageHeader
+      crumbs={
         <Breadcrumb>
           <BreadcrumbItem>
             <Button variant="link" isInline onClick={() => store.navigate('applications')}>
@@ -43,22 +41,12 @@ export const ApplicationHeader = observer(function ApplicationHeader(): JSX.Elem
           </BreadcrumbItem>
           <BreadcrumbItem isActive>{name}</BreadcrumbItem>
         </Breadcrumb>
-      </PageSection>
-      <PageSection hasBodyWrapper={false}>
-        <Flex alignItems={{ default: 'alignItemsCenter' }} gap={{ default: 'gapMd' }}>
-          <FlexItem>
-            <Title headingLevel="h1">{name}</Title>
-          </FlexItem>
-          {app ? (
-            <FlexItem>
-              <ReadyLabel ready={app.ready} />
-            </FlexItem>
-          ) : null}
-        </Flex>
-        {app?.detail ? <Content component="p">{app.detail}</Content> : null}
-      </PageSection>
-      {app ? (
-        <PageSection hasBodyWrapper={false} type="tabs">
+      }
+      title={name}
+      status={app ? <ReadyLabel ready={app.ready} /> : undefined}
+      description={app?.detail}
+      tabs={
+        app ? (
           <Tabs
             activeKey={ui.selectedTab}
             onSelect={(_event, key) => store.selectTab(key as ApplicationTab)}
@@ -69,11 +57,23 @@ export const ApplicationHeader = observer(function ApplicationHeader(): JSX.Elem
                 key={tab.key}
                 eventKey={tab.key}
                 title={<TabTitleText>{tab.title}</TabTitleText>}
+                tabContentId={`console-tab-${tab.key}`}
               />
             ))}
           </Tabs>
-        </PageSection>
-      ) : null}
-    </>
+        ) : undefined
+      }
+      actions={
+        app && ui.selectedTab === 'logs' ? (
+          <Button
+            variant="secondary"
+            icon={<SyncAltIcon />}
+            onClick={() => void store.refreshLogs()}
+          >
+            Refresh
+          </Button>
+        ) : undefined
+      }
+    />
   );
 });

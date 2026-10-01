@@ -9,7 +9,12 @@ export const BackingServiceList = observer(function BackingServiceList(): JSX.El
   const store = useStore();
   if (store.services.length === 0) {
     return (
-      <EmptyState variant="sm" titleText="No backing services" headingLevel="h3">
+      <EmptyState
+        variant="xs"
+        titleText="No backing services"
+        headingLevel="h3"
+        className="console-empty"
+      >
         <EmptyStateBody>
           Create a backing service to bind databases and queues to applications.
         </EmptyStateBody>
@@ -17,7 +22,7 @@ export const BackingServiceList = observer(function BackingServiceList(): JSX.El
     );
   }
   return (
-    <Table aria-label="Backing services" variant="compact">
+    <Table aria-label="Backing services" variant="compact" className="console-table">
       <Thead>
         <Tr>
           <Th>Name</Th>
@@ -41,6 +46,7 @@ export const BackingServiceList = observer(function BackingServiceList(): JSX.El
                 isDanger
                 size="sm"
                 isDisabled={!store.writable}
+                aria-label={`Delete ${service.name}`}
                 onClick={() => void store.deleteService(service.name)}
               >
                 Delete

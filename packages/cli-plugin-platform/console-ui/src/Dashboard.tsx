@@ -371,7 +371,7 @@ function SignalsCard({ apps, signals, onOpenApplication }: DashboardProps): JSX.
           <Stack hasGutter>
             {signals.map((entry, index) => (
               <StackItem key={entry.application}>
-                {index > 0 ? <Divider className="pf-v6-u-mb-md" /> : null}
+                {index > 0 ? <Divider /> : null}
                 <Grid hasGutter>
                   <GridItem span={12} md={5}>
                     <Content component="h4">

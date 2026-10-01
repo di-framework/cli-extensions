@@ -1,14 +1,11 @@
 import {
-  Content,
   DescriptionList,
   DescriptionListDescription,
   DescriptionListGroup,
   DescriptionListTerm,
-  Grid,
-  GridItem,
   Label,
-  Title,
 } from '@patternfly/react-core';
+import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import { observer } from 'mobx-react-lite';
 import type { JSX } from 'react';
 import { useApplication } from '../StoreContext';
@@ -17,40 +14,49 @@ import { countPhrase } from '../shared';
 export const OverviewTab = observer(function OverviewTab(): JSX.Element {
   const app = useApplication();
   return (
-    <Grid hasGutter>
-      <GridItem span={12} lg={6}>
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mb-sm">
+    <div className="console-split">
+      <section aria-labelledby="overview-parts">
+        <h2 id="overview-parts" className="console-heading">
           Parts
-        </Title>
+        </h2>
         {app.parts.length === 0 ? (
-          <Content component="p">This application has no parts yet.</Content>
+          <p className="console-note">This application has no parts yet.</p>
         ) : (
-          <DescriptionList isHorizontal isCompact>
-            {app.parts.map((part) => (
-              <DescriptionListGroup key={`${part.kind}-${part.name}`}>
-                <DescriptionListTerm>
-                  <Label color={part.kind === 'service' ? 'blue' : 'green'} isCompact>
-                    {part.kind === 'service' ? 'Service' : 'Component'}
-                  </Label>{' '}
-                  {part.name}
-                </DescriptionListTerm>
-                <DescriptionListDescription>
-                  {part.lifetime === 'long-lived' ? 'Long-lived' : 'On-demand'}
-                </DescriptionListDescription>
-              </DescriptionListGroup>
-            ))}
-          </DescriptionList>
+          <Table aria-label="Parts" variant="compact" className="console-table">
+            <Thead>
+              <Tr>
+                <Th>Name</Th>
+                <Th>Kind</Th>
+                <Th>Lifetime</Th>
+              </Tr>
+            </Thead>
+            <Tbody>
+              {app.parts.map((part) => (
+                <Tr key={`${part.kind}-${part.name}`}>
+                  <Td dataLabel="Name">{part.name}</Td>
+                  <Td dataLabel="Kind">
+                    <Label color={part.kind === 'service' ? 'blue' : 'green'} isCompact>
+                      {part.kind === 'service' ? 'Service' : 'Component'}
+                    </Label>
+                  </Td>
+                  <Td dataLabel="Lifetime">
+                    {part.lifetime === 'long-lived' ? 'Long-lived' : 'On-demand'}
+                  </Td>
+                </Tr>
+              ))}
+            </Tbody>
+          </Table>
         )}
-        <Content component="small">
+        <p className="console-note">
           A service is long-lived for the life of the application. A component runs on demand, once
           per request.
-        </Content>
-      </GridItem>
-      <GridItem span={12} lg={6}>
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mb-sm">
+        </p>
+      </section>
+      <section aria-labelledby="overview-summary">
+        <h2 id="overview-summary" className="console-heading">
           Summary
-        </Title>
-        <DescriptionList isHorizontal isCompact>
+        </h2>
+        <DescriptionList isHorizontal isCompact horizontalTermWidthModifier={{ default: '10rem' }}>
           <DescriptionListGroup>
             <DescriptionListTerm>Routes</DescriptionListTerm>
             <DescriptionListDescription>
@@ -82,7 +88,7 @@ export const OverviewTab = observer(function OverviewTab(): JSX.Element {
             </DescriptionListGroup>
           ) : null}
         </DescriptionList>
-      </GridItem>
-    </Grid>
+      </section>
+    </div>
   );
 });

@@ -1,6 +1,5 @@
 import {
   Button,
-  Content,
   FormGroup,
   Modal,
   ModalBody,
@@ -27,9 +26,9 @@ export const SecretsTab = observer(function SecretsTab(): JSX.Element {
   return (
     <>
       {app.secrets.length === 0 ? (
-        <Content component="p">No secrets are attached to this application.</Content>
+        <p className="console-note">No secrets are attached to this application.</p>
       ) : (
-        <Table aria-label="Secrets" variant="compact">
+        <Table aria-label="Secrets" variant="compact" className="console-table">
           <Thead>
             <Tr>
               <Th>Name</Th>
@@ -47,6 +46,7 @@ export const SecretsTab = observer(function SecretsTab(): JSX.Element {
                     variant="secondary"
                     size="sm"
                     isDisabled={!store.writable}
+                    aria-label={`Reassign ${secret.name}`}
                     onClick={() => setSecretName(secret.name)}
                   >
                     Reassign
@@ -65,8 +65,7 @@ export const SecretsTab = observer(function SecretsTab(): JSX.Element {
       >
         <ModalHeader title="Reassign secret" labelId="reassign-secret" />
         <ModalBody>
-          <Content component="p">{secretName}</Content>
-          <FormGroup label="New value" fieldId="secret-value">
+          <FormGroup label={`New value for ${secretName ?? ''}`} fieldId="secret-value">
             <TextInput
               id="secret-value"
               type="password"
