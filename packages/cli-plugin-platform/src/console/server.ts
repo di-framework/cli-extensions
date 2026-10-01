@@ -9,7 +9,6 @@ import { type ClusterConnection, resolveConnection, resolveTarget } from '../tar
 import {
   CSRF_HEADER,
   createSessionStore,
-  passwordsMatch,
   readCookie,
   SESSION_COOKIE,
   SESSION_TTL_MS,
@@ -18,25 +17,30 @@ import {
   tokensMatch,
 } from './auth';
 import {
+  type ApplicationView,
   assertResourceName,
-  type CronJobDocument,
-  cronInTenantScope,
-  listTargetViews,
-  parseAppUpdate,
-  parseCronUpdate,
-  planWorkloadUpdate,
-  summarizeCron,
-  summarizeWorkload,
-  unassignedCronJobs,
+  planEnvironmentDelete,
+  planEnvironmentSet,
+  planRouteUpdate,
+  planSecretReassign,
+  summarizeApplications,
+  tenantIdentity,
+  toSummary,
   type WorkloadDocument,
   workloadInTenantScope,
 } from './catalog';
-import { type ConsoleCluster, createKubectlConsoleCluster } from './cluster';
-import { ConsoleError, sanitizePublicText } from './errors';
+import {
+  type BindInput,
+  type ConsoleCluster,
+  createKubectlConsoleCluster,
+  type SignalView,
+} from './cluster';
+import { ConsoleError, platformSentence, sanitizePublicText } from './errors';
 import {
   type ConsoleServices,
   createCliConsoleServices,
   type ServiceCreateInput,
+  type ServiceView,
 } from './services';
 
 const SECURITY_HEADERS = {
@@ -53,7 +57,7 @@ const SECURITY_HEADERS = {
 
 const ASSET_EXTENSIONS = new Set(['.js', '.css', '.map', '.woff', '.woff2', '.ttf', '.svg']);
 const MAX_BODY_BYTES = 65_536;
-const DELETION_POLICIES = new Set(['Retain', 'Delete']);
+const WRITES_FORBIDDEN = 'This credential cannot change the application.';
 
 export type ConsoleServer = {
   port: number;
@@ -64,8 +68,7 @@ export type ConsoleServer = {
 export type ConsoleServerOptions = {
   host: string;
   port: number;
-  password: string;
-  /** Deployment target whose kubeconfig, namespace, and host group are the tenant credential. */
+  /** Deployment target whose kubeconfig is the tenant credential. */
   target: string;
   deps: WasmcloudDeps;
   assetsDirectory: string;
@@ -73,13 +76,6 @@ export type ConsoleServerOptions = {
   cluster?: ConsoleCluster;
   services?: ConsoleServices;
   now?: () => number;
-};
-
-type TargetGroup = {
-  target: string;
-  namespace?: string;
-  apps: ReturnType<typeof summarizeWorkload>[];
-  error?: string;
 };
 
 export function startConsoleServer(options: ConsoleServerOptions): Promise<ConsoleServer> {
@@ -90,6 +86,7 @@ export function startConsoleServer(options: ConsoleServerOptions): Promise<Conso
   const sessions = createSessionStore();
   const now = options.now ?? Date.now;
   const connections = new Map<string, Promise<ClusterConnection>>();
+  const writers = new Map<string, Promise<boolean>>();
   const server = createServer((request, response) => {
     void handle(request, response, {
       ...options,
@@ -98,9 +95,10 @@ export function startConsoleServer(options: ConsoleServerOptions): Promise<Conso
       sessions,
       now,
       connections,
+      writers,
       log,
     }).catch((error) => {
-      log(error instanceof Error ? error.message : 'console request failed');
+      log(sanitizePublicText(error instanceof Error ? error.message : 'console request failed'));
       sendJson(response, 500, {
         error: 'The console request failed.',
         code: 'CONSOLE_REQUEST_FAILED',
@@ -135,6 +133,7 @@ type HandlerOptions = ConsoleServerOptions & {
   sessions: SessionStore;
   now: () => number;
   connections: Map<string, Promise<ClusterConnection>>;
+  writers: Map<string, Promise<boolean>>;
   log: (line: string) => void;
 };
 
@@ -179,8 +178,9 @@ async function handle(
     await routeApi(method, url, request, response, options);
   } catch (error) {
     const mapped = publicError(error);
-    if (mapped.status >= 500)
+    if (mapped.status >= 500) {
       options.log(sanitizePublicText(error instanceof Error ? error.message : 'request failed'));
+    }
     sendJson(response, mapped.status, mapped.body);
   }
 }
@@ -192,253 +192,311 @@ async function routeApi(
   response: ServerResponse,
   options: HandlerOptions,
 ): Promise<void> {
-  if (method === 'POST' && url.pathname === '/api/login') {
-    requireOrigin(request);
-    await login(request, response, options);
+  if (method === 'GET' && url.pathname === '/api/session') {
+    await openSession(request, response, options);
     return;
   }
 
-  const sessionId = readCookie(request.headers.cookie, SESSION_COOKIE);
-  const session = options.sessions.read(sessionId, options.now());
-  if (method === 'GET' && url.pathname === '/api/session') {
-    if (session === undefined) {
-      sendJson(response, 200, { authenticated: false });
-      return;
-    }
-    sendJson(response, 200, { authenticated: true, csrfToken: session.csrf });
-    return;
-  }
+  const session = options.sessions.read(
+    readCookie(request.headers.cookie, SESSION_COOKIE),
+    options.now(),
+  );
   if (session === undefined) {
-    sendJson(response, 401, { error: 'Sign in required.', code: 'SIGN_IN_REQUIRED' });
+    sendJson(response, 401, {
+      error: 'Reload the console and try again.',
+      code: 'SESSION_REQUIRED',
+    });
     return;
   }
-  if (method !== 'GET') {
+  if (method !== 'GET' && method !== 'HEAD') {
     requireOrigin(request);
     const header = request.headers[CSRF_HEADER];
     const provided = Array.isArray(header) ? header[0] : header;
     if (!tokensMatch(provided, session.csrf)) {
-      throw new ConsoleError(403, 'CSRF_REJECTED', 'The form token does not match this session.');
+      throw new ConsoleError(403, 'CSRF_REJECTED', 'The form token does not match this page.');
     }
+    await requireWrite(options);
   }
 
-  if (method === 'POST' && url.pathname === '/api/logout') {
-    options.sessions.destroy(sessionId);
-    response.setHeader('set-cookie', sessionCookie('', 0));
-    sendJson(response, 200, { authenticated: false });
+  if (method === 'GET' && url.pathname === '/api/applications') {
+    sendJson(response, 200, await listApplications(options));
     return;
   }
-  if (method === 'GET' && url.pathname === '/api/targets') {
-    const manifest = loadManifest(options);
-    assertTenantTarget(options, options.target);
+  if (method === 'GET' && url.pathname === '/api/backing-services') {
     sendJson(response, 200, {
-      targets: listTargetViews(manifest).filter((view) => view.name === options.target),
+      services: (await options.services.list(options.target)).map(publicService),
     });
     return;
   }
-  if (method === 'GET' && url.pathname === '/api/apps') {
-    const target = url.searchParams.get('target') ?? undefined;
-    sendJson(response, 200, await listApps(options, target));
+  if (method === 'POST' && url.pathname === '/api/backing-services') {
+    const input = parseServiceCreate(await readBody(request), options.target);
+    sendJson(response, 201, { service: publicService(await options.services.create(input)) });
     return;
   }
-
-  const appName = namedPath(url.pathname, '/api/apps/');
-  if (appName !== undefined && method === 'GET') {
-    assertResourceName(appName, 'Application name');
-    const target = requiredQueryTarget(url);
-    sendJson(response, 200, await oneApp(options, target, appName));
+  if (method === 'GET' && url.pathname === '/api/backing-service-classes') {
+    const listed = await options.services.classes(options.target);
+    sendJson(response, 200, {
+      classes: listed.classes.map((entry) => ({
+        name: entry.name,
+        type: entry.type,
+        default: entry.default,
+      })),
+    });
     return;
   }
-  if (appName !== undefined && method === 'PATCH') {
-    assertResourceName(appName, 'Application name');
-    const update = parseAppUpdate(await readBody(request));
-    sendJson(response, 200, await updateApp(options, appName, update));
-    return;
-  }
-
-  const cronName = namedPath(url.pathname, '/api/cronjobs/');
-  if (cronName !== undefined && method === 'PATCH') {
-    assertResourceName(cronName, 'CronJob name');
-    const update = parseCronUpdate(await readBody(request));
-    sendJson(response, 200, await updateCron(options, cronName, update));
-    return;
-  }
-
-  if (url.pathname === '/api/services' && method === 'GET') {
-    const target = requiredQueryTarget(url);
-    assertTenantTarget(options, target);
-    sendJson(response, 200, { target, services: await options.services.list(target) });
-    return;
-  }
-  if (url.pathname === '/api/services' && method === 'POST') {
-    const input = parseServiceCreate(await readBody(request));
-    assertTenantTarget(options, input.target);
-    sendJson(response, 201, { service: await options.services.create(input) });
-    return;
-  }
-  if (url.pathname === '/api/service-classes' && method === 'GET') {
-    const target = requiredQueryTarget(url);
-    assertTenantTarget(options, target);
-    sendJson(response, 200, await options.services.classes(target));
-    return;
-  }
-  const serviceName = namedPath(url.pathname, '/api/services/');
+  const serviceName = namedPath(url.pathname, '/api/backing-services/');
   if (serviceName !== undefined && method === 'DELETE') {
     if (!isBackingServiceName(serviceName)) {
       throw new ConsoleError(
         400,
         'INVALID_NAME',
-        'Service name must be a DNS label of at most 40 characters.',
+        'Service name must use lowercase letters, digits, and hyphens.',
       );
     }
-    const target = requiredQueryTarget(url);
-    assertTenantTarget(options, target);
-    sendJson(response, 200, await options.services.delete(target, serviceName));
+    await options.services.delete(options.target, serviceName);
+    sendJson(response, 200, { name: serviceName });
     return;
   }
 
-  sendJson(response, 404, { error: 'Not found', code: 'NOT_FOUND' });
+  const application = applicationPath(url.pathname);
+  if (application === undefined) {
+    sendJson(response, 404, { error: 'Not found', code: 'NOT_FOUND' });
+    return;
+  }
+  assertResourceName(application.name, 'Application name');
+  await routeApplication(method, application.name, application.rest, request, response, options);
 }
 
-async function login(
+async function routeApplication(
+  method: string,
+  name: string,
+  rest: readonly string[],
   request: IncomingMessage,
   response: ServerResponse,
   options: HandlerOptions,
 ): Promise<void> {
-  const remote = request.socket.remoteAddress ?? 'unknown';
-  if (!options.sessions.loginAllowed(remote, options.now())) {
-    sendJson(response, 429, {
-      error: 'Too many sign-in attempts. Wait before trying again.',
-      code: 'SIGN_IN_LIMIT',
-    });
+  if (rest.length === 0 && method === 'GET') {
+    sendJson(response, 200, { application: await present(options, name) });
     return;
   }
-  const body = await readBody(request);
-  const password =
-    body !== null && typeof body === 'object' && !Array.isArray(body)
-      ? (body as { password?: unknown }).password
-      : undefined;
-  if (typeof password !== 'string' || !passwordsMatch(password, options.password)) {
-    options.sessions.recordFailure(remote, options.now());
-    sendJson(response, 401, { error: 'The password is not valid.', code: 'SIGN_IN_FAILED' });
+  if (rest.length === 1 && rest[0] === 'logs' && method === 'GET') {
+    const loaded = await loadApplications(options);
+    requireApplication(loaded.applications, name);
+    sendJson(response, 200, await logsFor(options, loaded.connection, name));
     return;
   }
-  options.sessions.clearFailures(remote);
-  const created = options.sessions.create();
-  response.setHeader('set-cookie', sessionCookie(created.id, Math.floor(SESSION_TTL_MS / 1000)));
-  sendJson(response, 200, { authenticated: true, csrfToken: created.session.csrf });
-}
-
-async function listApps(
-  options: HandlerOptions,
-  target: string | undefined,
-): Promise<{ results: TargetGroup[] }> {
-  const names = [assertTenantTarget(options, target ?? options.target)];
-  const results: TargetGroup[] = [];
-  for (const name of names) {
-    try {
-      const loaded = await loadTarget(options, name);
-      results.push({ target: name, namespace: loaded.connection.namespace, apps: loaded.apps });
-    } catch (error) {
-      options.log(
-        sanitizePublicText(error instanceof Error ? error.message : 'target query failed'),
-      );
-      results.push({
-        target: name,
-        apps: [],
-        error: error instanceof ConsoleError ? error.message : 'The cluster request failed.',
-      });
+  if (rest.length === 2 && rest[0] === 'routes' && method === 'PATCH') {
+    const body = recordBody(await readBody(request), ['enabled']);
+    if (typeof body.enabled !== 'boolean') {
+      throw new ConsoleError(400, 'INVALID_BODY', 'enabled must be true or false.');
     }
+    const loaded = await loadApplications(options);
+    const members = membersOf(loaded, name);
+    const change = planRouteUpdate(members, rest[1] ?? '', body.enabled);
+    if (change.ops.length > 0)
+      await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
+    sendJson(response, 200, { application: await present(options, name) });
+    return;
   }
-  return { results };
+  if (rest.length === 1 && rest[0] === 'environment' && method === 'PUT') {
+    const body = recordBody(await readBody(request), ['key', 'value']);
+    if (typeof body.key !== 'string' || typeof body.value !== 'string') {
+      throw new ConsoleError(
+        400,
+        'INVALID_BODY',
+        'An environment variable needs a name and a value.',
+      );
+    }
+    const loaded = await loadApplications(options);
+    const change = planEnvironmentSet(membersOf(loaded, name), body.key, body.value);
+    if (change.ops.length > 0)
+      await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
+    sendJson(response, 200, { application: await present(options, name) });
+    return;
+  }
+  if (rest.length === 2 && rest[0] === 'environment' && method === 'DELETE') {
+    const loaded = await loadApplications(options);
+    const change = planEnvironmentDelete(membersOf(loaded, name), rest[1] ?? '');
+    await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
+    sendJson(response, 200, { application: await present(options, name) });
+    return;
+  }
+  if (rest.length === 2 && rest[0] === 'secrets' && method === 'POST') {
+    const secretName = rest[1] ?? '';
+    const body = recordBody(await readBody(request), ['value']);
+    if (typeof body.value !== 'string') {
+      throw new ConsoleError(400, 'INVALID_SECRET', 'Provide a new credential value.');
+    }
+    const loaded = await loadApplications(options);
+    const planned = planSecretReassign(membersOf(loaded, name), secretName, body.value);
+    if ('secret' in planned)
+      await options.cluster.reassignSecret(loaded.connection, planned.secret, body.value);
+    else if (planned.ops.length > 0) {
+      await options.cluster.patchWorkload(loaded.connection, planned.workload, planned.ops);
+    }
+    sendJson(response, 200, { name: secretName });
+    return;
+  }
+  if (rest.length === 1 && rest[0] === 'bindings' && method === 'POST') {
+    const input = parseBind(await readBody(request), name);
+    const loaded = await loadApplications(options);
+    requireApplication(loaded.applications, name);
+    await options.cluster.bindService(loaded.connection, input);
+    sendJson(response, 200, { application: await present(options, name) });
+    return;
+  }
+  if (rest.length === 2 && rest[0] === 'bindings' && method === 'DELETE') {
+    const loaded = await loadApplications(options);
+    const application = requireApplication(loaded.applications, name);
+    const binding = application.backingServices.find((entry) => entry.name === rest[1]);
+    if (binding === undefined) {
+      throw new ConsoleError(
+        404,
+        'BINDING_NOT_FOUND',
+        'That backing service is not bound to this application.',
+      );
+    }
+    await options.cluster.unbindService(loaded.connection, name, binding.name);
+    sendJson(response, 200, { application: await present(options, name) });
+    return;
+  }
+  sendJson(response, 404, { error: 'Not found', code: 'NOT_FOUND' });
 }
 
-async function oneApp(options: HandlerOptions, target: string, name: string) {
-  assertTenantTarget(options, target);
-  const loaded = await loadTarget(options, target);
-  const app = loaded.apps.find((entry) => entry?.name === name);
-  if (app === undefined)
-    throw new ConsoleError(
-      404,
-      'APP_NOT_FOUND',
-      `No deployed application named ${name} on this target.`,
-    );
-  return { app, unassignedCronJobs: loaded.unassigned };
-}
-
-async function updateApp(
+async function openSession(
+  request: IncomingMessage,
+  response: ServerResponse,
   options: HandlerOptions,
-  name: string,
-  update: ReturnType<typeof parseAppUpdate>,
-) {
-  assertTenantTarget(options, update.target);
-  const loaded = await loadTarget(options, update.target);
-  const document = loaded.documents.find((entry) => entry.metadata?.name === name);
-  if (document === undefined) {
-    throw new ConsoleError(
-      404,
-      'APP_NOT_FOUND',
-      `No deployed application named ${name} on this target.`,
-    );
+): Promise<void> {
+  const now = options.now();
+  let current = options.sessions.read(readCookie(request.headers.cookie, SESSION_COOKIE), now);
+  if (current === undefined) {
+    const created = options.sessions.create(now);
+    current = created.session;
+    response.setHeader('set-cookie', sessionCookie(created.id, Math.floor(SESSION_TTL_MS / 1000)));
   }
-  const ops = planWorkloadUpdate(document, update);
-  if (ops.length > 0) await options.cluster.patchWorkload(loaded.connection, name, ops);
-  const refreshed = await loadTarget(options, update.target);
-  const app = refreshed.apps.find((entry) => entry?.name === name);
-  if (app === undefined)
-    throw new ConsoleError(
-      404,
-      'APP_NOT_FOUND',
-      `No deployed application named ${name} on this target.`,
-    );
-  return { app };
+  const connection = await connectionFor(options, options.target);
+  const identity = tenantIdentity(connection.hostgroup, options.target);
+  const writable = await writerFor(options, connection);
+  sendJson(response, 200, {
+    csrfToken: current.csrf,
+    writable,
+    tenant: identity.tenant,
+    ...(identity.hostgroup ? { hostgroup: identity.hostgroup } : {}),
+  });
 }
 
-async function updateCron(
+async function listApplications(options: HandlerOptions): Promise<{
+  applications: ReturnType<typeof toSummary>[];
+  error?: string;
+}> {
+  try {
+    const loaded = await loadApplications(options);
+    return { applications: loaded.applications.map(toSummary) };
+  } catch (error) {
+    options.log(
+      sanitizePublicText(error instanceof Error ? error.message : 'application query failed'),
+    );
+    const message =
+      error instanceof ConsoleError ? error.message : 'The applications could not be read.';
+    return { applications: [], error: message };
+  }
+}
+
+async function present(options: HandlerOptions, name: string) {
+  const loaded = await loadApplications(options);
+  const application = requireApplication(loaded.applications, name);
+  const logs = await logsFor(options, loaded.connection, name);
+  const signals = await options.cluster.readSignals(loaded.connection, name);
+  return withProjections(application, logs, signals);
+}
+
+function withProjections(
+  application: ApplicationView,
+  logs: { unpublished: true } | { lines: string[] },
+  signals: SignalView | undefined,
+) {
+  return { ...application, logs, ...(signals ? { signals } : {}) };
+}
+
+async function logsFor(
   options: HandlerOptions,
+  connection: ClusterConnection,
   name: string,
-  update: { target: string; suspend: boolean },
-) {
-  assertTenantTarget(options, update.target);
-  const loaded = await loadTarget(options, update.target);
-  const cron = loaded.cronJobs.map(summarizeCron).find((entry) => entry?.name === name);
-  if (cron === undefined)
-    throw new ConsoleError(404, 'CRON_NOT_FOUND', `No cron job named ${name} on this target.`);
-  if (cron.suspend !== update.suspend) {
-    await options.cluster.patchCronJob(loaded.connection, name, update.suspend);
-  }
-  return { cronJob: { ...cron, suspend: update.suspend } };
+): Promise<{ unpublished: true } | { lines: string[] }> {
+  const lines = await options.cluster.readLogs(connection, name);
+  return lines === undefined
+    ? { unpublished: true }
+    : { lines: lines.map((line) => sanitizePublicText(line, 500)) };
 }
 
-async function loadTarget(options: HandlerOptions, target: string) {
-  const connection = await connectionFor(options, target);
-  const [listedDocuments, listedCronJobs] = await Promise.all([
+async function loadApplications(options: HandlerOptions) {
+  const connection = await connectionFor(options, options.target);
+  const [documents, bindings] = await Promise.all([
     options.cluster.listWorkloads(connection),
-    options.cluster.listCronJobs(connection),
+    options.cluster.listBindings(connection),
   ]);
-  const documents = listedDocuments.filter((document) =>
-    workloadInTenantScope(document, connection),
-  );
-  const cronJobs = listedCronJobs.filter((job) => cronInTenantScope(job, connection.namespace));
-  const apps = documents
-    .map((document) => summarizeWorkload(document, target, cronJobs))
-    .filter((app): app is NonNullable<typeof app> => app !== undefined)
-    .sort((left, right) => left.name.localeCompare(right.name));
+  const scoped = documents.filter((document) => workloadInTenantScope(document, connection));
   return {
     connection,
-    documents,
-    cronJobs,
-    apps,
-    unassigned: unassignedCronJobs(
-      apps.filter((app): app is NonNullable<typeof app> => app !== undefined),
-      cronJobs,
-    ),
+    documents: scoped,
+    applications: summarizeApplications(scoped, bindings),
   };
+}
+
+function membersOf(
+  loaded: { documents: WorkloadDocument[]; applications: ApplicationView[] },
+  name: string,
+): WorkloadDocument[] {
+  requireApplication(loaded.applications, name);
+  return loaded.documents.filter((document) => {
+    const workload = document.metadata?.labels?.['di-framework.dev/workload'];
+    return document.metadata?.name === name || workload === name;
+  });
+}
+
+function requireApplication(
+  applications: readonly ApplicationView[],
+  name: string,
+): ApplicationView {
+  const application = applications.find((entry) => entry.name === name);
+  if (application === undefined) {
+    throw new ConsoleError(404, 'APP_NOT_FOUND', `No application named ${name}.`);
+  }
+  return application;
+}
+
+async function requireWrite(options: HandlerOptions): Promise<void> {
+  const connection = await connectionFor(options, options.target);
+  if (!(await writerFor(options, connection))) {
+    throw new ConsoleError(403, 'WRITES_FORBIDDEN', WRITES_FORBIDDEN);
+  }
+}
+
+function writerFor(options: HandlerOptions, connection: ClusterConnection): Promise<boolean> {
+  const cached = options.writers.get(options.target);
+  if (cached !== undefined) return cached;
+  const pending = options.cluster.canWrite(connection).catch((error) => {
+    options.log(sanitizePublicText(error instanceof Error ? error.message : 'write check failed'));
+    options.writers.delete(options.target);
+    return false;
+  });
+  options.writers.set(options.target, pending);
+  return pending;
 }
 
 function connectionFor(options: HandlerOptions, targetName: string): Promise<ClusterConnection> {
   const cached = options.connections.get(targetName);
   if (cached !== undefined) return cached;
-  const manifest = loadManifest(options);
+  const manifest = loadDeployManifest(options.deps.cwd(), options.deps.env);
+  const selected = manifest.targets[targetName];
+  if (
+    targetName !== options.target ||
+    selected?.kind !== 'external' ||
+    selected.hostgroup === undefined
+  ) {
+    throw new ConsoleError(404, 'TENANT_SCOPE', 'This console is scoped to one tenant.');
+  }
   const target = resolveTarget(manifest, targetName);
   const pending = resolveConnection(target, manifest.workspaceRoot, manifest.path, options.deps);
   options.connections.set(target.name, pending);
@@ -446,48 +504,8 @@ function connectionFor(options: HandlerOptions, targetName: string): Promise<Clu
   return pending;
 }
 
-function loadManifest(options: HandlerOptions) {
-  return loadDeployManifest(options.deps.cwd(), options.deps.env);
-}
-
-function assertTenantTarget(options: HandlerOptions, target: string): string {
-  const selected = loadManifest(options).targets[target];
-  const tenant = selected?.kind === 'external' && selected.hostgroup !== undefined;
-  if (target !== options.target || !tenant) {
-    throw new ConsoleError(404, 'TENANT_SCOPE', 'This console is scoped to one tenant.');
-  }
-  return target;
-}
-
-function requiredQueryTarget(url: URL): string {
-  const target = url.searchParams.get('target');
-  if (target === null || target.length === 0) {
-    throw new ConsoleError(400, 'TARGET_REQUIRED', 'Choose a deployment target.');
-  }
-  return target;
-}
-
-function parseServiceCreate(body: unknown): ServiceCreateInput {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'Request body must be an object.');
-  }
-  const record = body as Record<string, unknown>;
-  const allowed = new Set([
-    'target',
-    'type',
-    'name',
-    'className',
-    'memory',
-    'storage',
-    'cpu',
-    'deletionPolicy',
-  ]);
-  if (Object.keys(record).some((key) => !allowed.has(key))) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'The request contains unsupported fields.');
-  }
-  if (typeof record.target !== 'string' || record.target.length === 0) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'A deployment target is required.');
-  }
+function parseServiceCreate(body: unknown, target: string): ServiceCreateInput {
+  const record = recordBody(body, ['type', 'name', 'className', 'memory', 'storage', 'cpu']);
   if (typeof record.type !== 'string' || !isServiceType(record.type)) {
     throw new ConsoleError(
       400,
@@ -499,11 +517,11 @@ function parseServiceCreate(body: unknown): ServiceCreateInput {
     throw new ConsoleError(
       400,
       'INVALID_NAME',
-      'Service name must be a DNS label of at most 40 characters.',
+      'Service name must use lowercase letters, digits, and hyphens.',
     );
   }
-  const input: ServiceCreateInput = { target: record.target, type: record.type, name: record.name };
-  for (const key of ['className', 'memory', 'storage', 'cpu', 'deletionPolicy'] as const) {
+  const input: ServiceCreateInput = { target, type: record.type, name: record.name };
+  for (const key of ['className', 'memory', 'storage', 'cpu'] as const) {
     const value = record[key];
     if (value === undefined) continue;
     if (typeof value !== 'string' || value.length === 0 || value.length > 40) {
@@ -513,15 +531,71 @@ function parseServiceCreate(body: unknown): ServiceCreateInput {
       throw new ConsoleError(
         400,
         'INVALID_NAME',
-        'Class name must be a DNS label of at most 40 characters.',
+        'Class name must use lowercase letters, digits, and hyphens.',
       );
-    }
-    if (key === 'deletionPolicy' && !DELETION_POLICIES.has(value)) {
-      throw new ConsoleError(400, 'INVALID_SERVICE', 'Deletion policy must be Retain or Delete.');
     }
     input[key] = value;
   }
   return input;
+}
+
+function parseBind(body: unknown, workload: string): BindInput {
+  const record = recordBody(body, ['binding', 'service', 'capability']);
+  if (typeof record.binding !== 'string' || !isBackingServiceName(record.binding, 54)) {
+    throw new ConsoleError(
+      400,
+      'INVALID_NAME',
+      'Binding name must use lowercase letters, digits, and hyphens.',
+    );
+  }
+  if (typeof record.service !== 'string' || !isBackingServiceName(record.service)) {
+    throw new ConsoleError(
+      400,
+      'INVALID_NAME',
+      'Service name must use lowercase letters, digits, and hyphens.',
+    );
+  }
+  if (typeof record.capability !== 'string' || !isServiceType(record.capability)) {
+    throw new ConsoleError(
+      400,
+      'INVALID_SERVICE',
+      `Service type must be one of ${SERVICE_TYPES.join(', ')}.`,
+    );
+  }
+  return {
+    workload,
+    binding: record.binding,
+    service: record.service,
+    capability: record.capability,
+  };
+}
+
+function recordBody(body: unknown, allowed: readonly string[]): Record<string, unknown> {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ConsoleError(400, 'INVALID_BODY', 'Request body must be an object.');
+  }
+  const record = body as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !allowed.includes(key))) {
+    throw new ConsoleError(400, 'INVALID_BODY', 'The request contains unsupported fields.');
+  }
+  return record;
+}
+
+function applicationPath(pathname: string): { name: string; rest: string[] } | undefined {
+  if (!pathname.startsWith('/api/applications/')) return undefined;
+  const tail = pathname.slice('/api/applications/'.length);
+  if (tail.length === 0) return undefined;
+  const [rawName, ...rest] = tail.split('/');
+  if (rawName === undefined || rawName.length === 0 || rest.some((part) => part.length === 0))
+    return undefined;
+  try {
+    return {
+      name: decodeURIComponent(rawName),
+      rest: rest.map((part) => decodeURIComponent(part)),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 function namedPath(pathname: string, prefix: string): string | undefined {
@@ -578,6 +652,24 @@ async function readBody(request: IncomingMessage): Promise<unknown> {
   }
 }
 
+function publicService(service: ServiceView): {
+  name: string;
+  className: string;
+  type: string;
+  ready: boolean;
+  detail?: string;
+} {
+  const ready = service.ready === 'True';
+  const detail = ready ? undefined : platformSentence(service.message);
+  return {
+    name: service.name,
+    className: service.className,
+    type: service.type,
+    ready,
+    ...(detail ? { detail } : {}),
+  };
+}
+
 function publicError(error: unknown): { status: number; body: { error: string; code: string } } {
   if (error instanceof ConsoleError) {
     return { status: error.status, body: { error: error.message, code: error.code } };
@@ -586,46 +678,46 @@ function publicError(error: unknown): { status: number; body: { error: string; c
     const status =
       error.code === 'WASMCLOUD_SERVICE_NOT_FOUND' || error.code === 'WASMCLOUD_TARGET_NOT_FOUND'
         ? 404
-        : error.code === 'WASMCLOUD_SERVICE_ALREADY_EXISTS'
+        : error.code === 'WASMCLOUD_SERVICE_ALREADY_EXISTS' ||
+            error.code === 'WASMCLOUD_SERVICE_IN_USE'
           ? 409
           : error.code === 'WASMCLOUD_SERVICE_UNAUTHORIZED'
             ? 403
-            : error.code === 'WASMCLOUD_SERVICE_IN_USE'
-              ? 409
-              : error.exitCode === 2
-                ? 400
-                : 502;
-    if (status === 502) {
-      return {
-        status,
-        body: { error: 'The cluster request failed.', code: 'CLUSTER_REQUEST_FAILED' },
-      };
-    }
-    if (error.code === 'WASMCLOUD_SERVICE_UNAUTHORIZED') {
-      return {
-        status,
-        body: {
-          error: 'Not authorized to manage backing services on this target.',
-          code: error.code,
-        },
-      };
-    }
-    return { status, body: { error: sanitizePublicText(error.message), code: error.code } };
+            : error.exitCode === 2
+              ? 400
+              : 502;
+    return {
+      status,
+      body: { error: failureSentence(error.code, error.message, status), code: error.code },
+    };
   }
   return {
     status: 502,
-    body: { error: 'The cluster request failed.', code: 'CLUSTER_REQUEST_FAILED' },
+    body: { error: 'The application could not be read.', code: 'REQUEST_FAILED' },
   };
+}
+
+function failureSentence(code: string, message: string, status: number): string {
+  if (code === 'WASMCLOUD_SERVICE_UNAUTHORIZED')
+    return 'This credential cannot change backing services.';
+  if (code === 'WASMCLOUD_SERVICE_NOT_FOUND') return 'No backing service with that name.';
+  if (code === 'WASMCLOUD_TARGET_NOT_FOUND') return 'This tenant could not be opened.';
+  if (code === 'WASMCLOUD_SERVICE_IN_USE')
+    return 'That backing service is still bound to an application.';
+  if (code === 'WASMCLOUD_SERVICE_ALREADY_EXISTS')
+    return 'A backing service with that name already exists.';
+  const sentence = platformSentence(message);
+  if (sentence !== undefined) return sentence;
+  return status === 400 ? 'The request was not accepted.' : 'The request could not be completed.';
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   if (response.headersSent) return;
-  const payload = JSON.stringify(body);
   response.writeHead(status, {
     ...SECURITY_HEADERS,
     'content-type': 'application/json; charset=utf-8',
   });
-  response.end(payload);
+  response.end(JSON.stringify(body));
 }
 
 function sendFile(response: ServerResponse, path: string, contentType: string): void {
@@ -677,5 +769,3 @@ function isSpaPath(pathname: string): boolean {
 function silentIo(): CliIo {
   return { stdout: { write: () => undefined }, stderr: { write: () => undefined } };
 }
-
-export type { CronJobDocument, WorkloadDocument };

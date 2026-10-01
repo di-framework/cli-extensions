@@ -1,128 +1,63 @@
 import { describe, expect, it } from 'bun:test';
 import { mkdirSync, mkdtempSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CommandFailure } from '@di-framework/cli-extension';
-import { createSessionStore, readCookie, sessionCookie } from '../src/console/auth';
-import {
-  assertResourceName,
-  type CronJobDocument,
-  cronInTenantScope,
-  isSensitiveConfigKey,
-  listTargetViews,
-  parseAppUpdate,
-  parseCronUpdate,
-  planWorkloadUpdate,
-  publicRegistryHost,
-  queueSettingBounds,
-  queueSettingLabel,
-  storagePinsReplicas,
-  summarizeCron,
-  summarizeWorkload,
-  unassignedCronJobs,
-  type WorkloadDocument,
-  workloadInTenantScope,
-} from '../src/console/catalog';
-import { createKubectlConsoleCluster } from '../src/console/cluster';
-import { sanitizePublicText } from '../src/console/errors';
-import {
-  consoleAssetsDirectory,
-  consolePassword,
-  parseConsoleArgs,
-  runWasmcloudConsole,
-} from '../src/console/run';
+import { createSessionStore, readCookie, sessionCookie, tokensMatch } from '../src/console/auth';
+import type { WorkloadDocument } from '../src/console/catalog';
+import { type ConsoleCluster, createKubectlConsoleCluster } from '../src/console/cluster';
+import { consoleAssetsDirectory, parseConsoleArgs, runWasmcloudConsole } from '../src/console/run';
 import { startConsoleServer } from '../src/console/server';
-import { createCliConsoleServices } from '../src/console/services';
-import { parseDeployManifest } from '../src/manifest';
+import { type ConsoleServices, createCliConsoleServices } from '../src/console/services';
 import type { ClusterConnection } from '../src/target';
 import { captureIo, fakeDeps, makeWorkspace } from './helpers';
 
 const connection = {
-  target: 'development',
+  target: 'warehouse',
   kubeconfig: '/tmp/kubeconfig',
-  namespace: 'wasmcloud',
-  registry: { pull: 'registry.example.com/team', push: 'registry.example.com/team' },
+  namespace: 'di-tenant-warehouse',
+  hostgroup: 'tenant-warehouse',
+  registry: { push: 'registry.example', pull: 'registry.example' },
 } as ClusterConnection;
 
-function request(
-  port: number,
-  options: {
-    path: string;
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-    origin?: boolean;
-  },
-): Promise<{
-  status: number;
-  headers: Record<string, string | string[] | undefined>;
-  body: string;
-}> {
-  const method = options.method ?? 'GET';
-  const headers: Record<string, string> = {
-    host: `127.0.0.1:${port}`,
-    ...(options.origin === false ? {} : { origin: `http://127.0.0.1:${port}` }),
-    ...options.headers,
-  };
-  if (options.body !== undefined)
-    headers['content-length'] = String(Buffer.byteLength(options.body));
-  return new Promise((resolve, reject) => {
-    const req = httpRequest(
-      { host: '127.0.0.1', port, path: options.path, method, headers },
-      (response) => {
-        const chunks: Buffer[] = [];
-        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-        response.on('end', () =>
-          resolve({
-            status: response.statusCode ?? 0,
-            headers: response.headers,
-            body: Buffer.concat(chunks).toString('utf8'),
-          }),
-        );
+function clusterFrom(
+  respond: (args: readonly string[]) => { exitCode?: number; stdout?: string; stderr?: string },
+) {
+  const logs: string[] = [];
+  const base = fakeDeps({ cwd: '/tmp' });
+  const cluster = createKubectlConsoleCluster(
+    {
+      ...base,
+      runCaptured: async (_command, args) => {
+        const result = respond(args);
+        return {
+          exitCode: result.exitCode ?? 0,
+          stdout: result.stdout ?? '',
+          stderr: result.stderr ?? '',
+        };
       },
-    );
-    req.on('error', reject);
-    if (options.body !== undefined) req.write(options.body);
-    req.end();
-  });
-}
-
-function sessionCookieHeader(setCookie: string | string[] | undefined): string {
-  const value = Array.isArray(setCookie) ? setCookie[0] : setCookie;
-  return (value ?? '').split(';')[0] ?? '';
+    },
+    (line) => logs.push(line),
+  );
+  return { cluster, logs };
 }
 
 describe('console branches', () => {
-  it('covers session expiry, login windows, and cookie decoding', () => {
+  it('covers session expiry and cookie decoding', () => {
     const store = createSessionStore();
-    const first = store.create();
+    const first = store.create(0);
     expect(store.read(first.id, first.session.expiresAt)).toBeUndefined();
     expect(store.read(undefined, 0)).toBeUndefined();
+    expect(store.read('', 0)).toBeUndefined();
     expect(store.read('missing', 0)).toBeUndefined();
     store.destroy(undefined);
-    for (let index = 0; index < 100; index += 1) store.create();
-    expect(store.create().id.length).toBeGreaterThan(10);
-
-    expect(store.loginAllowed('client', 0)).toBe(true);
-    store.recordFailure('client', 0);
-    store.recordFailure('client', 1);
-    for (let index = 0; index < 6; index += 1) store.recordFailure('client', 2);
-    expect(store.loginAllowed('client', 2)).toBe(false);
-    expect(store.loginAllowed('client', 15 * 60 * 1000 + 3)).toBe(true);
-    store.clearFailures('client');
-    expect(store.loginAllowed('client', 3)).toBe(true);
-    store.recordFailure('stale', 0);
-    store.recordFailure('fresh', 15 * 60 * 1000 + 4);
-    for (let index = 0; index < 100; index += 1) {
-      for (let failure = 0; failure < 8; failure += 1) {
-        store.recordFailure(`source-${index}`, 10);
-      }
-    }
-    store.recordFailure('overflow', 10);
-    expect(store.loginAllowed('source-0', 10)).toBe(true);
-    expect(store.loginAllowed('source-1', 10)).toBe(false);
-
+    store.destroy(first.id);
+    for (let index = 0; index < 100; index += 1) store.create(10);
+    expect(store.create(10).id.length).toBeGreaterThan(10);
+    expect(tokensMatch(undefined, 'expected')).toBe(false);
+    expect(tokensMatch('expected', 'expected')).toBe(true);
     expect(readCookie(undefined, 'di_console_session')).toBeUndefined();
     expect(
       readCookie('other=1; broken; di_console_session=%E0%A4%A', 'di_console_session'),
@@ -131,346 +66,148 @@ describe('console branches', () => {
     expect(sessionCookie('operator', 10)).toContain('Max-Age=10');
   });
 
-  it('redacts credential-shaped text and validates catalog updates', () => {
-    const long = 'a'.repeat(50);
-    const sanitized = sanitizePublicText(`Bearer ${long} token=${long} ${'word '.repeat(100)}`, 80);
-    expect(sanitized.endsWith('…')).toBe(true);
-    expect(sanitized).not.toContain(long);
-
-    expect(() => assertResourceName('Not_A_Name', 'Application name')).toThrow('DNS label');
-    expect(isSensitiveConfigKey('API_KEY')).toBe(true);
-    expect(queueSettingLabel('UNRELATED')).toBe('UNRELATED');
-    expect(queueSettingLabel('DI_QUEUE_MAIL_MAX_RETRIES')).toBe('mail max retries');
-    expect(queueSettingLabel('DI_QUEUE_MAIL_BACKOFF_MS')).toBe('mail backoff (ms)');
-    expect(queueSettingLabel('DI_QUEUE_MAIL_TIMEOUT_MS')).toBe('mail timeout (ms)');
-    expect(queueSettingBounds('DI_QUEUE_MAIL_MAX_RETRIES')).toEqual({ min: 0, max: 100 });
-    expect(queueSettingBounds('DI_QUEUE_MAIL_BACKOFF_MS')?.max).toBe(3_600_000);
-    expect(queueSettingBounds('DI_QUEUE_MAIL_TIMEOUT_MS')?.min).toBe(1);
-    expect(queueSettingBounds('OTHER')).toBeUndefined();
-    expect(publicRegistryHost('registry.example.com')).toBe('registry.example.com');
-
-    const manifest = parseDeployManifest(
-      '/workspace/di-framework.deploy.toml',
-      `default-target = "local"\n[targets.local]\nplatform = "deploy/platform"\nstack = "dev"\n[targets.edge]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
-      {},
-    );
-    expect(listTargetViews(manifest).map((target) => target.kind)).toEqual(['external', 'managed']);
-
-    expect(
-      storagePinsReplicas({
-        spec: {
-          template: {
-            spec: {
-              components: [
-                { localResources: { environment: { config: { ACTOR_STORAGE_DIR: '/actors' } } } },
-              ],
-            },
-          },
-        },
-      }),
-    ).toBe(true);
-    expect(
-      storagePinsReplicas({
-        spec: {
-          template: {
-            spec: {
-              components: [
-                { localResources: { environment: { config: { QUEUE_DB_PATH: '/queue' } } } },
-              ],
-            },
-          },
-        },
-      }),
-    ).toBe(true);
-    expect(storagePinsReplicas({})).toBe(false);
-    expect(
-      workloadInTenantScope(
-        { metadata: { namespace: 'di-tenant-other' } },
-        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
-      ),
-    ).toBe(false);
-    expect(
-      workloadInTenantScope(
-        {
-          metadata: { namespace: 'di-tenant-warehouse' },
-          spec: { template: { spec: { hostSelector: { hostgroup: 'other' } } } },
-        },
-        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
-      ),
-    ).toBe(false);
-    expect(
-      workloadInTenantScope(
-        { metadata: { namespace: 'di-tenant-warehouse' } },
-        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
-      ),
-    ).toBe(true);
-    expect(
-      workloadInTenantScope(
-        {
-          metadata: { namespace: 'di-tenant-warehouse' },
-          spec: { template: { spec: { hostSelector: { hostgroup: 'storage' } } } },
-        },
-        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
-      ),
-    ).toBe(true);
-    expect(
-      workloadInTenantScope(
-        {
-          metadata: { namespace: 'di-tenant-warehouse' },
-          spec: { template: { spec: { hostSelector: { hostgroup: 'tenant-warehouse-storage' } } } },
-        },
-        {
-          namespace: 'di-tenant-warehouse',
-          hostgroup: 'tenant-warehouse',
-          storageHostgroup: 'tenant-warehouse-storage',
-        },
-      ),
-    ).toBe(true);
-    expect(
-      workloadInTenantScope(
-        {
-          metadata: { namespace: 'di-tenant-warehouse' },
-          spec: { template: { spec: { hostSelector: { hostgroup: 'storage' } } } },
-        },
-        {
-          namespace: 'di-tenant-warehouse',
-          hostgroup: 'tenant-warehouse',
-          storageHostgroup: 'tenant-warehouse-storage',
-        },
-      ),
-    ).toBe(false);
-    expect(
-      cronInTenantScope({ metadata: { namespace: 'di-tenant-other' } }, 'di-tenant-warehouse'),
-    ).toBe(false);
-    expect(cronInTenantScope({}, 'di-tenant-warehouse')).toBe(true);
-
-    const bare: WorkloadDocument = {
-      metadata: {
-        name: 'bare',
-        labels: { 'app.kubernetes.io/managed-by': 'di-framework' },
-      },
-      spec: { template: { spec: { components: [{ name: 'bare' }] } } },
-      status: {
-        replicas: { ready: 1 },
-        conditions: [{ type: 'Ready', status: 'True', message: 'm'.repeat(250) }],
-      },
-    };
-    const bareView = summarizeWorkload(bare, 'development', []);
-    expect(bareView?.pinnedReplicas).toBe(false);
-    expect(bareView?.message?.endsWith('…')).toBe(true);
-    expect(summarizeWorkload({}, 'development')).toBeUndefined();
-    expect(summarizeWorkload({ metadata: { name: 'x' } }, 'development')).toBeUndefined();
-    expect(summarizeCron({})).toBeUndefined();
-    expect(
-      summarizeCron({
-        metadata: { name: 'job', labels: { 'app.kubernetes.io/managed-by': 'other' } },
-      }),
-    ).toBeUndefined();
-    expect(
-      summarizeCron({
-        metadata: { name: 'job', labels: { 'app.kubernetes.io/managed-by': 'di-framework' } },
-      }),
-    ).toBeUndefined();
-    const cron = summarizeCron({
-      metadata: { name: 'job', labels: { 'app.kubernetes.io/managed-by': 'di-framework' } },
-      spec: { schedule: '0 * * * *' },
+  it('reports request failures without returning sensitive command output', async () => {
+    const listed = '{"items":[{"metadata":{"name":"greeter"}}]}';
+    const ok = clusterFrom((args) => {
+      if (args.includes('auth')) return { stdout: 'yes\n' };
+      if (args.includes('configmap') && args.some((arg) => arg.includes('projection=logs'))) {
+        return {
+          stdout: JSON.stringify({ items: [{ data: { lines: 'hello\nnext', ignored: 1 } }] }),
+        };
+      }
+      if (args.includes('configmap') && args.some((arg) => arg.includes('projection=signals'))) {
+        return {
+          stdout: JSON.stringify({
+            items: [{ data: { success: '2', error: '1', compute: '1,2' } }],
+          }),
+        };
+      }
+      if (args.includes('servicebindings.platform.di-framework.dev') && args.includes('get'))
+        return { stdout: listed };
+      return { stdout: listed };
     });
-    expect(
-      unassignedCronJobs(
-        [],
-        [
-          cron
-            ? {
-                metadata: {
-                  name: 'job',
-                  labels: { 'app.kubernetes.io/managed-by': 'di-framework' },
-                },
-                spec: { schedule: '0 * * * *' },
-              }
-            : {},
-        ],
-      ),
-    ).toHaveLength(1);
-
-    const sensitiveHost: WorkloadDocument = {
-      metadata: { name: 'edge', labels: { 'app.kubernetes.io/managed-by': 'di-framework' } },
-      spec: {
-        template: {
-          spec: {
-            components: [
-              {
-                hostInterfaces: [
-                  {
-                    namespace: 'wasi',
-                    package: 'http',
-                    config: { host: 'http://user:secret@example.com', API_KEY: 'visible-name' },
-                  },
-                ],
-                localResources: {
-                  environment: {
-                    config: { DI_QUEUE_MAIL_CONCURRENCY: 'nope', PLAIN: 'value' },
-                  },
-                },
-              },
-            ],
-          },
-        },
-      },
-    };
-    expect(summarizeWorkload(sensitiveHost, 'development')?.httpHost).toBeUndefined();
-
-    expect(() => parseAppUpdate(null)).toThrow('object');
-    expect(() =>
-      parseAppUpdate({ namespace: 'kube-system', target: 'development', replicas: 1 }),
-    ).toThrow('unsupported');
-    expect(() => parseAppUpdate({ target: '' })).toThrow('target');
-    expect(() => parseAppUpdate({ target: 'development', replicas: 1.5 })).toThrow('Replicas');
-    expect(() => parseAppUpdate({ target: 'development', allowedIpNameLookups: 'echo' })).toThrow(
-      'DNS',
-    );
-    expect(() => parseAppUpdate({ target: 'development', allowedIpNameLookups: ['*'] })).toThrow(
-      'hostname',
-    );
-    expect(() =>
-      parseAppUpdate({
-        target: 'development',
-        allowedIpNameLookups: Array.from({ length: 33 }, () => 'a.example.com'),
-      }),
-    ).toThrow('32');
-    expect(() => parseAppUpdate({ target: 'development', queueSettings: {} })).toThrow('list');
-    expect(() => parseAppUpdate({ target: 'development', queueSettings: [null] })).toThrow(
-      'key and value',
-    );
-    expect(() =>
-      parseAppUpdate({ target: 'development', queueSettings: [{ key: 'NOPE', value: 1 }] }),
-    ).toThrow('already declared');
-    expect(() =>
-      parseAppUpdate({
-        target: 'development',
-        queueSettings: [{ key: 'DI_QUEUE_MAIL_CONCURRENCY', value: '2' }],
-      }),
-    ).toThrow('whole numbers');
-    expect(() => parseAppUpdate({ target: 'development' })).toThrow('at least one');
-
-    expect(planWorkloadUpdate(bare, { replicas: 2 })[0]?.op).toBe('add');
-    expect(planWorkloadUpdate(bare, { replicas: 1 })).toEqual([]);
-    expect(planWorkloadUpdate(bare, { allowedIpNameLookups: ['api.example.com'] })[0]?.op).toBe(
-      'add',
-    );
-    expect(() =>
-      planWorkloadUpdate(
-        { metadata: { name: 'empty', labels: { 'app.kubernetes.io/managed-by': 'di-framework' } } },
-        { allowedIpNameLookups: ['api.example.com'] },
-      ),
-    ).toThrow('no component');
-    const withConfig: WorkloadDocument = {
-      metadata: { name: 'queue', labels: { 'app.kubernetes.io/managed-by': 'di-framework' } },
-      spec: {
-        template: {
-          spec: {
-            components: [
-              {
-                localResources: {
-                  environment: { config: { DI_QUEUE_MAIL_TIMEOUT_MS: '10' } },
-                },
-              },
-            ],
-          },
-        },
-      },
-    };
-    expect(() =>
-      planWorkloadUpdate(withConfig, {
-        queueSettings: [{ key: 'DI_QUEUE_MAIL_TIMEOUT_MS', value: 0 }],
-      }),
-    ).toThrow('timeout');
-    expect(
-      planWorkloadUpdate(withConfig, {
-        queueSettings: [{ key: 'DI_QUEUE_MAIL_TIMEOUT_MS', value: 10 }],
-      }),
-    ).toEqual([]);
-
-    expect(() => parseCronUpdate([])).toThrow('object');
-    expect(() => parseCronUpdate({ target: 'development', suspend: true, extra: 1 })).toThrow(
-      'unsupported',
-    );
-    expect(() => parseCronUpdate({ target: '', suspend: true })).toThrow('target');
-    expect(() => parseCronUpdate({ target: 'development', suspend: 'yes' })).toThrow('suspend');
-  });
-
-  it('reports kubectl failures without returning cluster stderr', async () => {
-    const logs: string[] = [];
-    const cluster = createKubectlConsoleCluster(
-      fakeDeps({
-        cwd: '/tmp',
-        capturedStdout: {
-          'kubectl get': '{"items":[{"metadata":{"name":"greeter"}}]}',
-          kubectl: '',
-        },
-      }),
-      (line) => logs.push(line),
-    );
-    expect(await cluster.listWorkloads(connection)).toHaveLength(1);
-    expect(await cluster.listCronJobs(connection)).toHaveLength(1);
-    await cluster.patchWorkload(connection, 'greeter', []);
-    await cluster.patchCronJob(connection, 'greeter-nightly', true);
-
-    const failing = createKubectlConsoleCluster(
-      fakeDeps({
-        cwd: '/tmp',
-        exitCodes: { 'kubectl get': 1, kubectl: 1 },
-        capturedStdout: { 'kubectl get': 'Bearer secret-token-value', kubectl: '' },
-      }),
-      (line) => logs.push(line),
-    );
-    await expect(failing.listWorkloads(connection)).rejects.toMatchObject({
-      code: 'CLUSTER_REQUEST_FAILED',
+    expect(await ok.cluster.listWorkloads(connection)).toHaveLength(1);
+    expect(await ok.cluster.listBindings(connection)).toHaveLength(1);
+    await ok.cluster.patchWorkload(connection, 'greeter', []);
+    await ok.cluster.reassignSecret(connection, 'db-password', 'next-value');
+    expect(await ok.cluster.canWrite(connection)).toBe(true);
+    expect(await ok.cluster.readLogs(connection, 'greeter')).toEqual(['hello', 'next']);
+    expect(await ok.cluster.readSignals(connection, 'greeter')).toEqual({
+      success: 2,
+      error: 1,
+      compute: [1, 2],
     });
-    await expect(failing.listCronJobs(connection)).rejects.toMatchObject({ status: 502 });
-    await expect(failing.patchWorkload(connection, 'greeter', [])).rejects.toMatchObject({
+    await ok.cluster.bindService(connection, {
+      workload: 'greeter',
+      binding: 'orders-db',
+      service: 'orders',
+      capability: 'postgres',
+    });
+    await ok.cluster.unbindService(connection, 'greeter', 'orders-db');
+
+    const denied = clusterFrom(() => ({
+      exitCode: 1,
+      stderr: 'Error from server (Forbidden): cannot list',
+    }));
+    expect(await denied.cluster.listBindings(connection)).toEqual([]);
+    await expect(denied.cluster.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
+    await expect(denied.cluster.patchWorkload(connection, 'greeter', [])).rejects.toMatchObject({
+      status: 403,
+    });
+    await expect(denied.cluster.readLogs(connection, 'greeter')).resolves.toBeUndefined();
+    expect(await denied.cluster.canWrite(connection)).toBe(false);
+
+    const missingSecret = clusterFrom(() => ({
+      exitCode: 1,
+      stderr: 'Error from server (NotFound): secret missing',
+    }));
+    await expect(
+      missingSecret.cluster.reassignSecret(connection, 'db-password', 'next-value'),
+    ).rejects.toMatchObject({ status: 404 });
+    await expect(
+      missingSecret.cluster.unbindService(connection, 'greeter', 'orders-db'),
+    ).rejects.toMatchObject({ status: 404 });
+
+    const broken = clusterFrom(() => ({
+      exitCode: 1,
+      stdout: 'Bearer secret-token-value-with-enough-length',
+    }));
+    await expect(
+      broken.cluster.bindService(connection, {
+        workload: 'greeter',
+        binding: 'orders-db',
+        service: 'orders',
+        capability: 'postgres',
+      }),
+    ).rejects.toMatchObject({ status: 502 });
+    expect(broken.logs.join('\n')).toContain('[redacted]');
+
+    const malformed = clusterFrom(() => ({ stdout: '{' }));
+    await expect(malformed.cluster.listWorkloads(connection)).rejects.toMatchObject({
       status: 502,
     });
-    expect(logs.join('\n')).toContain('[redacted]');
-
-    const malformed = createKubectlConsoleCluster(
-      fakeDeps({ cwd: '/tmp', capturedStdout: { 'kubectl get': '{' } }),
-      (line) => logs.push(line),
-    );
-    await expect(malformed.listCronJobs(connection)).rejects.toMatchObject({ status: 502 });
-    await expect(malformed.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
-    const missingItems = createKubectlConsoleCluster(
-      fakeDeps({ cwd: '/tmp', capturedStdout: { 'kubectl get': '{"items":{}}' } }),
-      () => undefined,
-    );
-    await expect(missingItems.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
-    const notAList = createKubectlConsoleCluster(
-      fakeDeps({ cwd: '/tmp', capturedStdout: { 'kubectl get': 'null' } }),
-      () => undefined,
-    );
-    await expect(notAList.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
-
-    const base = fakeDeps({
-      cwd: '/tmp',
-      capturedStdout: { 'kubectl get': '{"items":[{"metadata":{"name":"greeter"}}]}' },
+    await expect(malformed.cluster.listBindings(connection)).rejects.toMatchObject({ status: 502 });
+    await expect(malformed.cluster.readLogs(connection, 'greeter')).rejects.toMatchObject({
+      status: 502,
     });
-    const forbiddenCron = createKubectlConsoleCluster(
-      {
-        ...base,
-        runCaptured: async (command, args, options) => {
-          if (args.includes('cronjob')) {
-            return {
-              exitCode: 1,
-              stdout: '',
-              stderr:
-                'Error from server (Forbidden): cronjobs.batch is forbidden: User cannot list resource "cronjobs"',
-            };
-          }
-          return base.runCaptured(command, args, options);
-        },
-      },
-      (line) => logs.push(line),
-    );
-    expect(await forbiddenCron.listCronJobs(connection)).toEqual([]);
+    const missingItems = clusterFrom(() => ({ stdout: '{"items":{}}' }));
+    await expect(missingItems.cluster.listWorkloads(connection)).rejects.toMatchObject({
+      status: 502,
+    });
+    const notAList = clusterFrom(() => ({ stdout: 'null' }));
+    await expect(notAList.cluster.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
+    const unpublished = clusterFrom((args) => {
+      if (args.includes('configmap'))
+        return {
+          stdout: JSON.stringify({ items: [{ data: { success: 'no', error: '1', compute: '' } }] }),
+        };
+      return { stdout: '{"items":[]}' };
+    });
+    expect(await unpublished.cluster.readLogs(connection, 'greeter')).toBeUndefined();
+    expect(await unpublished.cluster.readSignals(connection, 'greeter')).toBeUndefined();
+    const partialSignals = clusterFrom(() => ({
+      stdout: JSON.stringify({ items: [{ data: { success: '1', error: '0', compute: '1,no' } }] }),
+    }));
+    expect(await partialSignals.cluster.readSignals(connection, 'greeter')).toEqual({
+      success: 1,
+      error: 0,
+    });
+    const noData = clusterFrom(() => ({ stdout: JSON.stringify({ items: [{}] }) }));
+    expect(await noData.cluster.readLogs(connection, 'greeter')).toBeUndefined();
+    const resourceMissing = clusterFrom(() => ({
+      exitCode: 1,
+      stderr: 'the server does not have a resource type "servicebindings"',
+    }));
+    expect(await resourceMissing.cluster.listBindings(connection)).toEqual([]);
+    const unsafeNumber = clusterFrom(() => ({
+      stdout: JSON.stringify({ items: [{ data: { success: '1', error: '9007199254740993' } }] }),
+    }));
+    expect(await unsafeNumber.cluster.readSignals(connection, 'greeter')).toBeUndefined();
+
+    const failed = clusterFrom(() => ({ exitCode: 1, stderr: 'connection timed out' }));
+    await expect(failed.cluster.listBindings(connection)).rejects.toMatchObject({
+      status: 502,
+      message: 'Backing services could not be read.',
+    });
+    await expect(
+      failed.cluster.reassignSecret(connection, 'db-password', 'next-value'),
+    ).rejects.toMatchObject({
+      status: 502,
+      message: 'The credential could not be reassigned.',
+    });
+    await expect(
+      failed.cluster.unbindService(connection, 'greeter', 'orders-db'),
+    ).rejects.toMatchObject({
+      status: 502,
+      message: 'The backing service could not be unbound.',
+    });
+    await expect(failed.cluster.readLogs(connection, 'greeter')).rejects.toMatchObject({
+      status: 502,
+      message: 'The application could not be read.',
+    });
+    await expect(failed.cluster.readSignals(connection, 'greeter')).rejects.toMatchObject({
+      status: 502,
+    });
   });
 
   it('reads backing services through the service commands', async () => {
@@ -527,7 +264,6 @@ describe('console branches', () => {
     expect(JSON.stringify(views)).not.toContain('c'.repeat(40));
     const classes = await services.classes('development');
     expect(classes.fromCluster).toBe(true);
-    expect(classes.classes.some((entry) => entry.name === 'keyvalue-redis')).toBe(true);
     const created = await services.create({
       target: 'development',
       type: 'keyvalue',
@@ -544,64 +280,70 @@ describe('console branches', () => {
     });
   });
 
-  it('serves the remaining console routes and rejects bad requests', async () => {
+  it('rejects malformed console requests', async () => {
     const workspace = makeWorkspace({
-      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n[targets.other]\nkubeconfig = "\${kubeconfig}"\nnamespace = "other"\nregistry = "registry.example.com/team"\n`,
+      manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
     });
-    const assets = mkdtempSync(join(tmpdir(), 'console-assets-'));
-    writeFileSync(join(assets, 'index.html'), '<!doctype html><title>console</title>');
-    for (const extension of ['.js', '.css', '.svg', '.woff', '.woff2', '.ttf', '.map']) {
-      writeFileSync(join(assets, `asset${extension}`), 'asset');
-    }
-    mkdirSync(join(assets, 'nested'));
-    const document: WorkloadDocument = {
-      metadata: { name: 'greeter', labels: { 'app.kubernetes.io/managed-by': 'di-framework' } },
-      spec: { replicas: 1, template: { spec: { components: [{ name: 'greeter' }] } } },
-    };
-    let workloads = [document];
+    const bundle = assets();
     let failList = false;
-    const defaults = await startConsoleServer({
-      host: '127.0.0.1',
-      port: 0,
-      target: 'development',
-      password: 'correct horse battery',
-      assetsDirectory: assets,
-      deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
-    });
-    await defaults.close();
-
+    let explodeRead = false;
     const server = await startConsoleServer({
       host: '127.0.0.1',
       port: 0,
       target: 'development',
-      password: 'correct horse battery',
-      assetsDirectory: assets,
+      assetsDirectory: bundle,
       deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
-      now: () => 1_000,
       cluster: {
         async listWorkloads() {
-          if (failList) throw new Error('cluster unavailable');
-          return workloads;
-        },
-        async listCronJobs() {
+          if (failList) throw new Error('backend failed');
           return [
             {
               metadata: {
-                name: 'nightly',
-                labels: {
-                  'app.kubernetes.io/managed-by': 'di-framework',
-                  'app.kubernetes.io/name': 'greeter',
+                name: 'greeter',
+                namespace: 'wasmcloud',
+                labels: { 'app.kubernetes.io/managed-by': 'di-framework' },
+              },
+              spec: {
+                replicas: 1,
+                template: {
+                  spec: {
+                    components: [
+                      {
+                        name: 'greeter',
+                        localResources: { environment: { config: { COLOR: 'blue' } } },
+                      },
+                    ],
+                  },
                 },
               },
-              spec: { schedule: '0 3 * * *', suspend: false },
+              status: { readyReplicas: 1 },
             },
-          ];
+          ] as WorkloadDocument[];
+        },
+        async listBindings() {
+          return [];
         },
         async patchWorkload() {
-          workloads = [];
-        },
-        async patchCronJob() {
           return undefined;
+        },
+        async reassignSecret() {
+          return undefined;
+        },
+        async canWrite() {
+          return true;
+        },
+        async readLogs() {
+          if (explodeRead) throw new Error('backend exploded');
+          return ['line'];
+        },
+        async readSignals() {
+          return undefined;
+        },
+        async bindService() {
+          return undefined;
+        },
+        async unbindService() {
+          throw new CommandFailure('WASMCLOUD_TARGET_NOT_FOUND', 'missing target', 1);
         },
       },
       services: {
@@ -611,521 +353,348 @@ describe('console branches', () => {
         async classes() {
           return { classes: [], fromCluster: false };
         },
-        async create(input) {
-          if (input.name === 'conflict') {
-            throw new CommandFailure('WASMCLOUD_SERVICE_ALREADY_EXISTS', 'exists', 2);
-          }
-          if (input.name === 'missing-target') {
-            throw new CommandFailure('WASMCLOUD_TARGET_NOT_FOUND', 'missing target', 2);
-          }
-          if (input.name === 'denied') {
-            throw new CommandFailure('WASMCLOUD_SERVICE_UNAUTHORIZED', 'denied', 1);
-          }
-          if (input.name === 'busy')
-            throw new CommandFailure('WASMCLOUD_SERVICE_IN_USE', 'busy', 1);
-          if (input.name === 'usage') throw new CommandFailure('WASMCLOUD_USAGE', 'bad flag', 2);
-          if (input.name === 'down') throw new CommandFailure('WASMCLOUD_TOOL_FAILED', 'down', 3);
-          if (input.name === 'odd') throw 'odd failure';
-          return {
-            name: input.name,
-            namespace: 'wasmcloud',
-            type: input.type,
-            className: input.className ?? '',
-            ready: 'Unknown',
-            target: input.target,
-          };
+        async create() {
+          throw new CommandFailure('WASMCLOUD_OTHER', 'bad size', 2);
         },
-        async delete(_target, name) {
-          if (name === 'missing')
-            throw new CommandFailure('WASMCLOUD_SERVICE_NOT_FOUND', 'missing', 2);
-          return { name };
+        async delete() {
+          return { name: 'gone' };
         },
       },
     });
-
     try {
-      expect((await request(server.port, { path: '/applications' })).status).toBe(200);
-      expect((await request(server.port, { path: '/favicon.ico' })).status).toBe(404);
-      expect((await request(server.port, { path: '/assets/missing.js' })).status).toBe(404);
-      expect((await request(server.port, { path: '/assets/nested' })).status).toBe(404);
-      expect((await request(server.port, { path: '/assets/%E0%A4%A' })).status).toBe(404);
-      for (const extension of ['.js', '.css', '.svg', '.woff', '.woff2', '.ttf', '.map']) {
-        expect((await request(server.port, { path: `/assets/asset${extension}` })).status).toBe(
-          200,
-        );
-      }
-
-      const broken = await startConsoleServer({
-        host: '127.0.0.1',
-        port: 0,
-        target: 'development',
-        password: 'correct horse battery',
-        assetsDirectory: null as unknown as string,
-        deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
-        cluster: {
-          async listWorkloads() {
-            return [];
-          },
-          async listCronJobs() {
-            return [];
-          },
-          async patchWorkload() {},
-          async patchCronJob() {},
-        },
-        services: {
-          async list() {
-            return [];
-          },
-          async classes() {
-            return { classes: [], fromCluster: false };
-          },
-          async create(input) {
-            return {
-              name: input.name,
-              namespace: '',
-              type: input.type,
-              className: '',
-              ready: 'Unknown',
-              target: input.target,
-            };
-          },
-          async delete(_target, name) {
-            return { name };
-          },
-        },
-      });
-      expect((await request(broken.port, { path: '/' })).status).toBe(500);
-      await broken.close();
-
-      const emptyAssets = mkdtempSync(join(tmpdir(), 'console-empty-'));
-      const missingPage = await startConsoleServer({
-        host: '127.0.0.1',
-        port: 0,
-        target: 'development',
-        password: 'correct horse battery',
-        assetsDirectory: emptyAssets,
-        deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
-        cluster: {
-          async listWorkloads() {
-            return [];
-          },
-          async listCronJobs() {
-            return [];
-          },
-          async patchWorkload() {},
-          async patchCronJob() {},
-        },
-        services: {
-          async list() {
-            return [];
-          },
-          async classes() {
-            return { classes: [], fromCluster: false };
-          },
-          async create(input) {
-            return {
-              name: input.name,
-              namespace: '',
-              type: input.type,
-              className: '',
-              ready: 'Unknown',
-              target: input.target,
-            };
-          },
-          async delete(_target, name) {
-            return { name };
-          },
-        },
-      });
-      expect((await request(missingPage.port, { path: '/' })).status).toBe(404);
-      await missingPage.close();
-
+      const opened = await request(server.port, { path: '/api/session' });
+      const session = cookie(opened.headers['set-cookie']);
+      const csrf = (JSON.parse(opened.body) as { csrfToken: string }).csrfToken;
+      const auth = { cookie: session, 'x-di-console-csrf': csrf };
       expect(
         (
           await request(server.port, {
-            path: '/api/login',
-            method: 'POST',
-            body: JSON.stringify({ password: 'nope' }),
-            origin: false,
+            path: '/api/applications/nope',
+            headers: { cookie: session },
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/Bad',
+            headers: { cookie: session },
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/nope',
+            headers: { cookie: session },
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/%E0%A4%A',
+            headers: { cookie: session },
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/routes/missing',
+            method: 'PATCH',
+            headers: auth,
+            body: JSON.stringify({ enabled: 'yes' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/environment',
+            method: 'PUT',
+            headers: { cookie: session },
+            body: JSON.stringify({ key: 'COLOR', value: 'blue' }),
           })
         ).status,
       ).toBe(403);
       expect(
-        (await request(server.port, { path: '/api/login', method: 'POST', body: '[]' })).status,
-      ).toBe(401);
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/environment',
+            method: 'PUT',
+            headers: auth,
+            origin: false,
+            body: JSON.stringify({ key: 'COLOR', value: 'blue' }),
+          })
+        ).status,
+      ).toBe(403);
       expect(
-        (await request(server.port, { path: '/api/login', method: 'POST', body: '{' })).status,
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/environment',
+            method: 'PUT',
+            headers: auth,
+            body: '{',
+          })
+        ).status,
       ).toBe(400);
       expect(
         (
           await request(server.port, {
-            path: '/api/login',
+            path: '/api/applications/greeter/environment',
+            method: 'PUT',
+            headers: auth,
+            body: JSON.stringify({ key: 'COLOR', value: 'blue', extra: true }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/environment',
+            method: 'PUT',
+            headers: auth,
+            body: JSON.stringify({ key: 1, value: 'blue' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/environment',
+            method: 'PUT',
+            headers: auth,
+            body: '[]',
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/backing-services',
             method: 'POST',
-            body: `{"password":"${'x'.repeat(70_000)}"}`,
+            headers: auth,
+            body: JSON.stringify({ type: 'nope', name: 'orders' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/backing-services',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ type: 'postgres', name: 'Bad' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/backing-services',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({
+              type: 'postgres',
+              name: 'orders',
+              className: 'NOT',
+              memory: 'x'.repeat(41),
+            }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/backing-services',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ type: 'postgres', name: 'orders', memory: '' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/backing-services/NOT',
+            method: 'DELETE',
+            headers: auth,
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/bindings',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ binding: 'orders', service: 'orders', capability: 'nope' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/bindings',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ binding: 'Bad', service: 'orders', capability: 'postgres' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/bindings',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ binding: 'orders', service: 'Bad', capability: 'postgres' }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/bindings/missing',
+            method: 'DELETE',
+            headers: auth,
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/applications/greeter/secrets/missing',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ value: 1 }),
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await request(server.port, {
+            path: '/api/backing-services',
+            method: 'POST',
+            headers: auth,
+            body: 'x'.repeat(70_000),
           })
         ).status,
       ).toBe(413);
-      for (let attempt = 0; attempt < 7; attempt += 1) {
-        expect(
-          (
-            await request(server.port, {
-              path: '/api/login',
-              method: 'POST',
-              body: JSON.stringify({ password: 'nope' }),
-            })
-          ).status,
-        ).toBe(401);
-      }
       expect(
         (
           await request(server.port, {
-            path: '/api/login',
-            method: 'POST',
-            body: JSON.stringify({ password: 'correct horse battery' }),
+            path: '/api/backing-services/%E0%A4%A',
+            headers: { cookie: session },
           })
         ).status,
-      ).toBe(429);
-
-      const fresh = await startConsoleServer({
-        host: '127.0.0.1',
-        port: 0,
-        target: 'development',
-        password: 'correct horse battery',
-        assetsDirectory: assets,
-        deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
-        cluster: {
-          async listWorkloads() {
-            if (failList) throw 'cluster down';
-            return workloads;
-          },
-          async listCronJobs(): Promise<CronJobDocument[]> {
-            return [
-              {
-                metadata: {
-                  name: 'nightly',
-                  labels: {
-                    'app.kubernetes.io/managed-by': 'di-framework',
-                    'app.kubernetes.io/name': 'greeter',
-                  },
-                },
-                spec: { schedule: '0 3 * * *', suspend: true },
-              },
-              {
-                metadata: {
-                  name: 'orphan',
-                  labels: { 'app.kubernetes.io/managed-by': 'di-framework' },
-                },
-                spec: { schedule: '0 4 * * *' },
-              },
-            ];
-          },
-          async patchWorkload() {
-            workloads = [];
-          },
-          async patchCronJob() {},
-        },
-        services: {
-          async list() {
-            return [];
-          },
-          async classes() {
-            return { classes: [], fromCluster: false };
-          },
-          async create(input) {
-            if (input.name === 'conflict')
-              throw new CommandFailure('WASMCLOUD_SERVICE_ALREADY_EXISTS', 'exists', 2);
-            if (input.name === 'missing-target')
-              throw new CommandFailure('WASMCLOUD_TARGET_NOT_FOUND', 'missing target', 2);
-            if (input.name === 'denied')
-              throw new CommandFailure('WASMCLOUD_SERVICE_UNAUTHORIZED', 'denied', 1);
-            if (input.name === 'busy')
-              throw new CommandFailure('WASMCLOUD_SERVICE_IN_USE', 'busy', 1);
-            if (input.name === 'usage') throw new CommandFailure('WASMCLOUD_USAGE', 'bad flag', 2);
-            if (input.name === 'down') throw new CommandFailure('WASMCLOUD_TOOL_FAILED', 'down', 3);
-            if (input.name === 'odd') throw 'odd failure';
-            return {
-              name: input.name,
-              namespace: 'wasmcloud',
-              type: input.type,
-              className: input.className ?? '',
-              ready: 'Unknown',
-              target: input.target,
-            };
-          },
-          async delete(_target, name) {
-            if (name === 'missing')
-              throw new CommandFailure('WASMCLOUD_SERVICE_NOT_FOUND', 'missing', 2);
-            return { name };
-          },
-        },
+      ).toBe(404);
+      explodeRead = true;
+      const brokenRead = await request(server.port, {
+        path: '/api/applications/greeter',
+        headers: { cookie: session },
       });
-      const signedIn = await request(fresh.port, {
-        path: '/api/login',
-        method: 'POST',
-        body: JSON.stringify({ password: 'correct horse battery' }),
-      });
-      const cookie = sessionCookieHeader(signedIn.headers['set-cookie']);
-      const csrf = (JSON.parse(signedIn.body) as { csrfToken: string }).csrfToken;
-      const auth = { cookie, 'x-di-console-csrf': csrf };
-      expect((await request(fresh.port, { path: '/api/session', headers: auth })).body).toContain(
-        '"authenticated":true',
-      );
-      expect(
-        (await request(fresh.port, { path: '/api/apps/greeter?target=development', headers: auth }))
-          .status,
-      ).toBe(200);
-      expect(
-        (await request(fresh.port, { path: '/api/apps/missing?target=development', headers: auth }))
-          .status,
-      ).toBe(404);
-      expect(
-        (await request(fresh.port, { path: '/api/apps/%E0%A4%A', headers: auth })).status,
-      ).toBe(404);
-      expect(
-        (await request(fresh.port, { path: '/api/apps/Not_Name', method: 'GET', headers: auth }))
-          .status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/apps/greeter',
-            method: 'PATCH',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', replicas: 2 }),
-          })
-        ).status,
-      ).toBe(404);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/apps/missing',
-            method: 'PATCH',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', replicas: 1 }),
-          })
-        ).status,
-      ).toBe(404);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/cronjobs/nightly',
-            method: 'PATCH',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', suspend: true }),
-          })
-        ).status,
-      ).toBe(200);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/cronjobs/missing',
-            method: 'PATCH',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', suspend: true }),
-          })
-        ).status,
-      ).toBe(404);
-      expect((await request(fresh.port, { path: '/api/services', headers: auth })).status).toBe(
-        400,
-      );
-      expect(
-        (await request(fresh.port, { path: '/api/services?target=development', headers: auth }))
-          .status,
-      ).toBe(200);
-      expect(
-        (await request(fresh.port, { path: '/api/services?target=unknown', headers: auth })).status,
-      ).toBe(404);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/service-classes?target=development',
-            headers: auth,
-          })
-        ).status,
-      ).toBe(200);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', type: 'keyvalue', name: 'orders' }),
-          })
-        ).status,
-      ).toBe(201);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: 'null',
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({
-              target: 'development',
-              type: 'keyvalue',
-              name: 'orders',
-              namespace: 'kube-system',
-            }),
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({ type: 'keyvalue', name: 'orders' }),
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', type: 'cache', name: 'orders' }),
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', type: 'keyvalue', name: 'NOT_A_NAME' }),
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({
-              target: 'development',
-              type: 'keyvalue',
-              name: 'orders',
-              className: '',
-            }),
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({
-              target: 'development',
-              type: 'keyvalue',
-              name: 'orders',
-              className: 'BAD_CLASS',
-            }),
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({
-              target: 'development',
-              type: 'keyvalue',
-              name: 'orders',
-              deletionPolicy: 'Drop',
-            }),
-          })
-        ).status,
-      ).toBe(400);
-      for (const name of ['conflict', 'missing-target', 'denied', 'busy', 'usage', 'down', 'odd']) {
-        const status = (
-          await request(fresh.port, {
-            path: '/api/services',
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({ target: 'development', type: 'keyvalue', name }),
-          })
-        ).status;
-        expect(status).toBeGreaterThanOrEqual(400);
-      }
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services/NOT_A_NAME',
-            method: 'DELETE',
-            headers: auth,
-          })
-        ).status,
-      ).toBe(400);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services/orders?target=development',
-            method: 'DELETE',
-            headers: auth,
-          })
-        ).status,
-      ).toBe(200);
-      expect(
-        (
-          await request(fresh.port, {
-            path: '/api/services/missing?target=development',
-            method: 'DELETE',
-            headers: auth,
-          })
-        ).status,
-      ).toBe(404);
-      expect((await request(fresh.port, { path: '/api/nope', headers: auth })).status).toBe(404);
+      expect(brokenRead.status).toBe(502);
+      expect(brokenRead.body).toContain('could not be read');
+      explodeRead = false;
       failList = true;
       expect(
-        (await request(fresh.port, { path: '/api/apps?target=other', headers: auth })).status,
-      ).toBe(404);
-      expect(
-        (await request(fresh.port, { path: '/api/apps?target=development', headers: auth })).body,
-      ).toContain('cluster request failed');
-      expect(
-        (await request(fresh.port, { path: '/api/logout', method: 'POST', headers: auth })).status,
-      ).toBe(200);
-      await fresh.close();
+        (await request(server.port, { path: '/api/applications', headers: { cookie: session } }))
+          .body,
+      ).toContain('could not be read');
+      expect((await request(server.port, { path: '/assets/nested' })).status).toBe(404);
+      expect((await request(server.port, { path: '/assets/asset.svg' })).status).toBe(200);
+      expect((await request(server.port, { path: '/favicon.ico' })).status).toBe(404);
     } finally {
+      await server.close();
       await server.close();
     }
   });
 
+  it('keeps a viewer from writing and reports a broken request', async () => {
+    const workspace = tenantWorkspace();
+    const bundle = assets();
+    const empty = mkdtempSync(join(tmpdir(), 'console-empty-'));
+    const plain = makeWorkspace();
+    const captured = captureIo();
+    let checks = 0;
+    const viewer = await openConsole(
+      workspace,
+      bundle,
+      idleCluster(async () => false),
+    );
+    const denied = await openConsole(
+      workspace,
+      bundle,
+      idleCluster(async () => {
+        checks += 1;
+        throw new Error(`token=${'a'.repeat(40)}`);
+      }),
+      captured.io,
+    );
+    const unscoped = await openConsole(plain, bundle, idleCluster());
+    const missing = await openConsole(workspace, empty, idleCluster());
+    const quiet = await openConsole(workspace, bundle, idleCluster(), undefined, false);
+    try {
+      const opened = await request(viewer.port, { path: '/api/session' });
+      const session = cookie(opened.headers['set-cookie']);
+      const body = JSON.parse(opened.body) as { csrfToken: string; writable: boolean };
+      expect(body.writable).toBe(false);
+      const refused = await request(viewer.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: { cookie: session, 'x-di-console-csrf': body.csrfToken },
+        body: JSON.stringify({ key: 'COLOR', value: 'blue' }),
+      });
+      expect(refused.status).toBe(403);
+      expect(refused.body).toContain('cannot change the application');
+
+      const openedDenied = await request(denied.port, { path: '/api/session' });
+      expect(JSON.parse(openedDenied.body).writable).toBe(false);
+      const deniedSession = cookie(openedDenied.headers['set-cookie']);
+      const deniedToken = (JSON.parse(openedDenied.body) as { csrfToken: string }).csrfToken;
+      const failedWrite = await request(denied.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: { cookie: deniedSession, 'x-di-console-csrf': deniedToken },
+        body: JSON.stringify({ key: 'COLOR', value: 'blue' }),
+      });
+      expect(failedWrite.status).toBe(403);
+      expect(checks).toBe(2);
+      expect(captured.stderr.join('')).toContain('[redacted]');
+      expect(captured.stderr.join('')).not.toContain('a'.repeat(40));
+
+      const scoped = await request(unscoped.port, { path: '/api/session' });
+      expect(scoped.status).toBe(404);
+      expect(scoped.body).toContain('one tenant');
+      expect((await request(missing.port, { path: '/' })).status).toBe(404);
+      const raw = await rawRequest(
+        viewer.port,
+        `GET http://example.com:99999/x HTTP/1.1\r\nHost: 127.0.0.1:${viewer.port}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(raw).toContain('CONSOLE_REQUEST_FAILED');
+    } finally {
+      await viewer.close();
+      await denied.close();
+      await unscoped.close();
+      await missing.close();
+      await quiet.close();
+    }
+  });
+
   it('starts the console command and stops on SIGINT', async () => {
+    expect(() => parseConsoleArgs(['--target', 'warehouse', '--target', 'other'])).toThrow(
+      CommandFailure,
+    );
     expect(() => parseConsoleArgs(['--host', '127.0.0.1', '--host', 'localhost'])).toThrow(
       CommandFailure,
     );
     expect(() => parseConsoleArgs(['--port', '8787', '--port', '8788'])).toThrow(CommandFailure);
     expect(() => parseConsoleArgs(['extra'])).toThrow(CommandFailure);
-    expect(parseConsoleArgs(['--host', '::1', '--port', '8791']).host).toBe('::1');
-    expect(parseConsoleArgs(['--host', '10.1.1.8']).host).toBe('10.1.1.8');
-    expect(parseConsoleArgs(['--host', 'console.internal']).host).toBe('console.internal');
     expect(() => parseConsoleArgs(['--host', '::'])).toThrow(CommandFailure);
     expect(() => parseConsoleArgs(['--host', '[::]'])).toThrow(CommandFailure);
     expect(() => parseConsoleArgs(['--host', 'not a host'])).toThrow(CommandFailure);
-    expect(() => consolePassword({ DI_CONSOLE_PASSWORD: 'short' }, '127.0.0.1')).toThrow(
-      CommandFailure,
-    );
-    expect(() => consolePassword({ DI_CONSOLE_PASSWORD: 'x'.repeat(201) }, '127.0.0.1')).toThrow(
-      CommandFailure,
-    );
     expect(consoleAssetsDirectory()).toContain('console-ui');
 
     const workspace = makeWorkspace({
@@ -1142,10 +711,7 @@ describe('console branches', () => {
     const running = runWasmcloudConsole(
       ['--port', String(port)],
       captured.io,
-      fakeDeps({
-        cwd: workspace.root,
-        env: { kubeconfig: workspace.kubeconfig, DI_CONSOLE_PASSWORD: 'correct horse battery' },
-      }),
+      fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
     );
     const started = Date.now();
     while (!captured.stdout.join('').includes('Console listening') && Date.now() - started < 5000) {
@@ -1154,22 +720,9 @@ describe('console branches', () => {
     process.emit('SIGINT');
     const stopped = await running;
     expect(stopped.text).toContain('Console stopped');
-    expect(captured.stdout.join('')).toContain('DI_CONSOLE_PASSWORD');
-    expect(captured.stdout.join('')).toContain('namespace wasmcloud');
+    expect(captured.stdout.join('')).toContain('tenant development');
     expect(captured.stdout.join('')).toContain('tenant-development');
-
-    const generated = captureIo();
-    const again = runWasmcloudConsole(
-      ['--port', String(port)],
-      generated.io,
-      fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
-    );
-    const marked = Date.now();
-    while (!generated.stdout.join('').includes('one-time password') && Date.now() - marked < 5000) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    process.emit('SIGTERM');
-    expect((await again).text).toContain('Console stopped');
+    expect(captured.stdout.join('')).not.toContain('namespace');
 
     const hidden = `${indexPath}.aside`;
     renameSync(indexPath, hidden);
@@ -1184,3 +737,151 @@ describe('console branches', () => {
     }
   });
 });
+
+function tenantWorkspace() {
+  return makeWorkspace({
+    manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
+  });
+}
+
+function idleCluster(canWrite: ConsoleCluster['canWrite'] = async () => true): ConsoleCluster {
+  return {
+    async listWorkloads() {
+      return [];
+    },
+    async listBindings() {
+      return [];
+    },
+    async patchWorkload() {
+      return undefined;
+    },
+    async reassignSecret() {
+      return undefined;
+    },
+    canWrite,
+    async readLogs() {
+      return undefined;
+    },
+    async readSignals() {
+      return undefined;
+    },
+    async bindService() {
+      return undefined;
+    },
+    async unbindService() {
+      return undefined;
+    },
+  };
+}
+
+function idleServices(): ConsoleServices {
+  return {
+    async list() {
+      return [];
+    },
+    async classes() {
+      return { classes: [], fromCluster: false };
+    },
+    async create() {
+      return {
+        name: 'orders',
+        namespace: 'wasmcloud',
+        type: 'postgres',
+        className: 'postgres-dedicated',
+        ready: 'Unknown',
+        target: 'development',
+      };
+    },
+    async delete(_target, name) {
+      return { name };
+    },
+  };
+}
+
+function openConsole(
+  workspace: ReturnType<typeof makeWorkspace>,
+  bundle: string,
+  cluster: ConsoleCluster,
+  io?: ReturnType<typeof captureIo>['io'],
+  withServices = true,
+) {
+  return startConsoleServer({
+    host: '127.0.0.1',
+    port: 0,
+    target: 'development',
+    assetsDirectory: bundle,
+    deps: fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
+    cluster,
+    ...(withServices ? { services: idleServices() } : {}),
+    ...(io ? { io } : {}),
+  });
+}
+
+function rawRequest(port: number, payload: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(payload);
+    });
+    const chunks: Buffer[] = [];
+    socket.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    socket.on('error', reject);
+  });
+}
+
+function assets(): string {
+  const root = mkdtempSync(join(tmpdir(), 'console-assets-'));
+  writeFileSync(join(root, 'index.html'), '<!doctype html><title>console</title>');
+  writeFileSync(join(root, 'asset.svg'), '<svg />');
+  mkdirSync(join(root, 'nested'), { recursive: true });
+  return root;
+}
+
+function request(
+  port: number,
+  options: {
+    path: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    origin?: boolean;
+  },
+): Promise<{
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: string;
+}> {
+  const method = options.method ?? 'GET';
+  const host = `127.0.0.1:${port}`;
+  const headers: Record<string, string> = {
+    host,
+    ...(options.origin === false ? {} : { origin: `http://${host}` }),
+    ...options.headers,
+  };
+  if (options.body !== undefined)
+    headers['content-length'] = String(Buffer.byteLength(options.body));
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: '127.0.0.1', port, path: options.path, method, headers },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on('end', () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            headers: response.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    if (options.body !== undefined) req.write(options.body);
+    req.end();
+  });
+}
+
+function cookie(setCookie: string | string[] | undefined): string {
+  const value = Array.isArray(setCookie) ? setCookie[0] : setCookie;
+  return (value ?? '').split(';')[0] ?? '';
+}

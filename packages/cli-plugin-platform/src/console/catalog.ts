@@ -1,101 +1,122 @@
-import type { DeployManifest, DeployTarget } from '../manifest';
-import { materializeRegistry, registryReferenceHost } from '../registry';
 import { STORAGE_HOSTGROUP } from '../workload';
-import { ConsoleError } from './errors';
+import { ConsoleError, platformSentence } from './errors';
 
 const RESOURCE_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
-const LOOKUP_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/i;
-const QUEUE_SETTING = /^DI_QUEUE_([A-Z0-9_]+)_(CONCURRENCY|MAX_RETRIES|BACKOFF_MS|TIMEOUT_MS)$/;
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const HOST_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/i;
 const SENSITIVE_KEY = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|API_KEY|_KEY$)/i;
 const USERINFO = /:\/\/[^/\s:]+:[^/\s@]+@/;
-const PLATFORM_VISIBLE_CONTROL = new Set(['DI_CONTROL_REJECT_FORWARDED', 'DI_CONTROL_HTTP_HOST']);
+const HIDDEN_CONFIG =
+  /^(DI_CONTROL_|DI_QUEUE_|DI_CRON_|DI_SQLITE_|DI_STORAGE_)|^(ACTOR_STORAGE_DIR|QUEUE_DB_PATH|MIGRATION_DB_PATH)$/;
+const PLATFORM_CONTRACTS = new Set([
+  'wasi:http',
+  'wasi:cli',
+  'wasi:config',
+  'wasi:logging',
+  'wasi:random',
+  'wasi:sockets',
+  'wasi:filesystem',
+  'wasi:clocks',
+  'wasi:tls',
+  'wasmcloud:postgres',
+  'wasmcloud:keyvalue',
+  'wasmcloud:messaging',
+  'wasmcloud:blobstore',
+]);
+const ROUTES_OFF = 'di-framework.dev/routes-off';
+const NOT_READY = 'This application is not ready yet.';
 
 export type JsonPatchOp = {
-  op: 'add' | 'replace';
+  op: 'add' | 'replace' | 'remove';
   path: string;
-  value: unknown;
+  value?: unknown;
 };
 
-export type ConfigEntry = {
-  key: string;
-  sensitive: boolean;
-  value?: string;
-};
-
-export type QueueSetting = {
-  key: string;
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-};
-
-export type HostInterfaceView = {
-  name?: string;
-  reference: string;
-  interfaces: string[];
-  config: ConfigEntry[];
-};
-
-export type CronView = {
+export type PartView = {
   name: string;
-  schedule: string;
-  suspend: boolean;
-  jobId?: string;
-  application?: string;
-  concurrencyPolicy?: string;
+  kind: 'service' | 'component';
+  lifetime: 'long-lived' | 'on-demand';
 };
 
-export type AppView = {
-  target: string;
-  namespace: string;
+export type RouteView = {
+  id: string;
+  host: string;
+  path: string;
+  enabled: boolean;
+};
+
+export type EnvView = { key: string; value: string };
+export type SecretView = { name: string };
+
+export type BackingBindingView = {
   name: string;
-  application?: string;
-  workload?: string;
+  service: string;
+  className: string;
   ready: boolean;
-  reason?: string;
-  message?: string;
-  desiredReplicas: number;
-  readyReplicas: number;
-  pinnedReplicas: boolean;
-  deployPolicy?: string;
-  environmentName?: string;
-  hostgroup?: string;
-  httpHost?: string;
-  image?: string;
-  credentialsConfigured: boolean;
-  controlPlane: boolean;
-  allowedIpNameLookups: string[];
-  config: ConfigEntry[];
-  queueSettings: QueueSetting[];
-  hostInterfaces: HostInterfaceView[];
-  volumes: Array<{ name: string; hostPath?: string; mountPath?: string }>;
-  cronJobs: CronView[];
+  detail?: string;
 };
 
-export type TargetView = {
+export type PrivateBindingView = {
   name: string;
-  kind: 'managed' | 'external';
-  default: boolean;
+  contract: string;
+  bound: boolean;
+};
+
+export type ApplicationSummary = {
+  name: string;
+  ready: boolean;
+  detail?: string;
+  services: number;
+  components: number;
+  routeCount: number;
+};
+
+export type ApplicationView = ApplicationSummary & {
+  parts: PartView[];
+  routes: RouteView[];
+  environment: EnvView[];
+  secrets: SecretView[];
+  backingServices: BackingBindingView[];
+  privateBindings: PrivateBindingView[];
+};
+
+export type HostInterface = {
+  name?: string;
   namespace?: string;
-  context?: string;
-  hostgroup?: string;
-  stack?: string;
-  platform?: string;
-  registryHost?: string;
+  package?: string;
+  version?: string;
+  interfaces?: string[];
+  config?: Record<string, string>;
+  configFrom?: Array<{ name?: string }>;
+  secretFrom?: Array<{ name?: string }>;
+};
+
+export type WorkloadPart = {
+  name?: string;
+  image?: string;
+  service?: unknown;
+  localResources?: {
+    environment?: { config?: Record<string, string>; secretFrom?: Array<{ name?: string }> };
+    allowedIpNameLookups?: string[];
+  };
+  hostInterfaces?: HostInterface[];
 };
 
 export type WorkloadDocument = {
-  metadata?: { name?: string; namespace?: string; labels?: Record<string, string> };
+  metadata?: {
+    name?: string;
+    namespace?: string;
+    labels?: Record<string, string>;
+    annotations?: Record<string, string>;
+  };
   spec?: {
     replicas?: number;
-    deployPolicy?: string;
     template?: {
       spec?: {
-        environment?: string;
         hostSelector?: { hostgroup?: string };
-        volumes?: Array<{ name?: string; hostPath?: { path?: string } }>;
-        components?: WorkloadComponent[];
+        hostInterfaces?: HostInterface[];
+        components?: WorkloadPart[];
+        service?: WorkloadPart;
       };
     };
   };
@@ -106,46 +127,27 @@ export type WorkloadDocument = {
   };
 };
 
-type WorkloadComponent = {
-  name?: string;
-  image?: string;
-  localResources?: {
-    environment?: {
-      config?: Record<string, string>;
-      secretFrom?: unknown[];
-    };
-    volumeMounts?: Array<{ name?: string; mountPath?: string }>;
-    allowedIpNameLookups?: string[];
+export type BindingDocument = {
+  metadata?: { name?: string; labels?: Record<string, string> };
+  spec?: {
+    serviceName?: string;
+    bindingName?: string;
+    capability?: string;
+    workloadName?: string;
   };
-  hostInterfaces?: Array<{
-    name?: string;
-    namespace?: string;
-    package?: string;
-    version?: string;
-    interfaces?: string[];
-    config?: Record<string, string>;
-  }>;
+  status?: { conditions?: Array<{ type?: string; status?: string; message?: string }> };
 };
 
-export type CronJobDocument = {
-  metadata?: { name?: string; namespace?: string; labels?: Record<string, string> };
-  spec?: { schedule?: string; suspend?: boolean; concurrencyPolicy?: string };
-};
+export type WorkloadChange = { workload: string; ops: JsonPatchOp[] };
 
-export type AppUpdate = {
-  replicas?: number;
-  allowedIpNameLookups?: string[];
-  queueSettings?: Array<{ key: string; value: number }>;
-};
-
-const UPDATE_FIELDS = new Set(['target', 'replicas', 'allowedIpNameLookups', 'queueSettings']);
+type SecretSource = { name: string; kind: 'config' | 'secret'; workload: string; pointer?: string };
 
 export function assertResourceName(name: string, label: string): void {
   if (!isResourceName(name)) {
     throw new ConsoleError(
       400,
       'INVALID_NAME',
-      `${label} must be a DNS label of at most 63 characters.`,
+      `${label} must use lowercase letters, digits, and hyphens.`,
     );
   }
 }
@@ -154,35 +156,7 @@ export function isResourceName(name: string): boolean {
   return name.length >= 1 && name.length <= 63 && RESOURCE_NAME.test(name);
 }
 
-export function listTargetViews(manifest: DeployManifest): TargetView[] {
-  return Object.values(manifest.targets)
-    .map((target) => targetView(target, manifest.defaultTarget))
-    .sort((left, right) => left.name.localeCompare(right.name));
-}
-
-function targetView(target: DeployTarget, defaultTarget: string | undefined): TargetView {
-  if (target.kind === 'managed') {
-    return {
-      name: target.name,
-      kind: 'managed',
-      default: target.name === defaultTarget,
-      stack: target.stack,
-      platform: target.platform,
-    };
-  }
-  const registry = materializeRegistry(target.registry);
-  return {
-    name: target.name,
-    kind: 'external',
-    default: target.name === defaultTarget,
-    namespace: target.namespace,
-    ...(target.context ? { context: target.context } : {}),
-    ...(target.hostgroup ? { hostgroup: target.hostgroup } : {}),
-    registryHost: publicRegistryHost(registry.pull),
-  };
-}
-
-/** A tenant credential is one namespace. Persistent workloads use the storage host group. */
+/** A tenant credential is one scope. Persistent workloads use the storage host group. */
 export function workloadInTenantScope(
   document: WorkloadDocument,
   scope: { namespace: string; hostgroup?: string; storageHostgroup?: string },
@@ -195,449 +169,722 @@ export function workloadInTenantScope(
   return hostgroup === scope.hostgroup || hostgroup === storageHostgroup;
 }
 
-export function cronInTenantScope(document: CronJobDocument, namespace: string): boolean {
-  const actual = document.metadata?.namespace;
-  return actual === undefined || actual === namespace;
-}
-
-export function publicRegistryHost(reference: string): string {
-  let host = registryReferenceHost(reference);
-  const at = host.lastIndexOf('@');
-  if (at !== -1) host = host.slice(at + 1);
-  const slash = host.indexOf('/');
-  if (slash !== -1) host = host.slice(0, slash);
-  return host;
-}
-
-export function isSensitiveConfigKey(key: string): boolean {
-  return SENSITIVE_KEY.test(key);
-}
-
-export function queueSettingLabel(key: string): string {
-  const match = QUEUE_SETTING.exec(key);
-  if (match === null) return key;
-  const queue = (match[1] ?? '').toLowerCase().replace(/_/g, ' ');
-  const kind = match[2];
-  const suffix =
-    kind === 'CONCURRENCY'
-      ? 'concurrency'
-      : kind === 'MAX_RETRIES'
-        ? 'max retries'
-        : kind === 'BACKOFF_MS'
-          ? 'backoff (ms)'
-          : 'timeout (ms)';
-  return `${queue} ${suffix}`;
-}
-
-export function queueSettingBounds(key: string): { min: number; max: number } | undefined {
-  if (!QUEUE_SETTING.test(key)) return undefined;
-  if (key.endsWith('_CONCURRENCY')) return { min: 1, max: 64 };
-  if (key.endsWith('_MAX_RETRIES')) return { min: 0, max: 100 };
-  if (key.endsWith('_BACKOFF_MS')) return { min: 0, max: 3_600_000 };
-  if (key.endsWith('_TIMEOUT_MS')) return { min: 1, max: 3_600_000 };
-  return undefined;
-}
-
-export function storagePinsReplicas(document: WorkloadDocument): boolean {
-  const spec = document.spec?.template?.spec;
-  if ((spec?.volumes ?? []).some((volume) => volume.hostPath?.path !== undefined)) return true;
-  const config = componentConfig(document);
-  return (
-    config.DI_SQLITE_BACKEND !== undefined ||
-    config.ACTOR_STORAGE_DIR !== undefined ||
-    config.QUEUE_DB_PATH !== undefined
-  );
-}
-
-export function summarizeWorkload(
-  document: WorkloadDocument,
+export function tenantIdentity(
+  hostgroup: string | undefined,
   target: string,
-  cronJobs: readonly CronJobDocument[] = [],
-): AppView | undefined {
-  const name = document.metadata?.name;
-  const labels = document.metadata?.labels ?? {};
-  if (name === undefined || !isResourceName(name)) return undefined;
-  if (labels['app.kubernetes.io/managed-by'] !== 'di-framework') return undefined;
-
-  const component = document.spec?.template?.spec?.components?.[0];
-  const config = component?.localResources?.environment?.config ?? {};
-  const entries = configEntries(config);
-  const queueSettings = queueSettingsFrom(config);
-  const lookups = (component?.localResources?.allowedIpNameLookups ?? []).filter(
-    (entry): entry is string => typeof entry === 'string',
-  );
-  const condition = readiness(document);
-  const mounts = new Map(
-    (component?.localResources?.volumeMounts ?? [])
-      .filter((mount) => typeof mount.name === 'string')
-      .map((mount) => [mount.name as string, mount.mountPath]),
-  );
-  const application = labels['di-framework.dev/application'];
-  const workload = labels['di-framework.dev/workload'];
-  const httpHost = httpHostFrom(component);
-
-  return {
-    target,
-    namespace: document.metadata?.namespace ?? '',
-    name,
-    ...(typeof application === 'string' ? { application } : {}),
-    ...(typeof workload === 'string' ? { workload } : {}),
-    ready: condition.ready,
-    ...(condition.reason ? { reason: condition.reason } : {}),
-    ...(condition.message ? { message: condition.message } : {}),
-    desiredReplicas: document.spec?.replicas ?? 1,
-    readyReplicas: document.status?.readyReplicas ?? document.status?.replicas?.ready ?? 0,
-    pinnedReplicas: storagePinsReplicas(document),
-    ...(document.spec?.deployPolicy ? { deployPolicy: document.spec.deployPolicy } : {}),
-    ...(document.spec?.template?.spec?.environment
-      ? { environmentName: document.spec.template.spec.environment }
-      : {}),
-    ...(document.spec?.template?.spec?.hostSelector?.hostgroup
-      ? { hostgroup: document.spec.template.spec.hostSelector.hostgroup }
-      : {}),
-    ...(httpHost ? { httpHost } : {}),
-    ...(component?.image ? { image: component.image } : {}),
-    credentialsConfigured: (component?.localResources?.environment?.secretFrom?.length ?? 0) > 0,
-    controlPlane:
-      (component?.localResources?.environment?.secretFrom?.length ?? 0) > 0 ||
-      config.DI_CONTROL_REJECT_FORWARDED !== undefined,
-    allowedIpNameLookups: lookups,
-    config: entries,
-    queueSettings,
-    hostInterfaces: (component?.hostInterfaces ?? []).map(hostInterfaceView),
-    volumes: (document.spec?.template?.spec?.volumes ?? []).map((volume) => ({
-      name: volume.name ?? '',
-      ...(volume.hostPath?.path ? { hostPath: volume.hostPath.path } : {}),
-      ...(volume.name !== undefined && mounts.get(volume.name) !== undefined
-        ? { mountPath: mounts.get(volume.name) }
-        : {}),
-    })),
-    cronJobs: cronJobs
-      .map(summarizeCron)
-      .filter((job): job is CronView => job !== undefined && job.application === name),
-  };
+): {
+  tenant: string;
+  hostgroup?: string;
+} {
+  if (hostgroup?.startsWith('tenant-') && hostgroup.length > 'tenant-'.length) {
+    return { tenant: hostgroup.slice('tenant-'.length), hostgroup };
+  }
+  if (hostgroup !== undefined && hostgroup.length > 0) return { tenant: hostgroup, hostgroup };
+  return { tenant: target };
 }
 
-export function summarizeCron(document: CronJobDocument): CronView | undefined {
-  const name = document.metadata?.name;
-  const labels = document.metadata?.labels ?? {};
-  if (name === undefined || !isResourceName(name)) return undefined;
-  if (labels['app.kubernetes.io/managed-by'] !== 'di-framework') return undefined;
-  const schedule = document.spec?.schedule;
-  if (typeof schedule !== 'string' || schedule.length === 0) return undefined;
-  const jobId = labels['di-framework.dev/cron-job'];
-  const application = labels['app.kubernetes.io/name'];
-  return {
-    name,
-    schedule,
-    suspend: document.spec?.suspend === true,
-    ...(typeof jobId === 'string' ? { jobId } : {}),
-    ...(typeof application === 'string' ? { application } : {}),
-    ...(document.spec?.concurrencyPolicy
-      ? { concurrencyPolicy: document.spec.concurrencyPolicy }
-      : {}),
-  };
-}
-
-export function unassignedCronJobs(
-  apps: readonly AppView[],
-  cronJobs: readonly CronJobDocument[],
-): CronView[] {
-  const assigned = new Set(apps.flatMap((app) => app.cronJobs.map((job) => job.name)));
-  return cronJobs
-    .map(summarizeCron)
-    .filter((job): job is CronView => job !== undefined && !assigned.has(job.name));
-}
-
-export function parseAppUpdate(body: unknown): AppUpdate & { target: string } {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'Request body must be an object.');
-  }
-  const record = body as Record<string, unknown>;
-  const unknown = Object.keys(record).filter((key) => !UPDATE_FIELDS.has(key));
-  if (unknown.length > 0) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'The request contains unsupported fields.');
-  }
-  if (typeof record.target !== 'string' || record.target.length === 0) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'A deployment target is required.');
-  }
-  const update: AppUpdate & { target: string } = { target: record.target };
-  if ('replicas' in record) {
-    if (!isInteger(record.replicas, 0, 10)) {
-      throw new ConsoleError(
-        400,
-        'INVALID_REPLICAS',
-        'Replicas must be a whole number from 0 through 10.',
-      );
-    }
-    update.replicas = record.replicas;
-  }
-  if ('allowedIpNameLookups' in record) {
-    update.allowedIpNameLookups = parseLookups(record.allowedIpNameLookups);
-  }
-  if ('queueSettings' in record) {
-    update.queueSettings = parseQueueUpdates(record.queueSettings);
-  }
-  if (
-    update.replicas === undefined &&
-    update.allowedIpNameLookups === undefined &&
-    update.queueSettings === undefined
-  ) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'Choose at least one setting to update.');
-  }
-  return update;
-}
-
-export function planWorkloadUpdate(document: WorkloadDocument, update: AppUpdate): JsonPatchOp[] {
-  const ops: JsonPatchOp[] = [];
-  if (update.replicas !== undefined) {
-    if (storagePinsReplicas(document) && update.replicas !== 1) {
-      throw new ConsoleError(
-        400,
-        'REPLICAS_PINNED',
-        'SQLite-backed workloads stay at 1 replica so the volume is not shared across hosts.',
-      );
-    }
-    if ((document.spec?.replicas ?? 1) !== update.replicas) {
-      ops.push({
-        op: document.spec?.replicas === undefined ? 'add' : 'replace',
-        path: '/spec/replicas',
-        value: update.replicas,
-      });
-    }
-  }
-  if (update.allowedIpNameLookups !== undefined) {
-    const component = document.spec?.template?.spec?.components?.[0];
-    if (component === undefined) {
-      throw new ConsoleError(
-        400,
-        'NOT_CONFIGURABLE',
-        'This workload has no component to configure.',
-      );
-    }
-    const current = component.localResources?.allowedIpNameLookups ?? [];
-    if (!sameStrings(current, update.allowedIpNameLookups)) {
-      if (component.localResources === undefined) {
-        ops.push({
-          op: 'add',
-          path: '/spec/template/spec/components/0/localResources',
-          value: { allowedIpNameLookups: update.allowedIpNameLookups },
-        });
-      } else {
-        ops.push({
-          op: component.localResources.allowedIpNameLookups === undefined ? 'add' : 'replace',
-          path: '/spec/template/spec/components/0/localResources/allowedIpNameLookups',
-          value: update.allowedIpNameLookups,
-        });
-      }
-    }
-  }
-  if (update.queueSettings !== undefined) {
-    const config = componentConfig(document);
-    for (const setting of update.queueSettings) {
-      const bounds = queueSettingBounds(setting.key);
-      if (bounds === undefined || config[setting.key] === undefined) {
-        throw new ConsoleError(
-          400,
-          'INVALID_QUEUE_SETTING',
-          'Queue settings can only change values already declared on the workload.',
-        );
-      }
-      if (!isInteger(setting.value, bounds.min, bounds.max)) {
-        throw new ConsoleError(
-          400,
-          'INVALID_QUEUE_SETTING',
-          `${queueSettingLabel(setting.key)} must be a whole number from ${bounds.min} through ${bounds.max}.`,
-        );
-      }
-      if (Number(config[setting.key]) !== setting.value) {
-        ops.push({
-          op: 'replace',
-          path: `/spec/template/spec/components/0/localResources/environment/config/${setting.key}`,
-          value: String(setting.value),
-        });
-      }
-    }
-  }
-  return ops;
-}
-
-export function parseCronUpdate(body: unknown): { target: string; suspend: boolean } {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'Request body must be an object.');
-  }
-  const record = body as Record<string, unknown>;
-  const unknown = Object.keys(record).filter((key) => key !== 'target' && key !== 'suspend');
-  if (unknown.length > 0) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'The request contains unsupported fields.');
-  }
-  if (typeof record.target !== 'string' || record.target.length === 0) {
-    throw new ConsoleError(400, 'INVALID_BODY', 'A deployment target is required.');
-  }
-  if (typeof record.suspend !== 'boolean') {
-    throw new ConsoleError(400, 'INVALID_BODY', 'suspend must be true or false.');
-  }
-  return { target: record.target, suspend: record.suspend };
-}
-
-function componentConfig(document: WorkloadDocument): Record<string, string> {
-  return document.spec?.template?.spec?.components?.[0]?.localResources?.environment?.config ?? {};
-}
-
-function configEntries(config: Record<string, string>): ConfigEntry[] {
-  const entries: ConfigEntry[] = [];
-  for (const key of Object.keys(config).sort()) {
-    const value = config[key] ?? '';
-    if (key.startsWith('DI_CONTROL_') && !PLATFORM_VISIBLE_CONTROL.has(key)) continue;
-    if (queueSettingBounds(key) !== undefined) continue;
-    if (isSensitiveConfigKey(key) || containsCredential(value)) {
-      entries.push({ key, sensitive: true });
+export function summarizeApplications(
+  documents: readonly WorkloadDocument[],
+  bindings: readonly BindingDocument[] = [],
+): ApplicationView[] {
+  const groups = new Map<string, WorkloadDocument[]>();
+  const labeled = new Map<string, WorkloadDocument[]>();
+  for (const document of documents) {
+    if (!isManaged(document)) continue;
+    const label = document.metadata?.labels?.['di-framework.dev/workload'];
+    if (typeof label === 'string' && isResourceName(label)) {
+      const list = labeled.get(label) ?? [];
+      list.push(document);
+      labeled.set(label, list);
       continue;
     }
-    entries.push({ key, sensitive: false, value });
+    const name = document.metadata?.name;
+    if (name === undefined || !isResourceName(name)) continue;
+    const list = groups.get(name) ?? [];
+    list.push(document);
+    groups.set(name, list);
   }
-  return entries;
-}
-
-function queueSettingsFrom(config: Record<string, string>): QueueSetting[] {
-  const settings: QueueSetting[] = [];
-  for (const key of Object.keys(config).sort()) {
-    const bounds = queueSettingBounds(key);
-    if (bounds === undefined) continue;
-    const parsed = Number(config[key]);
-    if (!Number.isInteger(parsed)) continue;
-    settings.push({ key, label: queueSettingLabel(key), value: parsed, ...bounds });
-  }
-  return settings;
-}
-
-function hostInterfaceView(
-  entry: NonNullable<WorkloadComponent['hostInterfaces']>[number],
-): HostInterfaceView {
-  const namespace = entry.namespace ?? '';
-  const pkg = entry.package ?? '';
-  const version = entry.version ?? '';
-  const config: ConfigEntry[] = [];
-  for (const key of Object.keys(entry.config ?? {}).sort()) {
-    const value = entry.config?.[key] ?? '';
-    if (isSensitiveConfigKey(key) || containsCredential(value)) {
-      config.push({ key, sensitive: true });
-    } else {
-      config.push({ key, sensitive: false, value });
+  for (const [label, members] of labeled) {
+    if (members.length > 1) {
+      groups.set(label, members);
+      continue;
+    }
+    const only = members[0];
+    const name = only?.metadata?.name;
+    if (only !== undefined && name !== undefined && isResourceName(name)) {
+      const list = groups.get(name) ?? [];
+      list.push(only);
+      groups.set(name, list);
     }
   }
+
+  const applications: ApplicationView[] = [];
+  for (const [name, members] of groups) {
+    members.sort((left, right) =>
+      (left.metadata?.name ?? '').localeCompare(right.metadata?.name ?? ''),
+    );
+    const parts = dedupePartNames(members.flatMap((member) => partsFrom(member)));
+    const routes = routesFrom(members);
+    const environment = environmentFrom(members);
+    const secrets = secretsFrom(members).map((secret) => ({ name: secret.name }));
+    const memberNames = members
+      .map((member) => member.metadata?.name)
+      .filter((entry): entry is string => typeof entry === 'string');
+    const status = applicationStatus(members);
+    applications.push({
+      name,
+      ready: status.ready,
+      ...(status.detail ? { detail: status.detail } : {}),
+      services: parts.filter((part) => part.kind === 'service').length,
+      components: parts.filter((part) => part.kind === 'component').length,
+      routeCount: routes.length,
+      parts,
+      routes,
+      environment,
+      secrets,
+      backingServices: backingBindings(name, memberNames, bindings),
+      privateBindings: privateBindings(members),
+    });
+  }
+  return applications.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function toSummary(application: ApplicationView): ApplicationSummary {
   return {
-    ...(entry.name ? { name: entry.name } : {}),
-    reference: `${namespace}:${pkg}@${version}`,
-    interfaces: entry.interfaces ?? [],
-    config,
+    name: application.name,
+    ready: application.ready,
+    ...(application.detail ? { detail: application.detail } : {}),
+    services: application.services,
+    components: application.components,
+    routeCount: application.routeCount,
   };
 }
 
-function httpHostFrom(component: WorkloadComponent | undefined): string | undefined {
-  for (const entry of component?.hostInterfaces ?? []) {
-    if (entry.namespace === 'wasi' && entry.package === 'http') {
-      const host = entry.config?.host;
-      if (typeof host === 'string' && host.length > 0 && !containsCredential(host)) return host;
-    }
+export function planRouteUpdate(
+  documents: readonly WorkloadDocument[],
+  routeId: string,
+  enabled: boolean,
+): WorkloadChange {
+  const located = locateRoute(documents, routeId);
+  if (located === undefined) {
+    throw new ConsoleError(404, 'ROUTE_NOT_FOUND', 'No route with that address.');
   }
-  return undefined;
+  if (located.enabled === enabled) return { workload: located.workload, ops: [] };
+  const next = enabled
+    ? addRoute(located.config, located.host, located.path)
+    : stripRoute(located.config, located.host, located.path);
+  const ops: JsonPatchOp[] = [];
+  if (located.pointer === undefined) {
+    ops.push({
+      op: 'add',
+      path: '/spec/template/spec/hostInterfaces',
+      value: [
+        {
+          namespace: 'wasi',
+          package: 'http',
+          version: '0.3.0',
+          interfaces: ['handler'],
+          config: next,
+        },
+      ],
+    });
+  } else {
+    ops.push({
+      op: located.hadConfig ? 'replace' : 'add',
+      path: `${located.pointer}/config`,
+      value: next,
+    });
+  }
+  ops.push(annotationOp(located.document, located.host, located.path, enabled));
+  return { workload: located.workload, ops };
 }
 
-function readiness(document: WorkloadDocument): {
+export function planEnvironmentSet(
+  documents: readonly WorkloadDocument[],
+  key: string,
+  value: string,
+): WorkloadChange {
+  assertEnvKey(key);
+  if (value.length === 0 || value.length > 4096) {
+    throw new ConsoleError(
+      400,
+      'INVALID_ENVIRONMENT',
+      'Environment values must be 1 to 4096 characters.',
+    );
+  }
+  if (isSensitiveConfigKey(key) || containsCredential(value)) {
+    throw new ConsoleError(
+      400,
+      'INVALID_ENVIRONMENT',
+      'Add that credential under Secrets. Environment values cannot contain passwords.',
+    );
+  }
+  const existing = findConfigKey(documents, key);
+  const target = existing ?? firstConfigurable(documents);
+  if (target === undefined) {
+    throw new ConsoleError(400, 'NOT_CONFIGURABLE', 'This application has no configurable part.');
+  }
+  return { workload: target.workload, ops: configValueOps(target, key, value) };
+}
+
+export function planEnvironmentDelete(
+  documents: readonly WorkloadDocument[],
+  key: string,
+): WorkloadChange {
+  assertEnvKey(key);
+  const existing = findConfigKey(documents, key);
+  if (existing === undefined || existing.config[key] === undefined) {
+    throw new ConsoleError(404, 'ENV_NOT_FOUND', `No environment variable named ${key}.`);
+  }
+  return {
+    workload: existing.workload,
+    ops: [{ op: 'remove', path: `${existing.pointer}/${key}` }],
+  };
+}
+
+export function planSecretReassign(
+  documents: readonly WorkloadDocument[],
+  name: string,
+  value: string,
+): WorkloadChange | { secret: string } {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) {
+    throw new ConsoleError(400, 'INVALID_SECRET', 'Provide a new credential value.');
+  }
+  const sources = secretsFrom(documents);
+  const match = sources.find((secret) => secret.name === name);
+  if (match === undefined) {
+    throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
+  }
+  if (match.kind === 'secret') return { secret: name };
+  const located = findConfigKey(documents, name);
+  if (located === undefined) {
+    throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
+  }
+  return { workload: located.workload, ops: configValueOps(located, name, value) };
+}
+
+function isManaged(document: WorkloadDocument): boolean {
+  return document.metadata?.labels?.['app.kubernetes.io/managed-by'] === 'di-framework';
+}
+
+function partsFrom(document: WorkloadDocument): PartView[] {
+  const spec = document.spec?.template?.spec;
+  const parts: PartView[] = [];
+  if (spec?.service !== undefined && typeof spec.service === 'object') {
+    parts.push(part(spec.service.name || document.metadata?.name || 'service', 'service'));
+  }
+  for (const component of spec?.components ?? []) {
+    const longLived =
+      component.service !== undefined ||
+      (spec?.service === undefined && isLongLivedWorker(component, spec?.hostInterfaces));
+    const kind =
+      longLived && !parts.some((entry) => entry.kind === 'service') ? 'service' : 'component';
+    parts.push(part(component.name || 'component', kind));
+  }
+  return parts;
+}
+
+function part(name: string, kind: PartView['kind']): PartView {
+  return { name, kind, lifetime: kind === 'service' ? 'long-lived' : 'on-demand' };
+}
+
+function isLongLivedWorker(
+  component: WorkloadPart,
+  workloadInterfaces: HostInterface[] | undefined,
+): boolean {
+  const http = hasInterface(component, workloadInterfaces, 'wasi', 'http', [
+    'handler',
+    'incoming-handler',
+  ]);
+  const run = hasInterface(component, workloadInterfaces, 'wasi', 'cli', ['run']);
+  const messaging = hasInterface(component, workloadInterfaces, 'wasmcloud', 'messaging', [
+    'handler',
+  ]);
+  if (run) return true;
+  if (messaging && !http) return true;
+  const queue = component.localResources?.environment?.config?.DI_QUEUE_MODE;
+  return typeof queue === 'string' && queue.length > 0 && !http;
+}
+
+function hasInterface(
+  component: WorkloadPart,
+  workloadInterfaces: HostInterface[] | undefined,
+  namespace: string,
+  pkg: string,
+  names: readonly string[],
+): boolean {
+  return [...(component.hostInterfaces ?? []), ...(workloadInterfaces ?? [])].some(
+    (entry) =>
+      entry.namespace === namespace &&
+      entry.package === pkg &&
+      (entry.interfaces ?? []).some((name) => names.includes(name)),
+  );
+}
+
+function dedupePartNames(parts: PartView[]): PartView[] {
+  const seen = new Map<string, number>();
+  return parts.map((entry) => {
+    const count = seen.get(entry.name) ?? 0;
+    seen.set(entry.name, count + 1);
+    if (count === 0) return entry;
+    return { ...entry, name: `${entry.name}-${count + 1}` };
+  });
+}
+
+function applicationStatus(members: readonly WorkloadDocument[]): {
   ready: boolean;
-  reason?: string;
-  message?: string;
+  detail?: string;
 } {
+  for (const member of members) {
+    const status = memberStatus(member);
+    if (!status.ready) return status;
+  }
+  return { ready: true };
+}
+
+function memberStatus(document: WorkloadDocument): { ready: boolean; detail?: string } {
   const desired = document.spec?.replicas ?? 1;
   const readyCount = document.status?.readyReplicas ?? document.status?.replicas?.ready ?? 0;
   const condition = (document.status?.conditions ?? []).find(
     (entry) => entry.type === 'Ready' || entry.type === 'Available',
   );
-  const ready = readyCount >= desired || condition?.status === 'True';
-  const message =
-    typeof condition?.message === 'string' && condition.message.length > 0
-      ? truncate(condition.message, 200)
-      : undefined;
-  return {
-    ready,
-    ...(condition?.reason ? { reason: condition.reason } : {}),
-    ...(message ? { message } : {}),
+  const ready = condition?.status === 'True' || (desired > 0 && readyCount >= desired);
+  if (ready) return { ready: true };
+  return { ready: false, detail: platformSentence(condition?.message) ?? NOT_READY };
+}
+
+type RouteHit = {
+  id: string;
+  host: string;
+  path: string;
+  enabled: boolean;
+  workload: string;
+  document: WorkloadDocument;
+  pointer?: string;
+  hadConfig: boolean;
+  config: Record<string, string>;
+};
+
+function routesFrom(members: readonly WorkloadDocument[]): RouteView[] {
+  const routes = new Map<string, RouteView>();
+  for (const member of members) {
+    for (const slot of httpSlots(member)) {
+      for (const route of routesInConfig(slot.config)) {
+        routes.set(route.id, { ...route, enabled: true });
+      }
+    }
+    for (const route of rememberedRoutes(member)) {
+      if (!routes.has(route.id)) routes.set(route.id, { ...route, enabled: false });
+    }
+  }
+  return [...routes.values()].sort((left, right) =>
+    `${left.host}${left.path}`.localeCompare(`${right.host}${right.path}`),
+  );
+}
+
+function locateRoute(
+  documents: readonly WorkloadDocument[],
+  routeId: string,
+): RouteHit | undefined {
+  for (const document of documents) {
+    const workload = document.metadata?.name;
+    if (workload === undefined) continue;
+    for (const slot of httpSlots(document)) {
+      for (const route of routesInConfig(slot.config)) {
+        if (route.id !== routeId) continue;
+        return {
+          ...route,
+          enabled: true,
+          workload,
+          document,
+          pointer: slot.pointer,
+          hadConfig: slot.hadConfig,
+          config: slot.config,
+        };
+      }
+    }
+    for (const route of rememberedRoutes(document)) {
+      if (route.id !== routeId) continue;
+      const slot = httpSlots(document)[0];
+      return {
+        ...route,
+        enabled: false,
+        workload,
+        document,
+        ...(slot
+          ? { pointer: slot.pointer, hadConfig: slot.hadConfig, config: slot.config }
+          : { hadConfig: false, config: {} }),
+      };
+    }
+  }
+  return undefined;
+}
+
+type HttpSlot = { pointer: string; hadConfig: boolean; config: Record<string, string> };
+
+function httpSlots(document: WorkloadDocument): HttpSlot[] {
+  const spec = document.spec?.template?.spec;
+  const slots: HttpSlot[] = [];
+  const visit = (interfaces: HostInterface[] | undefined, pointer: string) => {
+    interfaces?.forEach((entry, index) => {
+      if (entry.namespace !== 'wasi' || entry.package !== 'http') return;
+      slots.push({
+        pointer: `${pointer}/${index}`,
+        hadConfig: entry.config !== undefined,
+        config: { ...(entry.config ?? {}) },
+      });
+    });
   };
+  visit(spec?.hostInterfaces, '/spec/template/spec/hostInterfaces');
+  spec?.components?.forEach((component, index) => {
+    visit(component.hostInterfaces, `/spec/template/spec/components/${index}/hostInterfaces`);
+  });
+  visit(spec?.service?.hostInterfaces, '/spec/template/spec/service/hostInterfaces');
+  return slots;
+}
+
+function routesInConfig(config: Record<string, string>): Array<Omit<RouteView, 'enabled'>> {
+  const routes: Array<Omit<RouteView, 'enabled'>> = [];
+  const seen = new Set<string>();
+  const add = (host: string, path: string) => {
+    if (!isHost(host) || !isPath(path)) return;
+    const id = routeId(host, path);
+    if (seen.has(id)) return;
+    seen.add(id);
+    routes.push({ id, host, path });
+  };
+  if (typeof config.host === 'string') add(config.host, '/');
+  for (const alias of splitComma(config['host-aliases'])) add(alias, '/');
+  for (const entry of splitComma(config.localRoute)) {
+    const slash = entry.indexOf('/');
+    if (slash === -1) add(entry, '/');
+    else add(entry.slice(0, slash), entry.slice(slash));
+  }
+  return routes;
+}
+
+function rememberedRoutes(document: WorkloadDocument): Array<Omit<RouteView, 'enabled'>> {
+  const raw = document.metadata?.annotations?.[ROUTES_OFF];
+  if (typeof raw !== 'string' || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const routes: Array<Omit<RouteView, 'enabled'>> = [];
+    for (const entry of parsed) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const host = (entry as { host?: unknown }).host;
+      const path = (entry as { path?: unknown }).path;
+      if (typeof host !== 'string' || typeof path !== 'string' || !isHost(host) || !isPath(path))
+        continue;
+      routes.push({ id: routeId(host, path), host, path });
+    }
+    return routes;
+  } catch {
+    return [];
+  }
+}
+
+function routeId(host: string, path: string): string {
+  return Buffer.from(`${host}\n${path}`).toString('base64url');
+}
+
+function addRoute(
+  config: Record<string, string>,
+  host: string,
+  path: string,
+): Record<string, string> {
+  const next = { ...config };
+  if (path === '/') {
+    if (next.host === undefined || next.host.length === 0) next.host = host;
+    else if (next.host !== host)
+      next['host-aliases'] = joinComma(splitComma(next['host-aliases']), host);
+    return next;
+  }
+  next.localRoute = joinComma(splitComma(next.localRoute), `${host}${path}`);
+  return next;
+}
+
+function stripRoute(
+  config: Record<string, string>,
+  host: string,
+  path: string,
+): Record<string, string> {
+  const next = { ...config };
+  if (path === '/' && next.host === host) delete next.host;
+  if (path === '/') {
+    const aliases = splitComma(next['host-aliases']).filter((entry) => entry !== host);
+    if (aliases.length === 0) delete next['host-aliases'];
+    else next['host-aliases'] = aliases.join(',');
+  }
+  const token = path === '/' ? host : `${host}${path}`;
+  const local = splitComma(next.localRoute).filter((entry) => entry !== token);
+  if (local.length === 0) delete next.localRoute;
+  else next.localRoute = local.join(',');
+  return next;
+}
+
+function annotationOp(
+  document: WorkloadDocument,
+  host: string,
+  path: string,
+  enabled: boolean,
+): JsonPatchOp {
+  const current = rememberedRoutes(document).map((route) => ({
+    host: route.host,
+    path: route.path,
+  }));
+  const next = enabled
+    ? current.filter((route) => route.host !== host || route.path !== path)
+    : current.some((route) => route.host === host && route.path === path)
+      ? current
+      : [...current, { host, path }];
+  const value = JSON.stringify(next);
+  const annotations = document.metadata?.annotations;
+  if (annotations === undefined) {
+    return { op: 'add', path: '/metadata/annotations', value: { [ROUTES_OFF]: value } };
+  }
+  const existing = annotations[ROUTES_OFF];
+  return {
+    op: existing === undefined ? 'add' : 'replace',
+    path: `/metadata/annotations/${ROUTES_OFF.replaceAll('~', '~0').replaceAll('/', '~1')}`,
+    value,
+  };
+}
+
+function environmentFrom(members: readonly WorkloadDocument[]): EnvView[] {
+  const values = new Map<string, string>();
+  for (const member of members) {
+    for (const config of configs(member)) {
+      for (const key of Object.keys(config).sort()) {
+        const value = config[key] ?? '';
+        if (HIDDEN_CONFIG.test(key) || isSensitiveConfigKey(key) || containsCredential(value))
+          continue;
+        values.set(key, value);
+      }
+    }
+  }
+  return [...values.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => ({ key, value }));
+}
+
+function secretsFrom(members: readonly WorkloadDocument[]): SecretSource[] {
+  const secrets: SecretSource[] = [];
+  const seen = new Set<string>();
+  const add = (secret: SecretSource) => {
+    if (
+      seen.has(secret.name) ||
+      secret.name.endsWith('-control') ||
+      secret.name.startsWith('di-binding-')
+    )
+      return;
+    if (!isResourceName(secret.name) && !ENV_KEY.test(secret.name)) return;
+    seen.add(secret.name);
+    secrets.push(secret);
+  };
+  for (const member of members) {
+    const workload = member.metadata?.name;
+    if (workload === undefined) continue;
+    for (const located of configLocations(member)) {
+      for (const key of Object.keys(located.config)) {
+        const value = located.config[key] ?? '';
+        if (HIDDEN_CONFIG.test(key)) continue;
+        if (!isSensitiveConfigKey(key) && !containsCredential(value)) continue;
+        add({ name: key, kind: 'config', workload, pointer: located.pointer });
+      }
+      for (const ref of located.secretFrom) {
+        if (typeof ref.name === 'string') add({ name: ref.name, kind: 'secret', workload });
+      }
+    }
+  }
+  return secrets.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function backingBindings(
+  application: string,
+  memberNames: readonly string[],
+  bindings: readonly BindingDocument[],
+): BackingBindingView[] {
+  const names = new Set([application, ...memberNames]);
+  const views: BackingBindingView[] = [];
+  for (const binding of bindings) {
+    const name = binding.spec?.bindingName;
+    const service = binding.spec?.serviceName;
+    const workload = binding.spec?.workloadName;
+    if (typeof name !== 'string' || typeof service !== 'string' || typeof workload !== 'string')
+      continue;
+    if (!names.has(workload)) continue;
+    const condition = (binding.status?.conditions ?? []).find((entry) => entry.type === 'Ready');
+    const ready = condition?.status === 'True';
+    const detail = ready ? undefined : platformSentence(condition?.message);
+    views.push({
+      name,
+      service,
+      className: binding.spec?.capability ?? '',
+      ready,
+      ...(detail ? { detail } : {}),
+    });
+  }
+  return views.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function privateBindings(members: readonly WorkloadDocument[]): PrivateBindingView[] {
+  const views = new Map<string, PrivateBindingView>();
+  for (const member of members) {
+    for (const entry of allInterfaces(member)) {
+      const namespace = entry.namespace ?? '';
+      const pkg = entry.package ?? '';
+      const contract = `${namespace}:${pkg}`;
+      if (PLATFORM_CONTRACTS.has(contract) || namespace.length === 0 || pkg.length === 0) continue;
+      const name = entry.name ?? pkg;
+      const key = `${name}\n${contract}`;
+      views.set(key, { name, contract, bound: (entry.interfaces ?? []).length > 0 });
+    }
+  }
+  return [...views.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function allInterfaces(document: WorkloadDocument): HostInterface[] {
+  const spec = document.spec?.template?.spec;
+  return [
+    ...(spec?.hostInterfaces ?? []),
+    ...(spec?.components ?? []).flatMap((component) => component.hostInterfaces ?? []),
+    ...(spec?.service?.hostInterfaces ?? []),
+  ];
+}
+
+type ConfigLocation = {
+  workload: string;
+  pointer: string;
+  config: Record<string, string>;
+  secretFrom: Array<{ name?: string }>;
+  part: WorkloadPart;
+};
+
+function configLocations(document: WorkloadDocument): ConfigLocation[] {
+  const workload = document.metadata?.name;
+  if (workload === undefined) return [];
+  const spec = document.spec?.template?.spec;
+  const locations: ConfigLocation[] = [];
+  spec?.components?.forEach((component, index) => {
+    locations.push(location(workload, component, `/spec/template/spec/components/${index}`));
+  });
+  if (spec?.service !== undefined) {
+    locations.push(location(workload, spec.service, '/spec/template/spec/service'));
+  }
+  return locations;
+}
+
+function location(workload: string, part: WorkloadPart, pointer: string): ConfigLocation {
+  return {
+    workload,
+    pointer: `${pointer}/localResources/environment/config`,
+    config: { ...(part.localResources?.environment?.config ?? {}) },
+    secretFrom: part.localResources?.environment?.secretFrom ?? [],
+    part,
+  };
+}
+
+function configs(document: WorkloadDocument): Record<string, string>[] {
+  return configLocations(document).map((entry) => entry.config);
+}
+
+function findConfigKey(
+  documents: readonly WorkloadDocument[],
+  key: string,
+): ConfigLocation | undefined {
+  for (const document of documents) {
+    for (const located of configLocations(document)) {
+      if (located.config[key] !== undefined) return located;
+    }
+  }
+  return undefined;
+}
+
+function firstConfigurable(documents: readonly WorkloadDocument[]): ConfigLocation | undefined {
+  for (const document of documents) {
+    const located = configLocations(document)[0];
+    if (located !== undefined) return located;
+  }
+  return undefined;
+}
+
+function configValueOps(located: ConfigLocation, key: string, value: string): JsonPatchOp[] {
+  const resources = located.part.localResources;
+  const base = located.pointer.replace(/\/localResources\/environment\/config$/, '');
+  if (resources === undefined) {
+    return [
+      {
+        op: 'add',
+        path: `${base}/localResources`,
+        value: { environment: { config: { [key]: value } } },
+      },
+    ];
+  }
+  if (resources.environment === undefined) {
+    return [
+      {
+        op: 'add',
+        path: `${base}/localResources/environment`,
+        value: { config: { [key]: value } },
+      },
+    ];
+  }
+  if (resources.environment.config === undefined) {
+    return [
+      { op: 'add', path: `${base}/localResources/environment/config`, value: { [key]: value } },
+    ];
+  }
+  return [
+    {
+      op: resources.environment.config[key] === undefined ? 'add' : 'replace',
+      path: `${located.pointer}/${key}`,
+      value,
+    },
+  ];
+}
+
+function assertEnvKey(key: string): void {
+  if (!ENV_KEY.test(key) || key.length > 128) {
+    throw new ConsoleError(
+      400,
+      'INVALID_ENVIRONMENT',
+      'Environment names use letters, digits, and underscores.',
+    );
+  }
+  if (HIDDEN_CONFIG.test(key)) {
+    throw new ConsoleError(
+      400,
+      'INVALID_ENVIRONMENT',
+      'That setting is not an environment variable.',
+    );
+  }
+}
+
+function isSensitiveConfigKey(key: string): boolean {
+  return SENSITIVE_KEY.test(key);
 }
 
 function containsCredential(value: string): boolean {
   return USERINFO.test(value);
 }
 
-function parseLookups(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length > 32) {
-    throw new ConsoleError(
-      400,
-      'INVALID_LOOKUPS',
-      'DNS lookups must be a list of at most 32 hostnames.',
-    );
-  }
-  const names: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== 'string' || !isLookupName(entry)) {
-      throw new ConsoleError(
-        400,
-        'INVALID_LOOKUPS',
-        'Each DNS lookup must be a hostname or a wildcard suffix such as *.example.com.',
-      );
-    }
-    names.push(entry);
-  }
-  return names;
+function isHost(value: string): boolean {
+  return value.length > 0 && value.length <= 253 && HOST_NAME.test(value) && !value.includes('*');
 }
 
-function isLookupName(value: string): boolean {
-  if (value.length === 0 || value.length > 253) return false;
-  const body = value.startsWith('*.') ? value.slice(2) : value;
-  if (body.length === 0 || body.includes('*')) return false;
-  return body.split('.').every((label) => LOOKUP_LABEL.test(label));
+function isPath(value: string): boolean {
+  return value.startsWith('/') && !value.startsWith('//') && !/[\s?#]/.test(value);
 }
 
-function parseQueueUpdates(value: unknown): Array<{ key: string; value: number }> {
-  if (!Array.isArray(value)) {
-    throw new ConsoleError(400, 'INVALID_QUEUE_SETTING', 'Queue settings must be a list.');
-  }
-  return value.map((entry) => {
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
-      throw new ConsoleError(
-        400,
-        'INVALID_QUEUE_SETTING',
-        'Each queue setting needs a key and value.',
-      );
-    }
-    const record = entry as Record<string, unknown>;
-    if (typeof record.key !== 'string' || queueSettingBounds(record.key) === undefined) {
-      throw new ConsoleError(
-        400,
-        'INVALID_QUEUE_SETTING',
-        'Queue settings can only change values already declared on the workload.',
-      );
-    }
-    if (typeof record.value !== 'number') {
-      throw new ConsoleError(
-        400,
-        'INVALID_QUEUE_SETTING',
-        'Queue setting values must be whole numbers.',
-      );
-    }
-    return { key: record.key, value: record.value };
-  });
+function splitComma(value: string | undefined): string[] {
+  if (value === undefined || value.length === 0) return [];
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
-function isInteger(value: unknown, min: number, max: number): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
-}
-
-function sameStrings(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((entry, index) => entry === right[index]);
-}
-
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max)}…` : value;
+function joinComma(values: readonly string[], extra: string): string {
+  return [...values.filter((entry) => entry !== extra), extra].join(',');
 }

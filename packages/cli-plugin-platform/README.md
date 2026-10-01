@@ -268,29 +268,23 @@ For the selected project the extension:
 
 ## Console
 
-`di-framework platform console` serves a local control panel for one tenant. It uses that
-target’s kubeconfig, namespace, and host group — the same credential a tenant already uses to
-deploy — and does not open other targets. It lists that tenant’s workloads, readiness, host
-interfaces, schedules, queue runtime settings, and backing services. You can change replica count,
-queue concurrency and retry settings that are already declared on a workload, allowed DNS lookups,
-cron suspension, and backing services. It does not show control tokens, secret values, or kubeconfig
-contents.
+`di-framework platform console` serves a local control panel for one tenant. The tenant credential
+is the only authentication: there is no login. The process binds to loopback and keeps that
+credential in memory.
+
+The console shows each deployed application as a workload of services and components. A developer
+can read its routes, environment, secret names, backing-service bindings, private bindings, and
+logs. Secret values are write-only. Routes can be turned on or off without a rebuild. Logs and
+success or compute signals appear only when the platform publishes them for that application.
 
 ```bash
 di-framework platform console --target warehouse
-di-framework platform console --target warehouse --host 127.0.0.1 --port 8787
+di-framework platform console --target warehouse --port 8787
 ```
 
-`--target` defaults to `default-target`. The target must be a tenant target (`kubeconfig`,
-`namespace`, and `hostgroup`), not the platform admin credential.
-
-The console binds to loopback unless you choose another specific host. Set `DI_CONSOLE_PASSWORD`
-(12 to 200 characters) before using a non-loopback host. On loopback, a one-time password is printed
-when that variable is unset. Sign-in uses an HttpOnly session cookie and a per-session token on
-every change. Cluster credentials stay in the console process.
-
-SQLite-backed workloads stay at one replica. Queue settings can be edited only when the workload
-already declares them.
+`--target` defaults to `default-target`. The target must be a tenant credential (`kubeconfig`,
+`namespace`, and `hostgroup`), not the platform admin credential. A viewer credential sees the same
+screens and cannot change them.
 
 For the generated local platform the result reports the HTTP URL and required Host header. It is
 directly reachable without `kubectl port-forward`, for example:

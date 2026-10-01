@@ -1,11 +1,9 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+
 export const SESSION_COOKIE = 'di_console_session';
 export const CSRF_HEADER = 'x-di-console-csrf';
 export const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const MAX_SESSIONS = 100;
-const MAX_ATTEMPT_KEYS = 100;
-const LOGIN_LIMIT = 8;
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
 export type Session = {
   csrf: string;
@@ -13,38 +11,16 @@ export type Session = {
   createdAt: number;
 };
 
-type Attempt = { failures: number; windowStarted: number };
-
 export type SessionStore = {
-  create(): { id: string; session: Session };
+  create(now?: number): { id: string; session: Session };
   read(id: string | undefined, now: number): Session | undefined;
   destroy(id: string | undefined): void;
-  loginAllowed(key: string, now: number): boolean;
-  recordFailure(key: string, now: number): void;
-  clearFailures(key: string): void;
 };
 
 export function createSessionStore(): SessionStore {
   const sessions = new Map<string, Session>();
-  const attempts = new Map<string, Attempt>();
-
-  const sweepAttempts = (now: number) => {
-    for (const [key, attempt] of attempts) {
-      if (now - attempt.windowStarted > LOGIN_WINDOW_MS) attempts.delete(key);
-    }
-  };
-
-  const ensureAttemptCapacity = () => {
-    while (attempts.size >= MAX_ATTEMPT_KEYS) {
-      const oldest = attempts.keys().next().value;
-      if (oldest === undefined) break;
-      attempts.delete(oldest);
-    }
-  };
-
   return {
-    create() {
-      const now = Date.now();
+    create(now = Date.now()) {
       for (const [id, session] of sessions) {
         if (session.expiresAt <= now) sessions.delete(id);
       }
@@ -75,32 +51,7 @@ export function createSessionStore(): SessionStore {
     destroy(id) {
       if (id !== undefined) sessions.delete(id);
     },
-    loginAllowed(key, now) {
-      sweepAttempts(now);
-      const attempt = attempts.get(key);
-      if (attempt === undefined) return true;
-      return attempt.failures < LOGIN_LIMIT;
-    },
-    recordFailure(key, now) {
-      sweepAttempts(now);
-      const attempt = attempts.get(key);
-      if (attempt === undefined) {
-        ensureAttemptCapacity();
-        attempts.set(key, { failures: 1, windowStarted: now });
-        return;
-      }
-      attempt.failures += 1;
-    },
-    clearFailures(key) {
-      attempts.delete(key);
-    },
   };
-}
-
-export function passwordsMatch(provided: string, expected: string): boolean {
-  const left = createHash('sha256').update(provided).digest();
-  const right = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(left, right);
 }
 
 export function tokensMatch(provided: string | undefined, expected: string): boolean {
@@ -128,16 +79,11 @@ export function readCookie(header: string | undefined, name: string): string | u
 }
 
 export function sessionCookie(id: string, maxAge: number): string {
-  const secure = [
+  return [
     `${SESSION_COOKIE}=${encodeURIComponent(id)}`,
     'HttpOnly',
     'SameSite=Strict',
     'Path=/',
     `Max-Age=${maxAge}`,
-  ];
-  return secure.join('; ');
-}
-
-export function generateConsolePassword(): string {
-  return randomBytes(18).toString('base64url');
+  ].join('; ');
 }

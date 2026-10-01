@@ -1,95 +1,73 @@
-export type TargetView = {
+export type PartView = {
   name: string;
-  kind: 'managed' | 'external';
-  default: boolean;
-  namespace?: string;
-  context?: string;
-  hostgroup?: string;
-  stack?: string;
-  platform?: string;
-  registryHost?: string;
+  kind: 'service' | 'component';
+  lifetime: 'long-lived' | 'on-demand';
 };
 
-export type ConfigEntry = {
-  key: string;
-  sensitive: boolean;
-  value?: string;
+export type RouteView = {
+  id: string;
+  host: string;
+  path: string;
+  enabled: boolean;
 };
 
-export type QueueSetting = {
-  key: string;
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-};
-
-export type HostInterfaceView = {
-  name?: string;
-  reference: string;
-  interfaces: string[];
-  config: ConfigEntry[];
-};
-
-export type CronView = {
+export type ApplicationSummary = {
   name: string;
-  schedule: string;
-  suspend: boolean;
-  jobId?: string;
-  application?: string;
-  concurrencyPolicy?: string;
-};
-
-export type AppView = {
-  target: string;
-  namespace: string;
-  name: string;
-  application?: string;
-  workload?: string;
   ready: boolean;
-  reason?: string;
-  message?: string;
-  desiredReplicas: number;
-  readyReplicas: number;
-  pinnedReplicas: boolean;
-  deployPolicy?: string;
-  environmentName?: string;
-  hostgroup?: string;
-  httpHost?: string;
-  image?: string;
-  credentialsConfigured: boolean;
-  controlPlane: boolean;
-  allowedIpNameLookups: string[];
-  config: ConfigEntry[];
-  queueSettings: QueueSetting[];
-  hostInterfaces: HostInterfaceView[];
-  volumes: Array<{ name: string; hostPath?: string; mountPath?: string }>;
-  cronJobs: CronView[];
+  detail?: string;
+  services: number;
+  components: number;
+  routeCount: number;
 };
 
-export type TargetGroup = {
-  target: string;
-  namespace?: string;
-  apps: AppView[];
-  error?: string;
-};
-
-export type ServiceView = {
+export type BackingBinding = {
   name: string;
-  namespace: string;
-  type: string;
+  service: string;
   className: string;
-  ready: string;
-  reason?: string;
-  message?: string;
-  endpoint?: { host: string; port: number; capability: string };
-  deletionPolicy?: string;
-  target: string;
+  ready: boolean;
+  detail?: string;
 };
 
-export type ServiceClassView = {
+export type PrivateBinding = {
+  name: string;
+  contract: string;
+  bound: boolean;
+};
+
+export type SignalView = {
+  success: number;
+  error: number;
+  compute?: number[];
+};
+
+export type ApplicationDetail = ApplicationSummary & {
+  parts: PartView[];
+  routes: RouteView[];
+  environment: Array<{ key: string; value: string }>;
+  secrets: Array<{ name: string }>;
+  backingServices: BackingBinding[];
+  privateBindings: PrivateBinding[];
+  logs: { unpublished: true } | { lines: string[] };
+  signals?: SignalView;
+};
+
+export type SessionView = {
+  csrfToken: string;
+  writable: boolean;
+  tenant: string;
+  hostgroup?: string;
+};
+
+export type BackingService = {
+  name: string;
+  className: string;
+  type: string;
+  ready: boolean;
+  detail?: string;
+};
+
+export type ServiceClass = {
   name: string;
   type: string;
-  provider: string;
   default: boolean;
 };
