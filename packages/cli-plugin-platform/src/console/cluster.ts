@@ -7,7 +7,7 @@ import { captureKubectl } from '../kubernetes';
 import { associationName } from '../managed-bindings';
 import type { ClusterConnection } from '../target';
 import { MANAGED_BY_LABEL, WORKLOAD_DEPLOYMENT_RESOURCE } from '../workload';
-import type { BindingDocument, JsonPatchOp, WorkloadDocument } from './catalog';
+import type { BindingDocument, HostFailure, JsonPatchOp, WorkloadDocument } from './catalog';
 import { ConsoleError, sanitizePublicText } from './errors';
 
 const BINDING_RESOURCE = 'servicebindings.platform.di-framework.dev';
@@ -37,6 +37,8 @@ export type ConsoleCluster = {
   canWrite(connection: ClusterConnection): Promise<boolean>;
   readLogs(connection: ClusterConnection, application: string): Promise<string[] | undefined>;
   readSignals(connection: ClusterConnection, application: string): Promise<SignalView | undefined>;
+  /** Host failures by WorkloadDeployment name, from every logs projection in the namespace. */
+  readFailures(connection: ClusterConnection): Promise<Map<string, HostFailure>>;
   bindService(connection: ClusterConnection, input: BindInput): Promise<void>;
   unbindService(connection: ClusterConnection, workload: string, binding: string): Promise<void>;
 };
@@ -143,6 +145,35 @@ export function createKubectlConsoleCluster(
         const compute = series(data.compute);
         return { success, error, ...(compute ? { compute } : {}) };
       });
+    },
+    async readFailures(connection) {
+      const result = await captureKubectl(
+        deps,
+        connection,
+        ['get', 'configmap', '-l', 'di-framework.dev/projection=logs', '-o', 'json'],
+        deps.cwd(),
+      );
+      const failures = new Map<string, HostFailure>();
+      if (result.exitCode !== 0) {
+        log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));
+        if (/forbidden|not found/i.test(result.stderr)) return failures;
+        throw new ConsoleError(502, 'REQUEST_FAILED', 'The application could not be read.');
+      }
+      let list: unknown[];
+      try {
+        list = items(JSON.parse(result.stdout) as unknown);
+      } catch {
+        log('The logs projections could not be read.');
+        throw new ConsoleError(502, 'REQUEST_FAILED', 'The application could not be read.');
+      }
+      for (const entry of list) {
+        const raw = (entry as { data?: { failures?: unknown } } | null)?.data?.failures;
+        for (const [name, failure] of parseFailures(raw)) {
+          const current = failures.get(name);
+          if (current === undefined || failure.time > current.time) failures.set(name, failure);
+        }
+      }
+      return failures;
     },
     async bindService(connection, input) {
       const directory = mkdtempSync(join(tmpdir(), 'di-console-binding-'));
@@ -309,6 +340,39 @@ function items(body: unknown): unknown[] {
     throw new ConsoleError(502, 'REQUEST_FAILED', 'The application could not be read.');
   }
   return list;
+}
+
+/** `data.failures` entries; malformed JSON or entries are ignored. */
+function parseFailures(raw: unknown): Array<[string, HostFailure]> {
+  if (typeof raw !== 'string') return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+  const entries: Array<[string, HostFailure]> = [];
+  for (const [name, value] of Object.entries(parsed)) {
+    const failure = value as Partial<HostFailure> | null;
+    if (
+      typeof failure?.workload === 'string' &&
+      typeof failure.time === 'string' &&
+      (failure.level === 'WARN' || failure.level === 'ERROR') &&
+      typeof failure.message === 'string'
+    ) {
+      entries.push([
+        name,
+        {
+          workload: failure.workload,
+          time: failure.time,
+          level: failure.level,
+          message: failure.message,
+        },
+      ]);
+    }
+  }
+  return entries;
 }
 
 function whole(value: string | undefined): number | undefined {

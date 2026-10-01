@@ -38,7 +38,7 @@ export const ApplicationList = observer(function ApplicationList(): JSX.Element 
               </Button>
             </Td>
             <Td dataLabel="Status">
-              <ReadyLabel ready={app.ready} compact />
+              <ReadyLabel ready={app.ready} failed={app.failed} compact />
               {app.detail ? <div className="console-metric">{app.detail}</div> : null}
             </Td>
             <Td dataLabel="Parts">

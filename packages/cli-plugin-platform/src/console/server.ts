@@ -485,15 +485,22 @@ async function logsFor(
 
 async function loadApplications(options: HandlerOptions) {
   const connection = await connectionFor(options, options.target);
-  const [documents, bindings] = await Promise.all([
+  const [documents, bindings, failures] = await Promise.all([
     options.cluster.listWorkloads(connection),
     options.cluster.listBindings(connection),
+    // Status without host failures is still useful; a projection read error is only logged.
+    options.cluster.readFailures(connection).catch((error: unknown) => {
+      options.log(
+        sanitizePublicText(error instanceof Error ? error.message : 'failure query failed'),
+      );
+      return new Map();
+    }),
   ]);
   const scoped = documents.filter((document) => workloadInTenantScope(document, connection));
   return {
     connection,
     documents: scoped,
-    applications: summarizeApplications(scoped, bindings),
+    applications: summarizeApplications(scoped, bindings, failures),
   };
 }
 
