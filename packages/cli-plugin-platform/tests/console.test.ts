@@ -873,6 +873,21 @@ registry = "registry.example.com/team"
       });
       expect(createdService.status).toBe(201);
       expect(created[0]?.name).toBe('audit');
+      const createdStore = await request(server.port, {
+        path: '/api/backing-services',
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ type: 'blobstore', name: 'catalog', className: 'blobstore-nats' }),
+      });
+      expect(createdStore.status).toBe(201);
+      expect(created[1]).toMatchObject({ name: 'catalog', type: 'blobstore' });
+      const boundStore = await request(server.port, {
+        path: '/api/applications/greeter/bindings',
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ binding: 'objects', service: 'catalog', capability: 'blobstore' }),
+      });
+      expect(boundStore.status).toBe(200);
       expect(
         (
           await request(server.port, {

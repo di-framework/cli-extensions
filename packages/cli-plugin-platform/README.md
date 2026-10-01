@@ -428,3 +428,26 @@ deletion remove obsolete deployment-owned associations. Shared projections stay
 while other workloads use them.
 
 See [PostgreSQL storage, deletion, and recovery](../di-framework-platform/README.md#dedicated-postgresql-upcoming-release).
+
+### Blobstore services
+
+`di-framework platform service create blobstore --name catalog --wait` provisions a
+JetStream NATS object store through the default `blobstore-nats` class. It takes the
+same `--class`, `--memory`, `--storage`, `--cpu`, `--deletion-policy`, and `--timeout`
+flags as the other types. Bind it to an application in the console (or with a
+`ServiceBinding` whose `bindingName` is `objects` and `capability` is `blobstore`); the
+controller projects ConfigMap `di-binding-objects`, and the guest selects it with
+`configFrom`:
+
+```ts
+@WasmCloudBinding('objects', { configFrom: 'di-binding-objects' })
+@Container()
+export class MeshObjects extends Blobstore {}
+```
+
+The host interface stays unnamed; `configFrom` is the only addition. Each guest
+container becomes its own object-store bucket. An unnamed blobstore without
+`configFrom` uses the host default, which in wash 2.8 is an in-memory store that is
+neither shared between components nor kept across restarts, so a workload whose
+members share objects should bind a created service. `serviceName` stays
+Postgres-only.
