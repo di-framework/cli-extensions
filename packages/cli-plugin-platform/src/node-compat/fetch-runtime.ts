@@ -312,6 +312,63 @@ export class ResponsePolyfill {
   }
 }
 
+export class AbortSignalPolyfill {
+  aborted = false;
+  reason: unknown = undefined;
+  onabort: ((event: { type: 'abort' }) => void) | null = null;
+  #listeners: Array<(event: { type: 'abort' }) => void> = [];
+
+  addEventListener(type: string, listener: (event: { type: 'abort' }) => void): void {
+    if (type === 'abort') this.#listeners.push(listener);
+  }
+
+  removeEventListener(type: string, listener: (event: { type: 'abort' }) => void): void {
+    if (type !== 'abort') return;
+    this.#listeners = this.#listeners.filter((item) => item !== listener);
+  }
+
+  dispatchEvent(event: { type: 'abort' }): boolean {
+    for (const listener of this.#listeners) listener(event);
+    return true;
+  }
+
+  throwIfAborted(): void {
+    if (this.aborted)
+      throw this.reason instanceof Error ? this.reason : new Error('This operation was aborted');
+  }
+}
+
+export class AbortControllerPolyfill {
+  readonly signal = new AbortSignalPolyfill();
+
+  abort(reason?: unknown): void {
+    if (this.signal.aborted) return;
+    this.signal.aborted = true;
+    this.signal.reason = reason ?? new Error('This operation was aborted');
+    const event = { type: 'abort' as const };
+    this.signal.onabort?.(event);
+    this.signal.dispatchEvent(event);
+  }
+}
+
+type BlobPart = string | ArrayBuffer | ArrayBufferView;
+
+/** QuickJS has no Blob. unenv's File extends it while Node streams load. */
+export class BlobPolyfill {
+  readonly size: number;
+  readonly type: string;
+
+  constructor(parts: BlobPart[] = [], options?: { type?: string }) {
+    let size = 0;
+    for (const part of parts) {
+      if (typeof part === 'string') size += new TextEncoder().encode(part).length;
+      else size += part.byteLength;
+    }
+    this.size = size;
+    this.type = options?.type ?? '';
+  }
+}
+
 const noopConsole = {
   log() {},
   info() {},
@@ -331,6 +388,13 @@ export function installFetchRuntime(force = false): void {
   if (force || typeof global.Headers !== 'function') global.Headers = HeadersPolyfill;
   if (force || typeof global.Request !== 'function') global.Request = RequestPolyfill;
   if (force || typeof global.Response !== 'function') global.Response = ResponsePolyfill;
+  if (force || typeof global.Blob !== 'function') global.Blob = BlobPolyfill;
+  if (force || typeof global.AbortSignal !== 'function') global.AbortSignal = AbortSignalPolyfill;
+  if (force || typeof global.AbortController !== 'function') {
+    global.AbortController = AbortControllerPolyfill;
+  }
+  // mqtt's browser abort-controller reads AbortController from self or window.
+  if (force || typeof global.self !== 'object' || global.self === null) global.self = globalThis;
   if (force || typeof global.console !== 'object' || global.console === null) {
     global.console = noopConsole;
   }

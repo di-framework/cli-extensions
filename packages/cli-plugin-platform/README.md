@@ -266,6 +266,26 @@ For the selected project the extension:
 4. Configures `wasi:http/handler@0.3.0` with the project name as its host, applies the resources,
    and waits for current `Ready=True` or compatible older readiness schemas.
 
+## Console
+
+`di-framework platform console` serves a local control panel for one tenant. The tenant credential
+is the only authentication: there is no login. The process binds to loopback and keeps that
+credential in memory.
+
+The console shows each deployed application as a workload of services and components. A developer
+can read its routes, environment, secret names, backing-service bindings, private bindings, and
+logs. Secret values are write-only. Routes can be turned on or off without a rebuild. Logs and
+success or compute signals appear only when the platform publishes them for that application.
+
+```bash
+di-framework platform console --target warehouse
+di-framework platform console --target warehouse --port 8787
+```
+
+`--target` defaults to `default-target`. The target must be a tenant credential (`kubeconfig`,
+`namespace`, and `hostgroup`), not the platform admin credential. A viewer credential sees the same
+screens and cannot change them.
+
 For the generated local platform the result reports the HTTP URL and required Host header. It is
 directly reachable without `kubectl port-forward`, for example:
 
@@ -346,8 +366,10 @@ or `WorkloadService({ path: '/sync', subscriptions: ['warehouse.stock'] })`, imp
 `@di-framework/bindings`. The workload name lives in config; source describes behavior.
 The CLI statically reads literal options, rejects conflicting member paths, and selects
 the exported handler without requiring a default export. A service with subscriptions
-exports `wasmcloud:messaging/handler@0.3.0`; a service without subscriptions exports
-`wasi:cli/run@0.3.0`. Both initialize declared host bindings before loading the entrypoint.
+exports `wasmcloud:messaging/handler@0.3.0` and deploys as a component; a service without
+subscriptions exports `wasi:cli/run@0.3.0` and deploys as the workload's
+`spec.template.spec.service`, the only place wash runs a long-lived program. Both initialize
+declared host bindings before loading the entrypoint.
 
 The inferred manifest records routes but does not install a shared HTTP router. On the
 current Kubernetes runtime, HTTP members retain their individual Host headers. See the

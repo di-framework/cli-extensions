@@ -208,6 +208,24 @@ export const sync = WorkloadService({ path: '/sync', subscriptions: ['warehouse.
     expect(entry).toContain('status: 404');
   });
 
+  it('lets a root workload component serve the rest of its host', async () => {
+    const project = member(
+      'site',
+      "export const fetch = WorkloadComponent({ path: '/' })(async () => new Response('ok'));",
+    );
+    await buildComponent(
+      project,
+      captureIo().io,
+      fakeDeps({ cwd: project.projectRoot, assets: makeAssets() }),
+    );
+    const entry = readFileSync(
+      join(project.projectRoot, '.di-framework/application-entry.js'),
+      'utf8',
+    );
+    expect(entry).toContain('fetch as invoke');
+    expect(entry).not.toContain('pathname !==');
+  });
+
   it('merges messaging imports and exports into one host interface with subscriptions', () => {
     const entries = hostInterfacesFromRequirements(
       [

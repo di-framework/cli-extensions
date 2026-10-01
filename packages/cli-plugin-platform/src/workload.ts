@@ -42,6 +42,44 @@ export function hostStoragePath(applicationName: string): string {
   return `${HOST_STORAGE_ROOT}/${asWitIdentifier(applicationName)}`;
 }
 
+/** Members of one persistent workload share a directory. Other apps keep their own. */
+export function storageDirectoryName(project: {
+  applicationName: string;
+  workload?: string;
+  persistentStorage?: boolean;
+}): string {
+  return project.persistentStorage === true && project.workload
+    ? project.workload
+    : project.applicationName;
+}
+
+export type StorageClaim = {
+  metadata?: { name?: string; labels?: Record<string, string> };
+  spec?: { template?: { spec?: { volumes?: Array<{ hostPath?: { path?: string } }> } } };
+};
+
+/** Another deployment may use the path only when it belongs to the same workload. */
+export function storageOwnershipConflict(
+  project: { applicationName: string; workload?: string },
+  hostPath: string,
+  items: readonly StorageClaim[],
+): { owner: string } | undefined {
+  for (const item of items) {
+    const labels = item.metadata?.labels;
+    if (
+      project.workload !== undefined &&
+      labels?.['di-framework.dev/workload'] === project.workload
+    ) {
+      continue;
+    }
+    const volumes = item.spec?.template?.spec?.volumes ?? [];
+    if (volumes.some((volume) => volume.hostPath?.path === hostPath)) {
+      return { owner: item.metadata?.name ?? 'unknown' };
+    }
+  }
+  return undefined;
+}
+
 /** Kubernetes Secret that holds DI_CONTROL_TOKEN for a workload. */
 export function controlSecretResourceName(workloadName: string): string {
   return `${workloadName}-control`;
@@ -111,7 +149,7 @@ export function renderWorkloadManifest(
   const mountPath =
     opts.storageVolume?.mountPath ??
     (hasActors ? `${DEFAULT_STORAGE_MOUNT}/actors` : DEFAULT_STORAGE_MOUNT);
-  const hostPath = opts.storageVolume?.hostPath ?? hostStoragePath(project.applicationName);
+  const hostPath = opts.storageVolume?.hostPath ?? hostStoragePath(storageDirectoryName(project));
 
   const environment: Record<string, string> = { ...(opts.environment ?? {}) };
   if (needsPersistentStorage) {
@@ -202,11 +240,20 @@ spec:
     );
   }
 
+  // A long-lived wasi:cli/run program is a WorkloadService: wash runs it only from
+  // spec.template.spec.service, never as a component export.
+  const runsAsService =
+    !hasHttp &&
+    !isWorker &&
+    project.workloadEntry?.kind === 'service' &&
+    project.workloadEntry.subscriptions === undefined;
+  const interfaceRequirements: readonly WitRequirement[] = requirements;
   const hostInterfaces = renderHostInterfacesYaml(
     hostInterfacesFromRequirements(
-      hasHttp && !requirements.some((r) => r.package === 'wasi:http' && r.direction === 'export')
+      hasHttp &&
+        !interfaceRequirements.some((r) => r.package === 'wasi:http' && r.direction === 'export')
         ? [
-            ...requirements,
+            ...interfaceRequirements,
             {
               package: 'wasi:http',
               version: '0.3.0',
@@ -215,7 +262,7 @@ spec:
               source: 'control-http',
             },
           ]
-        : requirements,
+        : interfaceRequirements,
       {
         ...(hasHttp ? { httpHost: advertisedHttpHost } : {}),
         subscriptions: project.workloadEntry?.subscriptions,
@@ -259,10 +306,16 @@ ${
           name: ${name}
 `
     : ''
-}      components:
+}${
+  runsAsService
+    ? `      service:
+        image: ${yamlQuote(image)}
+${localResourcesLines.length > 0 ? `${localResourcesLines.map((line) => line.slice(2)).join('\n')}\n` : ''}`
+    : `      components:
         - name: ${name}
           image: ${yamlQuote(image)}
-${localResourcesLines.length > 0 ? `${localResourcesLines.join('\n')}\n` : ''}${hostInterfaces}`;
+${localResourcesLines.length > 0 ? `${localResourcesLines.join('\n')}\n` : ''}`
+}${hostInterfaces}`;
 
   sections.push(workloadDeployment);
 
@@ -446,8 +499,7 @@ async function assertStorageOwnership(
   flags: { hasActors: boolean; hasQueues: boolean; hasPersistentStorage?: boolean },
 ): Promise<void> {
   if (!flags.hasActors && !flags.hasQueues && !flags.hasPersistentStorage) return;
-  const name = deploymentResourceName(project);
-  const hostPath = hostStoragePath(project.applicationName);
+  const hostPath = hostStoragePath(storageDirectoryName(project));
   const result = await captureKubectl(
     deps,
     connection,
@@ -463,30 +515,19 @@ async function assertStorageOwnership(
   );
   if (result.exitCode !== 0) return;
   try {
-    const list = JSON.parse(result.stdout) as {
-      items?: Array<{
-        metadata?: { name?: string };
-        spec?: { template?: { spec?: { volumes?: Array<{ hostPath?: { path?: string } }> } } };
-      }>;
-    };
-    let conflict: CommandFailure | undefined;
-    for (const item of list.items ?? []) {
-      for (const volume of item.spec?.template?.spec?.volumes ?? []) {
-        if (volume.hostPath?.path === hostPath) {
-          conflict = new CommandFailure(
-            'WASMCLOUD_STORAGE_OWNERSHIP_CONFLICT',
-            `Storage path ${hostPath} is already claimed by WorkloadDeployment ${item.metadata?.name ?? 'unknown'}`,
-            2,
-            { application: project.applicationName, path: hostPath, owner: item.metadata?.name },
-          );
-        }
-      }
+    const list = JSON.parse(result.stdout) as { items?: StorageClaim[] };
+    const conflict = storageOwnershipConflict(project, hostPath, list.items ?? []);
+    if (conflict) {
+      throw new CommandFailure(
+        'WASMCLOUD_STORAGE_OWNERSHIP_CONFLICT',
+        `Storage path ${hostPath} is already claimed by WorkloadDeployment ${conflict.owner}`,
+        2,
+        { application: project.applicationName, path: hostPath, owner: conflict.owner },
+      );
     }
-    if (conflict) throw conflict;
   } catch (error) {
     if (error instanceof CommandFailure) throw error;
   }
-  void name;
 }
 
 export async function deleteWorkload(

@@ -1,5 +1,6 @@
 import type { CommandNode } from '@di-framework/cli-extension';
 import { runWasmcloudBuild } from './build';
+import { runWasmcloudConsole } from './console/run';
 import { runWasmcloudDeploy } from './deploy';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { runWasmcloudDestroy } from './destroy';
@@ -84,6 +85,17 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
         description: 'Check the project and local toolchain for wasmCloud readiness',
         usage: 'di-framework platform doctor',
         run: ({ args, io }) => runWasmcloudDoctor(args, io, deps),
+      },
+      console: {
+        description: 'Open a local console for the applications on one tenant credential',
+        usage:
+          'di-framework platform console [--target <tenant>] [--host <address>] [--port <port>]',
+        options: [
+          '--target <tenant>  Tenant target (default: default-target). Uses that target’s kubeconfig only',
+          '--host <address>  Loopback bind address (default: 127.0.0.1)',
+          '--port <port>  Listen port (default: 8787)',
+        ],
+        run: ({ args, io }) => runWasmcloudConsole(args, io, deps),
       },
       service: {
         description:

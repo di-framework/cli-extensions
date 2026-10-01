@@ -6,6 +6,8 @@ import { loadProject } from '../src/project';
 import {
   applyWorkload,
   renderWorkloadManifest,
+  storageDirectoryName,
+  storageOwnershipConflict,
   WORKLOAD_DEPLOYMENT_RESOURCE,
   WORKLOAD_REPLICA_SET_RESOURCE,
   waitForReady,
@@ -25,6 +27,74 @@ const REGISTRY = {
 };
 
 describe('workload manifests', () => {
+  it('runs a long-lived workload service as the WorkloadService', () => {
+    const { greeter } = makeWorkspace();
+    const project = {
+      ...loadProject(greeter),
+      ingress: false,
+      allowedIpNameLookups: ['nats.example.com'],
+      workloadEntry: { kind: 'service' as const, exportName: 'collect', path: '/collect' },
+    };
+    const yaml = renderWorkloadManifest(
+      project,
+      {
+        target: 'development',
+        kubeconfig: '/tmp/kube',
+        namespace: 'wasmcloud',
+        registry: REGISTRY,
+      },
+      'registry.example.com/collector:1',
+      [],
+    );
+    // wash 2.8 runs wasi:cli/run only from spec.template.spec.service; a host interface
+    // named wasi:cli/run is never provided and stops the workload from starting.
+    expect(yaml).toContain(
+      '      service:\n        image: "registry.example.com/collector:1"\n        localResources:\n          allowedIpNameLookups: ["nats.example.com"]\n',
+    );
+    expect(yaml).not.toContain('hostInterfaces:');
+    expect(yaml).not.toContain('components:');
+    expect(yaml).not.toContain('package: cli');
+    expect(yaml).not.toContain('kubernetes:');
+    expect(yaml).not.toContain('volumeMounts:');
+  });
+
+  it('keeps a messaging-subscription workload service as a component', () => {
+    const { greeter } = makeWorkspace();
+    const project = {
+      ...loadProject(greeter),
+      ingress: false,
+      workloadEntry: {
+        kind: 'service' as const,
+        exportName: 'collect',
+        path: '/collect',
+        subscriptions: ['mesh.events'],
+      },
+    };
+    const yaml = renderWorkloadManifest(
+      project,
+      {
+        target: 'development',
+        kubeconfig: '/tmp/kube',
+        namespace: 'wasmcloud',
+        registry: REGISTRY,
+      },
+      'registry.example.com/collector:1',
+      [
+        {
+          package: 'wasmcloud:messaging',
+          version: '0.2.0',
+          interfaces: ['handler'],
+          direction: 'export',
+          source: 'workload-service',
+        },
+      ],
+    );
+    expect(yaml).toContain('      components:\n        - name: greeter\n');
+    expect(yaml).not.toContain('      service:');
+    expect(yaml).not.toContain('package: cli');
+    expect(yaml).toContain('"subscriptions": "mesh.events"');
+  });
+
   it('renders Service and WorkloadDeployment from the project name and image', () => {
     const { greeter } = makeWorkspace();
     const project = loadProject(greeter);
@@ -367,6 +437,63 @@ export class Worker {
         }),
       ),
     ).rejects.toMatchObject({ code: 'WASMCLOUD_STORAGE_OWNERSHIP_CONFLICT', exitCode: 2 });
+  });
+
+  it('shares one storage directory across a persistent workload', () => {
+    const { greeter } = makeWorkspace();
+    const project = {
+      ...loadProject(greeter),
+      workload: 'mesh',
+      persistentStorage: true,
+    };
+    expect(storageDirectoryName(project)).toBe('mesh');
+    expect(storageDirectoryName({ ...project, persistentStorage: false })).toBe('greeter');
+    expect(storageDirectoryName({ applicationName: 'Queue App' })).toBe('Queue App');
+    const yaml = renderWorkloadManifest(
+      project,
+      {
+        target: 'development',
+        kubeconfig: '/tmp/kube',
+        namespace: 'wasmcloud',
+        registry: REGISTRY,
+      },
+      'registry.example.com/team/greeter:shared',
+      undefined,
+      [],
+      { hasPersistentStorage: true },
+    );
+    expect(yaml).toContain('path: "/var/lib/di-framework/storage/mesh"');
+    const claim = {
+      metadata: { name: 'mesh-collector', labels: { 'di-framework.dev/workload': 'mesh' } },
+      spec: {
+        template: {
+          spec: { volumes: [{ hostPath: { path: '/var/lib/di-framework/storage/mesh' } }] },
+        },
+      },
+    };
+    expect(storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [claim])).toBe(
+      undefined,
+    );
+    expect(
+      storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [
+        { metadata: { name: 'other' }, spec: claim.spec },
+      ]),
+    ).toEqual({ owner: 'other' });
+    expect(
+      storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [
+        { metadata: { name: 'empty' } },
+      ]),
+    ).toBe(undefined);
+    expect(
+      storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [
+        { spec: claim.spec },
+      ]),
+    ).toEqual({ owner: 'unknown' });
+    expect(
+      storageOwnershipConflict({ applicationName: 'lone' }, '/var/lib/di-framework/storage/mesh', [
+        claim,
+      ]),
+    ).toEqual({ owner: 'mesh-collector' });
   });
 
   it('creates localResources for control secrets and allowed IP lookups when no env is configured', () => {

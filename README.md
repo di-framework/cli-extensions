@@ -60,7 +60,10 @@ di-framework platform deploy greeter --target local
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
-The generated `di-framework.deploy.toml` describes deployment targets. Named
+The generated `local` target is the platform admin credential. The console is a separate
+command for a tenant target (`kubeconfig`, `namespace`, and `hostgroup`), described in the
+[platform guide](packages/cli-plugin-platform/README.md#console). The generated
+`di-framework.deploy.toml` describes deployment targets. Named
 projects are discovered by their configured `name` within the workspace. The
 HTTP example uses the generated platform's default port.
 

@@ -24,6 +24,6 @@
     "noPropertyAccessFromIndexSignature": false,
     "baseUrl": "."
   },
-  "include": ["**/*.ts"],
+  "include": ["**/*.ts", "packages/cli-plugin-platform/console-ui/**/*.tsx"],
   "exclude": ["node_modules", "dist", "coverage", "sqlite-src"]
 }

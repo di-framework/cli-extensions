@@ -15,6 +15,7 @@ describe('extension manifest', () => {
       'destroy',
       'cluster',
       'doctor',
+      'console',
       'service',
     ]);
     expect(Object.keys(manifest.command.children?.cluster?.children ?? {})).toEqual([
@@ -51,6 +52,7 @@ describe('extension manifest', () => {
       'cluster up',
       'cluster destroy',
       'doctor',
+      'console',
       'service create',
       'service list',
       'service get',
