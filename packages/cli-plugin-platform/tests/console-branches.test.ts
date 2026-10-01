@@ -381,6 +381,7 @@ describe('console branches', () => {
     await expect(failing.listWorkloads(connection)).rejects.toMatchObject({
       code: 'CLUSTER_REQUEST_FAILED',
     });
+    await expect(failing.listCronJobs(connection)).rejects.toMatchObject({ status: 502 });
     await expect(failing.patchWorkload(connection, 'greeter', [])).rejects.toMatchObject({
       status: 502,
     });
@@ -391,6 +392,7 @@ describe('console branches', () => {
       (line) => logs.push(line),
     );
     await expect(malformed.listCronJobs(connection)).rejects.toMatchObject({ status: 502 });
+    await expect(malformed.listWorkloads(connection)).rejects.toMatchObject({ status: 502 });
     const missingItems = createKubectlConsoleCluster(
       fakeDeps({ cwd: '/tmp', capturedStdout: { 'kubectl get': '{"items":{}}' } }),
       () => undefined,
