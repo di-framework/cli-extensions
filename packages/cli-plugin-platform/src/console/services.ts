@@ -56,7 +56,8 @@ export function createCliConsoleServices(deps: WasmcloudDeps, io: CliIo): Consol
       const result = await runWasmcloudServiceClasses(['--target', target], io, deps);
       const data = record(result.data);
       return {
-        classes: readClasses(data.classes),
+        // Egress needs destinations, which the console create form does not collect.
+        classes: readClasses(data.classes).filter((entry) => entry.type !== 'egress'),
         fromCluster: data.fromCluster === true,
       };
     },

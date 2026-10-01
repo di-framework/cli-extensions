@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WasmcloudDeps } from '../deps';
+import { EGRESS_BINDING_NAME, egressResourceName } from '../egress';
 import { captureKubectl } from '../kubernetes';
 import { associationName } from '../managed-bindings';
 import type { ClusterConnection } from '../target';
@@ -180,12 +181,24 @@ export function createKubectlConsoleCluster(
       }
     },
     async unbindService(connection, workload, binding) {
-      const result = await captureKubectl(
+      let result = await captureKubectl(
         deps,
         connection,
         ['delete', BINDING_RESOURCE, associationName(workload, binding)],
         deps.cwd(),
       );
+      // Deploy names the egress binding after the WorkloadDeployment.
+      if (
+        result.exitCode !== 0 &&
+        binding === EGRESS_BINDING_NAME &&
+        /not ?found/i.test(result.stderr)
+      )
+        result = await captureKubectl(
+          deps,
+          connection,
+          ['delete', BINDING_RESOURCE, egressResourceName(workload)],
+          deps.cwd(),
+        );
       if (result.exitCode !== 0 && /not ?found/i.test(result.stderr)) {
         log(sanitizePublicText(result.stderr));
         throw new ConsoleError(

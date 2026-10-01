@@ -156,8 +156,11 @@ describe('tenant deployment targets', () => {
         fakeDeps({ cwd: root, invocations }),
       );
       expectScope(invocations, root, user);
-      expect(invocations).toHaveLength(2);
+      expect(invocations).toHaveLength(3);
       expect(invocations[0]?.args).toContain('delete');
+      expect(invocations[2]?.args).toContain(
+        'di-framework.dev/egress-workload=greeter,app.kubernetes.io/managed-by=di-framework',
+      );
     }
   });
 

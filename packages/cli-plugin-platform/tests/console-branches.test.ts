@@ -9,7 +9,7 @@ import { createSessionStore, readCookie, sessionCookie, tokensMatch } from '../s
 import type { WorkloadDocument } from '../src/console/catalog';
 import { type ConsoleCluster, createKubectlConsoleCluster } from '../src/console/cluster';
 import { consoleAssetsDirectory, parseConsoleArgs, runWasmcloudConsole } from '../src/console/run';
-import { startConsoleServer } from '../src/console/server';
+import { egressWorkload, startConsoleServer } from '../src/console/server';
 import { type ConsoleServices, createCliConsoleServices } from '../src/console/services';
 import type { ClusterConnection } from '../src/target';
 import { captureIo, fakeDeps, makeWorkspace } from './helpers';
@@ -556,6 +556,24 @@ describe('console branches', () => {
       expect(
         (
           await request(server.port, {
+            path: '/api/applications/greeter/bindings',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ binding: 'egress', service: 'outbound', capability: 'egress' }),
+          })
+        ).status,
+      ).toBe(200);
+      const egressCreate = await request(server.port, {
+        path: '/api/backing-services',
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ type: 'egress', name: 'outbound' }),
+      });
+      expect(egressCreate.status).toBe(400);
+      expect(egressCreate.body).toContain('platform service create egress');
+      expect(
+        (
+          await request(server.port, {
             path: '/api/applications/greeter/bindings/missing',
             method: 'DELETE',
             headers: auth,
@@ -735,6 +753,29 @@ describe('console branches', () => {
       if (previous) writeFileSync(indexPath, previousBody);
       else unlinkSync(indexPath);
     }
+  });
+
+  it('binds egress to the single WorkloadDeployment of an application', () => {
+    expect(egressWorkload([{ metadata: { name: 'mesh-site' } }] as WorkloadDocument[])).toBe(
+      'mesh-site',
+    );
+    for (const members of [[], [{ metadata: { name: 'a' } }, { metadata: { name: 'b' } }], [{}]])
+      expect(() => egressWorkload(members as WorkloadDocument[])).toThrow(
+        'Egress is granted per part',
+      );
+  });
+
+  it('unbinds the deploy-named egress binding when no console binding exists', async () => {
+    const deleted: string[] = [];
+    const { cluster } = clusterFrom((args) => {
+      const name = args[args.indexOf('delete') + 2] ?? '';
+      deleted.push(name);
+      return name.startsWith('di-bind-')
+        ? { exitCode: 1, stderr: 'Error from server (NotFound): not found' }
+        : {};
+    });
+    await cluster.unbindService(connection, 'mesh-site', 'egress');
+    expect(deleted).toEqual([expect.stringMatching(/^di-bind-/), 'mesh-site-egress']);
   });
 });
 
