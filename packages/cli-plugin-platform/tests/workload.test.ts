@@ -27,11 +27,12 @@ const REGISTRY = {
 };
 
 describe('workload manifests', () => {
-  it('declares wasi:cli/run for a long-lived workload service', () => {
+  it('runs a long-lived workload service as the WorkloadService', () => {
     const { greeter } = makeWorkspace();
     const project = {
       ...loadProject(greeter),
       ingress: false,
+      allowedIpNameLookups: ['nats.example.com'],
       workloadEntry: { kind: 'service' as const, exportName: 'collect', path: '/collect' },
     };
     const yaml = renderWorkloadManifest(
@@ -45,9 +46,53 @@ describe('workload manifests', () => {
       'registry.example.com/collector:1',
       [],
     );
-    expect(yaml).toContain('package: cli');
-    expect(yaml).toContain('- run');
+    // wash 2.8 runs wasi:cli/run only from spec.template.spec.service; a host interface
+    // named wasi:cli/run is never provided and stops the workload from starting.
+    expect(yaml).toContain(
+      '      service:\n        image: "registry.example.com/collector:1"\n        localResources:\n          allowedIpNameLookups: ["nats.example.com"]\n',
+    );
+    expect(yaml).not.toContain('hostInterfaces:');
+    expect(yaml).not.toContain('components:');
+    expect(yaml).not.toContain('package: cli');
+    expect(yaml).not.toContain('kubernetes:');
     expect(yaml).not.toContain('volumeMounts:');
+  });
+
+  it('keeps a messaging-subscription workload service as a component', () => {
+    const { greeter } = makeWorkspace();
+    const project = {
+      ...loadProject(greeter),
+      ingress: false,
+      workloadEntry: {
+        kind: 'service' as const,
+        exportName: 'collect',
+        path: '/collect',
+        subscriptions: ['mesh.events'],
+      },
+    };
+    const yaml = renderWorkloadManifest(
+      project,
+      {
+        target: 'development',
+        kubeconfig: '/tmp/kube',
+        namespace: 'wasmcloud',
+        registry: REGISTRY,
+      },
+      'registry.example.com/collector:1',
+      [
+        {
+          package: 'wasmcloud:messaging',
+          version: '0.2.0',
+          interfaces: ['handler'],
+          direction: 'export',
+          source: 'workload-service',
+        },
+      ],
+    );
+    expect(yaml).toContain('      components:\n        - name: greeter\n');
+    expect(yaml).not.toContain('      service:');
+    expect(yaml).not.toContain('package: cli');
+    expect(yaml).toContain('"subscriptions": "mesh.events"');
   });
 
   it('renders Service and WorkloadDeployment from the project name and image', () => {

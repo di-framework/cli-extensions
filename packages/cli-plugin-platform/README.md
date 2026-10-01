@@ -366,8 +366,10 @@ or `WorkloadService({ path: '/sync', subscriptions: ['warehouse.stock'] })`, imp
 `@di-framework/bindings`. The workload name lives in config; source describes behavior.
 The CLI statically reads literal options, rejects conflicting member paths, and selects
 the exported handler without requiring a default export. A service with subscriptions
-exports `wasmcloud:messaging/handler@0.3.0`; a service without subscriptions exports
-`wasi:cli/run@0.3.0`. Both initialize declared host bindings before loading the entrypoint.
+exports `wasmcloud:messaging/handler@0.3.0` and deploys as a component; a service without
+subscriptions exports `wasi:cli/run@0.3.0` and deploys as the workload's
+`spec.template.spec.service`, the only place wash runs a long-lived program. Both initialize
+declared host bindings before loading the entrypoint.
 
 The inferred manifest records routes but does not install a shared HTTP router. On the
 current Kubernetes runtime, HTTP members retain their individual Host headers. See the

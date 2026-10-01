@@ -240,22 +240,14 @@ spec:
     );
   }
 
-  const interfaceRequirements: readonly WitRequirement[] =
+  // A long-lived wasi:cli/run program is a WorkloadService: wash runs it only from
+  // spec.template.spec.service, never as a component export.
+  const runsAsService =
     !hasHttp &&
     !isWorker &&
     project.workloadEntry?.kind === 'service' &&
-    project.workloadEntry.subscriptions === undefined
-      ? [
-          ...requirements,
-          {
-            package: 'wasi:cli',
-            version: '0.3.0',
-            interfaces: ['run'],
-            direction: 'export',
-            source: 'workload-service',
-          },
-        ]
-      : requirements;
+    project.workloadEntry.subscriptions === undefined;
+  const interfaceRequirements: readonly WitRequirement[] = requirements;
   const hostInterfaces = renderHostInterfacesYaml(
     hostInterfacesFromRequirements(
       hasHttp &&
@@ -314,10 +306,16 @@ ${
           name: ${name}
 `
     : ''
-}      components:
+}${
+  runsAsService
+    ? `      service:
+        image: ${yamlQuote(image)}
+${localResourcesLines.length > 0 ? `${localResourcesLines.map((line) => line.slice(2)).join('\n')}\n` : ''}`
+    : `      components:
         - name: ${name}
           image: ${yamlQuote(image)}
-${localResourcesLines.length > 0 ? `${localResourcesLines.join('\n')}\n` : ''}${hostInterfaces}`;
+${localResourcesLines.length > 0 ? `${localResourcesLines.join('\n')}\n` : ''}`
+}${hostInterfaces}`;
 
   sections.push(workloadDeployment);
 
