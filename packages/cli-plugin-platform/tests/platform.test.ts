@@ -317,6 +317,43 @@ describe('runWasmcloudPlatformDeploy', () => {
   });
 });
 
+describe('platform cluster commands without a target', () => {
+  it('use default-target for cluster up and cluster destroy', async () => {
+    const { root, kubeconfig } = makeWorkspace();
+    const up = await runWasmcloudPlatformDeploy(
+      ['--yes'],
+      captureIo().io,
+      fakeDeps({
+        cwd: root,
+        capturedStdout: { 'pulumi stack output': platformOutputJson(kubeconfig) },
+      }),
+    );
+    expect(up.data).toMatchObject({ target: 'local', stack: 'dev' });
+    const destroyed = await runWasmcloudPlatformDestroy(
+      ['--target', 'local', '--yes'],
+      captureIo().io,
+      fakeDeps({ cwd: root }),
+    );
+    expect(destroyed.data).toMatchObject({ target: 'local', stack: 'dev' });
+    const defaulted = await runWasmcloudPlatformDestroy(
+      [],
+      captureIo().io,
+      fakeDeps({ cwd: root }),
+    );
+    expect(defaulted.data).toMatchObject({ target: 'local' });
+  });
+
+  it('fail clearly when no target is given and default-target is unset', async () => {
+    const { root } = makeWorkspace({ manifest: '[targets.local]\nplatform = "deploy/platform"\n' });
+    await expect(
+      runWasmcloudPlatformDeploy([], captureIo().io, fakeDeps({ cwd: root })),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_TARGET_NOT_FOUND',
+      message: expect.stringContaining('set default-target'),
+    });
+  });
+});
+
 describe('runWasmcloudPlatformDestroy', () => {
   it('destroys only the platform stack', async () => {
     const { root } = makeWorkspace();

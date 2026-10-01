@@ -69,14 +69,20 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
           up: {
             description:
               'Run pulumi up for a managed target in di-framework.deploy.toml (k0s, registry, operator)',
-            usage: 'di-framework platform cluster up <target> [--yes]',
-            options: ['--yes  Skip the Pulumi confirmation prompt'],
+            usage: 'di-framework platform cluster up [target] [--yes]',
+            options: [
+              '[target], --target <name>  Managed target from di-framework.deploy.toml (default: default-target)',
+              '--yes  Skip the Pulumi confirmation prompt',
+            ],
             run: ({ args, io }) => runWasmcloudPlatformDeploy(args, io, deps),
           },
           destroy: {
             description: 'Run pulumi destroy for a managed platform target only',
-            usage: 'di-framework platform cluster destroy <target> [--yes]',
-            options: ['--yes  Skip the Pulumi confirmation prompt'],
+            usage: 'di-framework platform cluster destroy [target] [--yes]',
+            options: [
+              '[target], --target <name>  Managed target from di-framework.deploy.toml (default: default-target)',
+              '--yes  Skip the Pulumi confirmation prompt',
+            ],
             run: ({ args, io }) => runWasmcloudPlatformDestroy(args, io, deps),
           },
         },
@@ -112,7 +118,7 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
               '--storage <qty>  Optional sizing parameter (Kubernetes quantity)',
               '--cpu <qty>  Optional sizing parameter (Kubernetes quantity)',
               '--deletion-policy <Retain|Delete>  Retention when the CR is deleted (default Retain)',
-              '--target <name>  Deployment target from di-framework.deploy.toml',
+              '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
               '--namespace <ns>  Override the target namespace',
               '--context <name>  Override the kubeconfig context',
               '--wait  Wait until the Ready condition is True',
@@ -124,7 +130,7 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
             description: 'List BackingService resources in the target namespace',
             usage: 'di-framework platform service list [--target <name>] [--namespace <ns>]',
             options: [
-              '--target <name>  Deployment target from di-framework.deploy.toml',
+              '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
               '--namespace <ns>  Override the target namespace',
               '--context <name>  Override the kubeconfig context',
             ],
@@ -135,7 +141,7 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
               'Show Ready status, type, class, and endpoint summary for a BackingService',
             usage: 'di-framework platform service get <name> [--target <name>] [--namespace <ns>]',
             options: [
-              '--target <name>  Deployment target from di-framework.deploy.toml',
+              '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
               '--namespace <ns>  Override the target namespace',
               '--context <name>  Override the kubeconfig context',
             ],
@@ -147,7 +153,7 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
             usage:
               'di-framework platform service delete <name> [--target <name>] [--namespace <ns>]',
             options: [
-              '--target <name>  Deployment target from di-framework.deploy.toml',
+              '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
               '--namespace <ns>  Override the target namespace',
               '--context <name>  Override the kubeconfig context',
             ],
@@ -158,7 +164,7 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
               'Discover approved BackingServiceClass resources (falls back to platform defaults)',
             usage: 'di-framework platform service classes [--target <name>]',
             options: [
-              '--target <name>  Deployment target from di-framework.deploy.toml',
+              '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
               '--namespace <ns>  Override the target namespace',
               '--context <name>  Override the kubeconfig context',
             ],

@@ -64,7 +64,7 @@ export function selectConsoleTenant(
   if (target.kind !== 'external' || target.hostgroup === undefined) {
     throw new CommandFailure(
       'WASMCLOUD_CONSOLE_TENANT_REQUIRED',
-      `Target "${target.name}" is not a tenant credential. Start the console with the tenant kubeconfig and host group.`,
+      `Target "${target.name}" is not a tenant credential. Start the console with a target that sets tenant = "<name>" (or namespace and hostgroup) and the tenant user's kubeconfig.`,
       2,
       { target: target.name },
     );

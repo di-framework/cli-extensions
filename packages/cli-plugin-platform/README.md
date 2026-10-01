@@ -11,11 +11,11 @@ di-framework platform build                               # bundle + jco compone
 di-framework platform dev                                 # build, then serve locally (wasmtime by default)
 di-framework platform deploy                              # nearest project, default target
 di-framework platform deploy greeter                      # named project anywhere in the workspace
-di-framework platform deploy greeter --target development
+di-framework platform deploy greeter --target development # a target other than default-target
 di-framework platform destroy greeter
 di-framework platform cluster init                        # generate deploy/platform + local target
-di-framework platform cluster up local --yes              # start the generated platform
-di-framework platform cluster destroy local --yes
+di-framework platform cluster up --yes                    # start the generated platform (default-target)
+di-framework platform cluster destroy --yes
 di-framework platform doctor                              # project + toolchain readiness checks
 ```
 
@@ -212,14 +212,41 @@ namespace = "wasmcloud"
 push = "https://registry.example.com/team"
 pull = "registry.internal.example.com/team"
 insecure = false
+
+[targets.warehouse]
+kubeconfig = "${WAREHOUSE_KUBECONFIG}"
+tenant = "warehouse"            # namespace di-tenant-warehouse, hostgroup tenant-warehouse
+registry = "registry.example.com/warehouse"
 ```
 
+- Every command that takes `--target` (`deploy`, `destroy`, `console`, `service …`, and
+  `cluster up` / `cluster destroy`) uses `default-target` when `--target` is left out. Pass
+  `--target <name>` only to pick a different target.
 - `di-framework platform deploy` with no name uses the nearest `di-framework.config.json`.
 - `di-framework platform deploy greeter` recursively discovers projects (skipping `.git`,
   `node_modules`, `.di-framework`, and generated output by default) and matches the configured
   `name`. Duplicate names fail with every conflicting path.
 - `${VAR}` interpolation fails if the variable is unset or empty. Do not put credentials in the
   manifest.
+
+### Targets and tenants
+
+A **target** and a **tenant** are different things:
+
+- A **target** is a local deploy destination: one `[targets.<name>]` table in
+  `di-framework.deploy.toml`. It bundles a credential (kubeconfig and optional context), a
+  namespace, a host group, and a registry. Only your workspace knows about it.
+- A **tenant** is the platform's isolation unit, declared by the platform administrator. The
+  platform gives tenant `<t>` the workload namespace `di-tenant-<t>`, the runtime namespace
+  `di-runtime-<t>`, the host group `tenant-<t>`, and RBAC for its users.
+
+One tenant can have several targets, for example one per user, credential, or registry. A target
+points at no tenant (an admin or plain-cluster target such as `local` or `development` above) or
+exactly one. Set `tenant = "<t>"` on an external target to point it at a tenant: it fills in
+`namespace = "di-tenant-<t>"` and `hostgroup = "tenant-<t>"`. An explicit `namespace` or
+`hostgroup` still wins. Tenant names follow the platform's rule: 1–40 characters, lowercase
+letters, digits, and single hyphens, starting with a letter. An external target needs
+`kubeconfig`, `registry`, and either `tenant` or `namespace`.
 
 ### Managed Pulumi target
 
@@ -228,12 +255,13 @@ the wasmCloud operator) from templates shipped with this extension:
 
 ```bash
 di-framework platform cluster init
-di-framework platform cluster up local --yes
+di-framework platform cluster up --yes
 ```
 
 `platform init` writes `deploy/platform` and creates or updates `di-framework.deploy.toml` so
 `local` is a managed target (`platform = "deploy/platform"`, `stack = "dev"`). Existing files are
-left alone unless you pass `--force`. The command prints the exact start command when it finishes.
+left alone unless you pass `--force`. When the manifest has no `default-target` yet, `local`
+becomes the default, so the commands below need no target name. The command prints the exact start command when it finishes.
 Platform deploy runs the package-manager-neutral `pulumi install` command automatically, so the
 generated project works immediately in a blank consumer workspace without a root workspace entry
 or a manual install inside `deploy/platform`.
@@ -255,11 +283,12 @@ The CLI reads a small output contract from `pulumi stack output --json`:
 | `context` | no | kubectl context |
 | `endpoints.http` / `endpoints.kubernetes` / `endpoints.registry` | no | optional URLs |
 
-Provision and tear down that stack explicitly:
+Provision and tear down that stack explicitly (add the target name, positionally or with
+`--target`, when it is not the `default-target`):
 
 ```bash
-di-framework platform cluster up local --yes
-di-framework platform cluster destroy local --yes
+di-framework platform cluster up --yes
+di-framework platform cluster destroy --yes
 ```
 
 Application `destroy` never runs `pulumi destroy`.
@@ -303,14 +332,23 @@ can read its routes, environment, secret names, backing-service bindings, privat
 logs. Secret values are write-only. Routes can be turned on or off without a rebuild. Logs and
 success or compute signals appear only when the platform publishes them for that application.
 
-```bash
-di-framework platform console --target warehouse
-di-framework platform console --target warehouse --port 8787
+```toml
+default-target = "warehouse"
+
+[targets.warehouse]
+kubeconfig = "${WAREHOUSE_KUBECONFIG}"
+tenant = "warehouse"
+registry = "registry.example.com/warehouse"
 ```
 
-`--target` defaults to `default-target`. The target must be a tenant credential (`kubeconfig`,
-`namespace`, and `hostgroup`), not the platform admin credential. A viewer credential sees the same
-screens and cannot change them.
+```bash
+di-framework platform console
+di-framework platform console --port 8787
+```
+
+`--target` defaults to `default-target`. The target must be a tenant credential (a tenant user's
+`kubeconfig` with `tenant`, or with `namespace` and `hostgroup`), not the platform admin
+credential. A viewer credential sees the same screens and cannot change them.
 
 For the generated local platform the result reports the HTTP URL and required Host header. It is
 directly reachable without `kubectl port-forward`, for example:
@@ -403,21 +441,28 @@ current Kubernetes runtime, HTTP members retain their individual Host headers. S
 
 ## Tenant deployment targets
 
-Each external target selects a user's credentials, namespace, registry, and host groups:
+Each external target selects a user's credentials, namespace, registry, and host groups. Two
+users of the `warehouse` tenant each get their own target:
 
 ```toml
+default-target = "alice"
+
 [targets.alice]
 kubeconfig = "${ALICE_KUBECONFIG}"
 context = "alice"
-namespace = "tenant-alice"
-hostgroup = "alice"
+tenant = "warehouse"
 
 [targets.alice.registry]
 push = "https://registry.example.com/alice"
 pull = "registry.example.com/alice"
+
+[targets.bob]
+kubeconfig = "${BOB_KUBECONFIG}"
+tenant = "warehouse"
+registry = "registry.example.com/bob"
 ```
 
-Run `di-framework platform deploy warehouse-take --target alice`. All Kubernetes calls,
+Run `di-framework platform deploy warehouse-take` as alice, or add `--target bob`. All Kubernetes calls,
 including deletion and diagnostics, use that target's kubeconfig, context, and namespace.
 The generated WorkloadDeployment also sets `spec.template.spec.environment` to the target
 namespace, so host selection cannot silently fall back to another environment when the

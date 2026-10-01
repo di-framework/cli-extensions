@@ -470,6 +470,36 @@ describe('runWasmcloudServiceCreate', () => {
   });
 });
 
+describe('service commands without --target', () => {
+  it('use the default tenant target for create, list, get, delete, and classes', async () => {
+    const { root } = makeWorkspace({
+      manifest: `default-target = "dev"
+[targets.dev]
+kubeconfig = "/tmp/dev.kubeconfig"
+tenant = "meshtastic"
+registry = "registry.example.com/meshtastic"
+`,
+    });
+    const invocations: RunnerInvocation[] = [];
+    const deps = serviceDeps({ cwd: root, invocations });
+    const created = await runWasmcloudServiceCreate(
+      ['keyvalue', '--name=stock'],
+      captureIo().io,
+      deps,
+    );
+    expect(created.data).toMatchObject({ target: 'dev', namespace: 'di-tenant-meshtastic' });
+    await runWasmcloudServiceList([], captureIo().io, deps);
+    await runWasmcloudServiceGet(['stock'], captureIo().io, deps);
+    await runWasmcloudServiceDelete(['stock'], captureIo().io, deps);
+    await runWasmcloudServiceClasses([], captureIo().io, deps);
+    const kubectl = invocations.filter((i) => i.command === 'kubectl');
+    expect(kubectl.length).toBeGreaterThanOrEqual(5);
+    for (const invocation of kubectl) {
+      expect(invocation.args).toContain('di-tenant-meshtastic');
+    }
+  });
+});
+
 describe('runWasmcloudServiceList/get/delete/classes', () => {
   it('lists services with readable Ready/type/class/endpoint summary', async () => {
     const { root } = makeWorkspace();
