@@ -1,4 +1,4 @@
-import { Bullseye, Card, CardBody, PageSection, Spinner } from '@patternfly/react-core';
+import { Bullseye, PageSection, Spinner } from '@patternfly/react-core';
 import { observer } from 'mobx-react-lite';
 import type { JSX } from 'react';
 import { ApplicationHeader } from './ApplicationHeader';
@@ -25,18 +25,22 @@ const TAB_VIEWS: Record<ApplicationTab, () => JSX.Element | null> = {
 
 export const ApplicationPage = observer(function ApplicationPage(): JSX.Element {
   const store = useStore();
-  const SelectedTab = TAB_VIEWS[store.ui.selectedTab];
+  const tab = store.ui.selectedTab;
+  const SelectedTab = TAB_VIEWS[tab];
   return (
     <>
       <ApplicationHeader />
-      <PageSection hasBodyWrapper={false} isFilled>
+      <PageSection
+        hasBodyWrapper={false}
+        isFilled
+        className="console-body"
+        id={`console-tab-${tab}`}
+        role="tabpanel"
+        aria-label={tab}
+      >
         <ErrorAlert />
         {store.application ? (
-          <Card>
-            <CardBody>
-              <SelectedTab />
-            </CardBody>
-          </Card>
+          <SelectedTab />
         ) : (
           <Bullseye>
             <Spinner aria-label={`Loading ${store.ui.selectedApplication ?? 'application'}`} />

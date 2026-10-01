@@ -1,16 +1,12 @@
 import {
   ActionGroup,
   Button,
-  Content,
   Form,
   FormGroup,
   FormSelect,
   FormSelectOption,
-  Grid,
-  GridItem,
   Label,
   TextInput,
-  Title,
 } from '@patternfly/react-core';
 import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import { observer } from 'mobx-react-lite';
@@ -32,15 +28,19 @@ export const BindingsTab = observer(function BindingsTab(): JSX.Element {
   }
 
   return (
-    <Grid hasGutter>
-      <GridItem span={12} xl={8}>
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mb-sm">
+    <>
+      <section aria-labelledby="bindings-backing">
+        <h2 id="bindings-backing" className="console-heading">
           Backing services
-        </Title>
+        </h2>
         {app.backingServices.length === 0 ? (
-          <Content component="p">No backing services are bound.</Content>
+          <p className="console-note">No backing services are bound.</p>
         ) : (
-          <Table aria-label="Backing services bound to this application" variant="compact">
+          <Table
+            aria-label="Backing services bound to this application"
+            variant="compact"
+            className="console-table"
+          >
             <Thead>
               <Tr>
                 <Th>Class</Th>
@@ -65,6 +65,7 @@ export const BindingsTab = observer(function BindingsTab(): JSX.Element {
                       variant="secondary"
                       size="sm"
                       isDisabled={!writable}
+                      aria-label={`Unbind ${binding.name}`}
                       onClick={() => void store.unbind(binding.name)}
                     >
                       Unbind
@@ -75,13 +76,53 @@ export const BindingsTab = observer(function BindingsTab(): JSX.Element {
             </Tbody>
           </Table>
         )}
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mt-lg pf-v6-u-mb-sm">
+      </section>
+      <section aria-labelledby="bindings-bind">
+        <h2 id="bindings-bind" className="console-heading">
+          Bind a backing service
+        </h2>
+        {services.length === 0 ? (
+          <p className="console-note">Create a backing service first.</p>
+        ) : null}
+        <Form className="console-form" onSubmit={(event) => void submit(event)}>
+          <FormGroup label="Binding name" isRequired fieldId="binding-name">
+            <TextInput
+              id="binding-name"
+              value={bindingName}
+              onChange={(_event, value) => setBindingName(value)}
+              isDisabled={!writable}
+            />
+          </FormGroup>
+          <FormGroup label="Backing service" isRequired fieldId="binding-service">
+            <FormSelect
+              id="binding-service"
+              value={bindingService}
+              isDisabled={!writable || services.length === 0}
+              onChange={(_event, value) => setChosenService(String(value))}
+            >
+              {services.map((service) => (
+                <FormSelectOption key={service.name} value={service.name} label={service.name} />
+              ))}
+            </FormSelect>
+          </FormGroup>
+          <ActionGroup className="console-form__actions">
+            <Button
+              type="submit"
+              isDisabled={!writable || bindingName.length === 0 || bindingService.length === 0}
+            >
+              Bind
+            </Button>
+          </ActionGroup>
+        </Form>
+      </section>
+      <section aria-labelledby="bindings-private">
+        <h2 id="bindings-private" className="console-heading">
           Private bindings
-        </Title>
+        </h2>
         {app.privateBindings.length === 0 ? (
-          <Content component="p">This application declares no private bindings.</Content>
+          <p className="console-note">This application declares no private bindings.</p>
         ) : (
-          <Table aria-label="Private bindings" variant="compact">
+          <Table aria-label="Private bindings" variant="compact" className="console-table">
             <Thead>
               <Tr>
                 <Th>Name</Th>
@@ -104,45 +145,7 @@ export const BindingsTab = observer(function BindingsTab(): JSX.Element {
             </Tbody>
           </Table>
         )}
-      </GridItem>
-      <GridItem span={12} xl={4}>
-        <Title headingLevel="h3" size="md" className="pf-v6-u-mb-sm">
-          Bind a backing service
-        </Title>
-        {services.length === 0 ? (
-          <Content component="p">Create a backing service first.</Content>
-        ) : null}
-        <Form onSubmit={(event) => void submit(event)}>
-          <FormGroup label="Binding name" isRequired fieldId="binding-name">
-            <TextInput
-              id="binding-name"
-              value={bindingName}
-              onChange={(_event, value) => setBindingName(value)}
-              isDisabled={!writable}
-            />
-          </FormGroup>
-          <FormGroup label="Backing service" isRequired fieldId="binding-service">
-            <FormSelect
-              id="binding-service"
-              value={bindingService}
-              isDisabled={!writable || services.length === 0}
-              onChange={(_event, value) => setChosenService(String(value))}
-            >
-              {services.map((service) => (
-                <FormSelectOption key={service.name} value={service.name} label={service.name} />
-              ))}
-            </FormSelect>
-          </FormGroup>
-          <ActionGroup>
-            <Button
-              type="submit"
-              isDisabled={!writable || bindingName.length === 0 || bindingService.length === 0}
-            >
-              Bind
-            </Button>
-          </ActionGroup>
-        </Form>
-      </GridItem>
-    </Grid>
+      </section>
+    </>
   );
 });

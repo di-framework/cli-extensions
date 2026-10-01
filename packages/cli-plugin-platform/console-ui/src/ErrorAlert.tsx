@@ -6,6 +6,6 @@ import { useStore } from './StoreContext';
 export const ErrorAlert = observer(function ErrorAlert(): JSX.Element | null {
   const { ui } = useStore();
   return ui.error ? (
-    <Alert variant="warning" title={ui.error} isInline className="pf-v6-u-mb-md" />
+    <Alert variant="warning" title={ui.error} isInline className="console-alert" />
   ) : null;
 });

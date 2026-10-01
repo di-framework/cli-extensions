@@ -2,7 +2,6 @@ import {
   Alert,
   Bullseye,
   Button,
-  Content,
   Label,
   Masthead,
   MastheadBrand,
@@ -19,7 +18,6 @@ import {
   PageSidebarBody,
   PageToggleButton,
   Spinner,
-  Title,
   Toolbar,
   ToolbarContent,
   ToolbarGroup,
@@ -33,11 +31,13 @@ import { ApplicationPage } from './ApplicationPage';
 import { BackingServicesPage } from './BackingServicesPage';
 import { Dashboard } from './Dashboard';
 import { ErrorAlert } from './ErrorAlert';
+import { PageHeader } from './PageHeader';
 import { useStore } from './StoreContext';
 
 export const Shell = observer(function Shell(): JSX.Element {
   return (
     <Page
+      className="console-page"
       masthead={<ConsoleMasthead />}
       sidebar={<ConsoleSidebar />}
       isManagedSidebar
@@ -66,7 +66,14 @@ const ConsoleMasthead = observer(function ConsoleMasthead(): JSX.Element {
             onClick={() => store.navigate('dashboard')}
           >
             <BrandMark />
-            <span>DI Framework</span>
+            <span className="console-masthead-title">
+              <span className="console-masthead-title__product">DI Framework console</span>
+              {session ? (
+                <span className="console-masthead-title__context">
+                  {session.hostgroup ? `${session.tenant} · ${session.hostgroup}` : session.tenant}
+                </span>
+              ) : null}
+            </span>
           </MastheadLogo>
         </MastheadBrand>
       </MastheadMain>
@@ -74,26 +81,12 @@ const ConsoleMasthead = observer(function ConsoleMasthead(): JSX.Element {
         <Toolbar isFullHeight isStatic>
           <ToolbarContent>
             <ToolbarGroup align={{ default: 'alignEnd' }} gap={{ default: 'gapSm' }}>
-              {session ? (
-                <>
-                  <ToolbarItem>
-                    <Label id="console-tenant" color="blue">
-                      {session.tenant}
-                    </Label>
-                  </ToolbarItem>
-                  {session.hostgroup ? (
-                    <ToolbarItem>
-                      <Label id="console-hostgroup" color="purple">
-                        {session.hostgroup}
-                      </Label>
-                    </ToolbarItem>
-                  ) : null}
-                  {store.writable ? null : (
-                    <ToolbarItem>
-                      <Label color="grey">View only</Label>
-                    </ToolbarItem>
-                  )}
-                </>
+              {session && !store.writable ? (
+                <ToolbarItem>
+                  <Label color="grey" isCompact>
+                    View only
+                  </Label>
+                </ToolbarItem>
               ) : null}
               <ToolbarItem>
                 <Button
@@ -121,6 +114,7 @@ const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
         <Nav aria-label="Console navigation">
           <NavList>
             <NavItem
+              component="button"
               itemId="dashboard"
               isActive={section === 'dashboard'}
               onClick={() => store.navigate('dashboard')}
@@ -128,6 +122,7 @@ const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
               Dashboard
             </NavItem>
             <NavItem
+              component="button"
               itemId="applications"
               isActive={section === 'applications'}
               onClick={() => store.navigate('applications')}
@@ -135,6 +130,7 @@ const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
               Applications
             </NavItem>
             <NavItem
+              component="button"
               itemId="backing-services"
               isActive={section === 'backing-services'}
               onClick={() => store.navigate('backing-services')}
@@ -169,7 +165,11 @@ const SectionContent = observer(function SectionContent(): JSX.Element {
   }
   const page =
     ui.section === 'dashboard'
-      ? { title: 'Dashboard', body: <Dashboard /> }
+      ? {
+          title: 'Dashboard',
+          description: 'Readiness, signals, and recent activity for this tenant.',
+          body: <Dashboard />,
+        }
       : ui.section === 'backing-services'
         ? {
             title: 'Backing services',
@@ -183,11 +183,8 @@ const SectionContent = observer(function SectionContent(): JSX.Element {
           };
   return (
     <>
-      <PageSection hasBodyWrapper={false}>
-        <Title headingLevel="h1">{page.title}</Title>
-        {page.description ? <Content component="p">{page.description}</Content> : null}
-      </PageSection>
-      <PageSection hasBodyWrapper={false} isFilled>
+      <PageHeader title={page.title} description={page.description} />
+      <PageSection hasBodyWrapper={false} isFilled className="console-body">
         <ErrorAlert />
         {page.body}
       </PageSection>

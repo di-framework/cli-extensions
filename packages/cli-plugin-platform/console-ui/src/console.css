@@ -1,7 +1,63 @@
 /*
- * PatternFly 6 only defines its dark palette under a root-level theme class, so the
- * masthead and sidebar re-map the semantic tokens they read onto the base color ramps.
+ * The console's one stylesheet. Spacing, type, and color are named here once, on top of the
+ * PatternFly tokens, and every screen reads these names instead of inheriting component defaults.
  */
+:root {
+  --console-space-2xs: var(--pf-t--global--spacer--xs);
+  --console-space-xs: var(--pf-t--global--spacer--sm);
+  --console-space-sm: var(--pf-t--global--spacer--md);
+  --console-space-md: var(--pf-t--global--spacer--lg);
+  --console-space-lg: var(--pf-t--global--spacer--xl);
+  --console-gutter: var(--pf-t--global--spacer--lg);
+
+  --console-font-body: var(--pf-t--global--font--size--body--default);
+  --console-font-small: var(--pf-t--global--font--size--body--sm);
+  --console-font-title: var(--pf-t--global--font--size--heading--h2);
+  --console-font-heading: var(--pf-t--global--font--size--heading--h4);
+  --console-weight-heading: var(--pf-t--global--font--weight--heading--default);
+
+  --console-surface: var(--pf-t--global--background--color--primary--default);
+  --console-text: var(--pf-t--global--text--color--regular);
+  --console-text-subtle: var(--pf-t--global--text--color--subtle);
+  --console-rule: var(--pf-t--global--border--color--default);
+  --console-accent: var(--pf-t--global--color--brand--default);
+  --console-chart: var(--pf-t--global--color--brand--default);
+
+  --console-chrome: var(--pf-t--color--gray--90);
+  --console-chrome-nav: var(--pf-t--color--gray--95);
+}
+
+/* ---- Page: the console fills the viewport and the content is one working surface. ---- */
+
+.console-page.pf-v6-c-page {
+  --pf-v6-c-page--BackgroundColor: var(--console-surface);
+  height: 100dvh;
+}
+
+.console-page .pf-v6-c-page__main-container {
+  --pf-v6-c-page__main-container--MarginBlockStart: 0px;
+  --pf-v6-c-page__main-container--MarginInlineStart: 0px;
+  --pf-v6-c-page__main-container--MarginInlineEnd: 0px;
+  --pf-v6-c-page__main-container--BorderRadius: 0;
+  --pf-v6-c-page__main-container--BoxShadow: none;
+  --pf-v6-c-page__main-container--BorderBlockStartWidth: 0px;
+  --pf-v6-c-page__main-container--BorderBlockEndWidth: 0px;
+  --pf-v6-c-page__main-container--BorderInlineStartWidth: 0px;
+  --pf-v6-c-page__main-container--BorderInlineEndWidth: 0px;
+  --pf-v6-c-page__main-container--BackgroundColor: var(--console-surface);
+}
+
+.console-page .pf-v6-c-page__main-section {
+  --pf-v6-c-page__main-section--BackgroundColor: var(--console-surface);
+  --pf-v6-c-page__main-section--PaddingBlockStart: var(--console-space-md);
+  --pf-v6-c-page__main-section--PaddingBlockEnd: var(--console-space-md);
+  --pf-v6-c-page__main-section--PaddingInlineStart: var(--console-gutter);
+  --pf-v6-c-page__main-section--PaddingInlineEnd: var(--console-gutter);
+}
+
+/* ---- Chrome: dark masthead and sidebar. PF 6 only defines its dark palette on a root class, ---- */
+/* ---- so the chrome re-maps the semantic tokens it reads onto the base color ramps.          ---- */
+
 .console-dark {
   color-scheme: dark;
   --pf-t--global--text--color--regular: var(--pf-t--color--white);
@@ -10,9 +66,9 @@
   --pf-t--global--text--color--link--hover: var(--pf-t--color--blue--10);
   --pf-t--global--icon--color--regular: var(--pf-t--color--gray--10);
   --pf-t--global--icon--color--subtle: var(--pf-t--color--gray--40);
-  --pf-t--global--background--color--primary--default: var(--pf-t--color--gray--90);
-  --pf-t--global--background--color--secondary--default: var(--pf-t--color--gray--95);
-  --pf-t--global--background--color--floating--secondary--default: var(--pf-t--color--gray--95);
+  --pf-t--global--background--color--primary--default: var(--console-chrome);
+  --pf-t--global--background--color--secondary--default: var(--console-chrome-nav);
+  --pf-t--global--background--color--floating--secondary--default: var(--console-chrome-nav);
   --pf-t--global--background--color--action--plain--hover: rgb(199 199 199 / 15%);
   --pf-t--global--background--color--action--plain--clicked: rgb(199 199 199 / 15%);
   --pf-t--global--background--color--action--plain--alt--hover: var(--pf-t--color--gray--80);
@@ -25,45 +81,248 @@
 }
 
 .console-dark.pf-v6-c-masthead {
-  --pf-v6-c-masthead--BackgroundColor: var(--pf-t--color--gray--90);
+  --pf-v6-c-masthead--BackgroundColor: var(--console-chrome);
 }
 
 .console-dark.pf-v6-c-page__sidebar {
-  --pf-v6-c-page__sidebar--BackgroundColor: var(--pf-t--color--gray--95);
-  --pf-v6-c-page__sidebar--xl--BackgroundColor: var(--pf-t--color--gray--95);
+  --pf-v6-c-page__sidebar--BackgroundColor: var(--console-chrome-nav);
+  --pf-v6-c-page__sidebar--xl--BackgroundColor: var(--console-chrome-nav);
 }
 
 .console-masthead-brand {
   display: inline-flex;
   align-items: center;
-  gap: var(--pf-t--global--spacer--sm);
+  gap: var(--console-space-xs);
   padding: 0;
   border: 0;
   background: none;
   cursor: pointer;
   color: var(--pf-t--global--text--color--regular);
-  font-size: var(--pf-t--global--font--size--heading--sm);
-  font-weight: var(--pf-t--global--font--weight--heading);
-  letter-spacing: 0.04em;
   text-decoration: none;
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
 .console-masthead-brand svg {
   width: 28px;
   height: 28px;
+  flex: none;
 }
+
+.console-masthead-title {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.2;
+}
+
+.console-masthead-title__product {
+  font-size: var(--console-font-heading);
+  font-weight: var(--console-weight-heading);
+}
+
+.console-masthead-title__context {
+  color: var(--pf-t--global--text--color--subtle);
+  font-size: var(--console-font-small);
+}
+
+/* ---- Page header: title, status, description, tabs, and the tab's actions in one block. ---- */
+
+.console-page .console-header.pf-v6-c-page__main-section {
+  --pf-v6-c-page__main-section--PaddingBlockEnd: 0;
+  border-block-end: 1px solid var(--console-rule);
+}
+
+.console-page .console-header--plain.pf-v6-c-page__main-section {
+  --pf-v6-c-page__main-section--PaddingBlockEnd: var(--console-space-md);
+}
+
+.console-header__crumbs {
+  margin-block-end: var(--console-space-xs);
+}
+
+.console-header__title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--console-space-sm);
+}
+
+.console-header__title h1 {
+  font-size: var(--console-font-title);
+  font-weight: var(--console-weight-heading);
+  margin: 0;
+}
+
+.console-header__description {
+  margin: var(--console-space-2xs) 0 0;
+  color: var(--console-text-subtle);
+}
+
+.console-header__bar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--console-space-sm);
+  margin-block-start: var(--console-space-sm);
+}
+
+.console-page .console-header__bar .pf-v6-c-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  --pf-v6-c-tabs--before--BorderBlockEndWidth: 0;
+}
+
+.console-header__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--console-space-xs);
+  padding-block-end: var(--console-space-xs);
+}
+
+/* ---- Working surface ---- */
+
+.console-body > * + * {
+  margin-block-start: var(--console-space-md);
+}
+
+.console-alert {
+  margin-block-end: var(--console-space-sm);
+}
+
+.console-heading {
+  font-size: var(--console-font-heading);
+  font-weight: var(--console-weight-heading);
+  margin: 0 0 var(--console-space-xs);
+}
+
+.console-note,
+.console-metric {
+  color: var(--console-text-subtle);
+  font-size: var(--console-font-small);
+}
+
+.console-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--console-space-lg);
+  align-items: start;
+}
+
+@media (min-width: 75rem) {
+  .console-split {
+    grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr);
+  }
+}
+
+/* A panel groups one real block of content, such as a create form beside its list. */
+.console-panel {
+  border: 1px solid var(--console-rule);
+  border-radius: var(--pf-t--global--border--radius--small);
+  padding: var(--console-space-sm);
+}
+
+/* Empty states sit at the top of the surface, under the header, at reading width. */
+.console-page .console-empty.pf-v6-c-empty-state {
+  --pf-v6-c-empty-state--PaddingBlockStart: var(--console-space-sm);
+  --pf-v6-c-empty-state--PaddingBlockEnd: var(--console-space-sm);
+  --pf-v6-c-empty-state--PaddingInlineStart: 0;
+  --pf-v6-c-empty-state--PaddingInlineEnd: 0;
+  justify-content: flex-start;
+  text-align: start;
+}
+
+.console-page .console-empty .pf-v6-c-empty-state__content {
+  margin-inline: 0;
+  max-width: 40rem;
+}
+
+.console-page .console-empty .pf-v6-c-empty-state__header,
+.console-page .console-empty .pf-v6-c-empty-state__title {
+  align-items: flex-start;
+  text-align: start;
+}
+
+/* ---- Tables ---- */
+
+.console-page .console-table.pf-v6-c-table {
+  --pf-v6-c-table--cell--PaddingInlineStart: var(--console-space-xs);
+  --pf-v6-c-table--cell--PaddingInlineEnd: var(--console-space-xs);
+}
+
+.console-page .console-table .pf-v6-c-table__th {
+  color: var(--console-text-subtle);
+  font-size: var(--console-font-small);
+}
+
+.console-page .console-table :is(.pf-v6-c-table__th, .pf-v6-c-table__td):first-child {
+  padding-inline-start: 0;
+}
+
+.console-table + .console-note {
+  margin-block-start: var(--console-space-xs);
+}
+
+.console-table .console-metric {
+  margin-block-start: var(--console-space-2xs);
+}
+
+/* ---- Forms: every field labeled, laid out on a grid. ---- */
+
+.console-page .console-form.pf-v6-c-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: var(--console-space-sm);
+  align-items: end;
+}
+
+.console-page .console-form--stacked.pf-v6-c-form {
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+}
+
+.console-form .console-form__wide {
+  grid-column: 1 / -1;
+}
+
+.console-page .console-form .pf-v6-c-form__group {
+  margin: 0;
+}
+
+.console-form .console-form__actions {
+  display: flex;
+  gap: var(--console-space-xs);
+}
+
+/* ---- Logs ---- */
+
+.console-logs {
+  max-height: calc(100dvh - 18rem);
+  overflow: auto;
+}
+
+/* ---- Dashboard ---- */
 
 .console-status-item {
   min-width: 10rem;
 }
 
 .console-status-item__detail {
-  color: var(--pf-t--global--text--color--subtle);
-  font-size: var(--pf-t--global--font--size--body--sm);
-  padding-inline-start: calc(1em + var(--pf-t--global--spacer--sm));
+  color: var(--console-text-subtle);
+  font-size: var(--console-font-small);
+  padding-inline-start: calc(1em + var(--console-space-xs));
 }
+
+.console-activity {
+  max-height: 32rem;
+  overflow-y: auto;
+}
+
+.console-activity__time {
+  color: var(--console-text-subtle);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- Sparkline ---- */
 
 .console-sparkline {
   display: block;
@@ -74,45 +333,24 @@
 }
 
 .console-sparkline__area {
-  fill: var(--pf-t--chart--color--blue--300, #0066cc);
+  fill: var(--console-chart);
   fill-opacity: 0.18;
 }
 
 .console-sparkline__line {
   fill: none;
-  stroke: var(--pf-t--chart--color--blue--300, #0066cc);
+  stroke: var(--console-chart);
   stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
 }
 
 .console-sparkline__marker {
-  fill: var(--pf-t--chart--color--blue--300, #0066cc);
-  stroke: var(--pf-t--global--background--color--primary--default);
+  fill: var(--console-chart);
+  stroke: var(--console-surface);
   stroke-width: 2;
 }
 
 .console-sparkline__hit {
   fill: transparent;
-}
-
-.console-metric {
-  color: var(--pf-t--global--text--color--subtle);
-  font-size: var(--pf-t--global--font--size--body--sm);
-}
-
-.console-activity {
-  max-height: 32rem;
-  overflow-y: auto;
-}
-
-.console-activity__time {
-  color: var(--pf-t--global--text--color--subtle);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.console-logs {
-  max-height: 32rem;
-  overflow: auto;
 }
