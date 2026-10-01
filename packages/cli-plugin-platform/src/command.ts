@@ -99,7 +99,7 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
         options: [
           '--target <tenant>  Tenant target (default: default-target). Uses that target’s kubeconfig only',
           '--host <address>  Loopback bind address (default: 127.0.0.1)',
-          '--port <port>  Listen port (default: 8787)',
+          '--port <port>  Listen port (default: a free port chosen by the system)',
         ],
         run: ({ args, io }) => runWasmcloudConsole(args, io, deps),
       },

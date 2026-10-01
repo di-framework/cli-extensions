@@ -725,22 +725,30 @@ describe('console branches', () => {
     const previousBody = previous ? await Bun.file(indexPath).text() : '';
     writeFileSync(indexPath, '<!doctype html><title>console</title>');
     const captured = captureIo();
-    const port = 18787 + Math.floor(Math.random() * 1000);
+    const live: string[] = [];
     const running = runWasmcloudConsole(
-      ['--port', String(port)],
+      [],
       captured.io,
       fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
+      { write: (chunk: string) => live.push(chunk) },
     );
     const started = Date.now();
-    while (!captured.stdout.join('').includes('Console listening') && Date.now() - started < 5000) {
+    while (!live.join('').includes('Console listening') && Date.now() - started < 5000) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
+    const banner = live.join('');
+    const address = /Console listening on (http:\/\/127\.0\.0\.1:(\d+))\n/.exec(banner);
+    expect(Number(address?.[2])).toBeGreaterThan(0);
+    const page = await fetch(`${address?.[1]}/`);
+    expect(page.status).toBe(200);
+    await page.text();
     process.emit('SIGINT');
     const stopped = await running;
-    expect(stopped.text).toContain('Console stopped');
-    expect(captured.stdout.join('')).toContain('tenant development');
-    expect(captured.stdout.join('')).toContain('tenant-development');
-    expect(captured.stdout.join('')).not.toContain('namespace');
+    expect(stopped.text).toContain(`Console stopped (${address?.[1]})`);
+    expect(captured.stdout.join('')).toBe('');
+    expect(banner).toContain('tenant development');
+    expect(banner).toContain('tenant-development');
+    expect(banner).not.toContain('namespace');
 
     const hidden = `${indexPath}.aside`;
     renameSync(indexPath, hidden);

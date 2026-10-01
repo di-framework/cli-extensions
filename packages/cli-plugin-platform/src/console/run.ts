@@ -1,7 +1,12 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { type CliIo, CommandFailure, type CommandResult } from '@di-framework/cli-extension';
+import {
+  type CliIo,
+  type CliStream,
+  CommandFailure,
+  type CommandResult,
+} from '@di-framework/cli-extension';
 import { DEFAULT_DEPS, type WasmcloudDeps } from '../deps';
 import { type DeployManifest, type ExternalTarget, loadDeployManifest } from '../manifest';
 import { invalidUsage, readOptionValue } from '../support';
@@ -46,9 +51,10 @@ export function parseConsoleArgs(args: readonly string[]): ConsoleOptions {
   if (!LOOPBACK.has(resolvedHost)) {
     invalidUsage('The console binds to loopback only.', '--host', { command: 'platform console' });
   }
-  const resolvedPort = port === undefined ? 8787 : Number(port);
-  if (!Number.isInteger(resolvedPort) || resolvedPort < 1 || resolvedPort > 65535) {
-    invalidUsage('Console port must be an integer from 1 through 65535.', '--port', {
+  // Port 0 lets the operating system pick a free port; the listening line reports it.
+  const resolvedPort = port === undefined ? 0 : Number(port);
+  if (!Number.isInteger(resolvedPort) || resolvedPort < 0 || resolvedPort > 65535) {
+    invalidUsage('Console port must be an integer from 0 through 65535.', '--port', {
       command: 'platform console',
     });
   }
@@ -78,10 +84,16 @@ export function consoleAssetsDirectory(): string {
   return fileURLToPath(new URL('../../dist/console-ui', import.meta.url));
 }
 
+/**
+ * The host CLI buffers `io.stdout` until a command returns, and the console runs until it is
+ * stopped. The address goes to `live` (the process stdout) so it is readable while the console runs,
+ * including when stdout is a file.
+ */
 export async function runWasmcloudConsole(
   args: readonly string[],
   io: CliIo,
   deps: WasmcloudDeps = DEFAULT_DEPS,
+  live: CliStream = process.stdout,
 ): Promise<CommandResult> {
   const options = parseConsoleArgs(args);
   const assetsDirectory = consoleAssetsDirectory();
@@ -105,11 +117,13 @@ export async function runWasmcloudConsole(
     assetsDirectory,
     io,
   });
-  io.stdout.write(`Console listening on ${server.url}\n`);
-  io.stdout.write(`Scoped to tenant ${identity.tenant}`);
-  if (identity.hostgroup !== undefined) io.stdout.write(` on host group ${identity.hostgroup}`);
-  io.stdout.write('.\n');
-  io.stdout.write('The tenant credential stays in this process.\n');
+  const scope =
+    identity.hostgroup === undefined
+      ? identity.tenant
+      : `${identity.tenant} on host group ${identity.hostgroup}`;
+  live.write(
+    `Console listening on ${server.url}\nScoped to tenant ${scope}.\nThe tenant credential stays in this process.\n`,
+  );
   await new Promise<void>((resolve) => {
     const stop = () => {
       void server.close().finally(resolve);
