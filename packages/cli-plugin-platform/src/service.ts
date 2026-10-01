@@ -14,13 +14,21 @@ export const BACKING_SERVICE_KIND = 'BackingService';
 export const BACKING_SERVICE_RESOURCE = 'backingservices.platform.di-framework.dev';
 export const BACKING_SERVICE_CLASS_RESOURCE = 'backingserviceclasses.platform.di-framework.dev';
 
-export const SERVICE_TYPES = ['keyvalue', 'messaging', 'postgres'] as const;
+export const SERVICE_TYPES = ['keyvalue', 'messaging', 'blobstore', 'postgres'] as const;
 export type ServiceType = (typeof SERVICE_TYPES)[number];
 
 export const DEFAULT_SERVICE_CLASSES = {
   keyvalue: 'keyvalue-redis',
   messaging: 'messaging-nats',
+  blobstore: 'blobstore-nats',
   postgres: 'postgres-dedicated',
+} as const satisfies Record<ServiceType, string>;
+
+export const DEFAULT_SERVICE_PROVIDERS = {
+  keyvalue: 'redis',
+  messaging: 'nats',
+  blobstore: 'nats',
+  postgres: 'postgres',
 } as const satisfies Record<ServiceType, string>;
 
 export const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
@@ -112,6 +120,7 @@ export function serviceTypeDiscoveryText(): string {
     'Supported resource types:',
     '  keyvalue    default class keyvalue-redis',
     '  messaging   default class messaging-nats',
+    '  blobstore   default class blobstore-nats',
     '  postgres    default class postgres-dedicated',
     '',
     'Usage: di-framework platform service create <type> --name=<name> [--class=<class>]',
@@ -923,7 +932,7 @@ export async function runWasmcloudServiceClasses(
       : SERVICE_TYPES.map((type) => ({
           name: DEFAULT_SERVICE_CLASSES[type],
           type,
-          provider: type === 'postgres' ? 'postgres' : type === 'keyvalue' ? 'redis' : 'nats',
+          provider: DEFAULT_SERVICE_PROVIDERS[type],
           default: true,
         }));
 

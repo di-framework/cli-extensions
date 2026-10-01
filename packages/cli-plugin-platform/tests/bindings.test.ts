@@ -54,6 +54,31 @@ export class Cache extends KeyValue {}
     expect(records[2]?.requirement.instanceName).toBe('cache');
   });
 
+  it('selects a created blobstore through configFrom without a secret', () => {
+    const root = makeProject();
+    const path = writeBindings(
+      root,
+      `import { Blobstore, WasmCloudBinding } from '@di-framework/bindings';
+
+@WasmCloudBinding('objects', { configFrom: 'di-binding-objects' })
+export class MeshObjects extends Blobstore {}
+`,
+    );
+    const [record] = parseBindingsFile(path, CATALOG, 'mesh');
+    expect(record).toMatchObject({
+      className: 'MeshObjects',
+      kind: 'Blobstore',
+      configFrom: 'di-binding-objects',
+      requirement: {
+        package: 'wasmcloud:blobstore',
+        version: '0.1.0',
+        interfaces: ['blobstore', 'container', 'types'],
+      },
+    });
+    expect(record?.secretFrom).toBeUndefined();
+    expect(record?.serviceName).toBeUndefined();
+  });
+
   it('rejects plaintext secret values in decorator config', () => {
     const root = makeProject();
     expectFailure(

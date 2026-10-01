@@ -74,6 +74,30 @@ describe('provider discovery', () => {
     },
   );
 
+  it('selects a created blobstore with configFrom on an unnamed host interface', () => {
+    const [entry] = hostInterfacesFromRequirements(
+      [
+        {
+          package: 'wasmcloud:blobstore',
+          version: '0.1.0',
+          interfaces: ['blobstore', 'container', 'types'],
+          direction: 'import',
+          instanceName: 'objects',
+          source: 'MeshObjects',
+        },
+      ],
+      {},
+      [{ name: 'objects', className: 'MeshObjects', configFrom: 'di-binding-objects' }],
+    );
+    expect(entry).toEqual({
+      namespace: 'wasmcloud',
+      package: 'blobstore',
+      version: '0.1.0',
+      interfaces: ['blobstore', 'container', 'types'],
+      configFrom: [{ name: 'di-binding-objects' }],
+    });
+  });
+
   it('keeps key-value types in WIT but excludes them from host discovery', () => {
     const requirement: WitRequirement = {
       package: 'wasmcloud:keyvalue',

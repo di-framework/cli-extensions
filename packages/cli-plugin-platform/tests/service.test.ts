@@ -167,7 +167,8 @@ describe('service argument parsing', () => {
     expect(isBackingServiceName('stock')).toBe(true);
     expect(isBackingServiceName('Stock')).toBe(false);
     expect(isBackingServiceName('a'.repeat(41))).toBe(false);
-    expect(SERVICE_TYPES).toEqual(['keyvalue', 'messaging', 'postgres']);
+    expect(SERVICE_TYPES).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres']);
+    expect(DEFAULT_SERVICE_CLASSES.blobstore).toBe('blobstore-nats');
     expect(DEFAULT_SERVICE_CLASSES.keyvalue).toBe('keyvalue-redis');
   });
 });
@@ -280,6 +281,33 @@ describe('runWasmcloudServiceCreate', () => {
       kind: BACKING_SERVICE_KIND,
       metadata: { name: 'events' },
       spec: { type: 'messaging', className: 'messaging-nats' },
+    });
+  });
+
+  it('creates a blobstore with the blobstore-nats default class', async () => {
+    const { root } = makeWorkspace();
+    const invocations: RunnerInvocation[] = [];
+    let capturedManifest = '';
+    const deps = serviceDeps({ cwd: root, invocations });
+    const original = deps.runCaptured;
+    deps.runCaptured = async (command, args, options) => {
+      if (command === 'kubectl' && args.includes('create')) {
+        const path = args[args.indexOf('-f') + 1];
+        if (path) capturedManifest = readFileSync(path, 'utf8');
+      }
+      return original(command, args, options);
+    };
+    const result = await runWasmcloudServiceCreate(
+      ['blobstore', '--name=catalog', '--target=development'],
+      captureIo().io,
+      deps,
+    );
+    expect(result.data).toMatchObject({ type: 'blobstore', className: 'blobstore-nats' });
+    expect(JSON.parse(capturedManifest)).toEqual({
+      apiVersion: BACKING_SERVICE_API_VERSION,
+      kind: BACKING_SERVICE_KIND,
+      metadata: { name: 'catalog' },
+      spec: { type: 'blobstore' },
     });
   });
 
@@ -548,6 +576,7 @@ describe('runWasmcloudServiceList/get/delete/classes', () => {
     );
     expect(fallback.data).toMatchObject({ fromCluster: false });
     expect(fallback.text).toContain('messaging-nats');
+    expect(fallback.text).toMatch(/blobstore-nats\s+blobstore\s+nats/);
     expect(fallback.text).toContain('platform defaults');
   });
 });
