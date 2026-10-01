@@ -515,6 +515,293 @@ describe('console catalog', () => {
   });
 });
 
+function routeId(host: string, path = '/'): string {
+  return Buffer.from(`${host}\n${path}`).toString('base64url');
+}
+
+function site(extra: WorkloadDocument = {}): WorkloadDocument {
+  return managed('mesh-site', {
+    metadata: { annotations: { 'di-framework.dev/routes-off': '[]' } },
+    spec: {
+      template: {
+        spec: {
+          components: [{ name: 'mesh-site' }],
+          hostInterfaces: [
+            {
+              namespace: 'wasi',
+              package: 'http',
+              version: '0.3.0',
+              interfaces: ['handler'],
+              config: { host: 'mesh-site' },
+            },
+            { namespace: 'wasi', package: 'logging', interfaces: ['logging'] },
+          ],
+        },
+      },
+    },
+    ...extra,
+  });
+}
+
+describe('console route changes', () => {
+  it('removes the wasi:http interface with the last route and restores it', () => {
+    const live = site();
+    const off = planRouteUpdate([live], routeId('mesh-site'), false);
+    expect(off).toEqual({
+      workload: 'mesh-site',
+      ops: [
+        { op: 'remove', path: '/spec/template/spec/hostInterfaces/0' },
+        {
+          op: 'replace',
+          path: '/metadata/annotations/di-framework.dev~1routes-off',
+          value: JSON.stringify([{ host: 'mesh-site', path: '/' }]),
+        },
+        {
+          op: 'add',
+          path: '/metadata/annotations/di-framework.dev~1http-off',
+          value: JSON.stringify({
+            array: '/spec/template/spec/hostInterfaces',
+            entry: {
+              namespace: 'wasi',
+              package: 'http',
+              version: '0.3.0',
+              interfaces: ['handler'],
+            },
+          }),
+        },
+      ],
+    });
+    expect(JSON.stringify(off.ops)).not.toContain('"config":{}');
+
+    const paused = site({
+      metadata: {
+        annotations: {
+          'di-framework.dev/routes-off': JSON.stringify([{ host: 'mesh-site', path: '/' }]),
+          'di-framework.dev/http-off': JSON.stringify({
+            array: '/spec/template/spec/hostInterfaces',
+            entry: {
+              namespace: 'wasi',
+              package: 'http',
+              version: '0.3.0',
+              interfaces: ['handler'],
+            },
+          }),
+        },
+      },
+    });
+    const spec = paused.spec?.template?.spec;
+    if (spec) spec.hostInterfaces = spec.hostInterfaces?.slice(1);
+    expect(summarizeApplications([paused])[0]?.routes).toEqual([
+      { id: routeId('mesh-site'), host: 'mesh-site', path: '/', enabled: false },
+    ]);
+    expect(planRouteUpdate([paused], routeId('mesh-site'), true).ops).toEqual([
+      {
+        op: 'add',
+        path: '/spec/template/spec/hostInterfaces/-',
+        value: {
+          namespace: 'wasi',
+          package: 'http',
+          version: '0.3.0',
+          interfaces: ['handler'],
+          config: { host: 'mesh-site' },
+        },
+      },
+      { op: 'replace', path: '/metadata/annotations/di-framework.dev~1routes-off', value: '[]' },
+      { op: 'remove', path: '/metadata/annotations/di-framework.dev~1http-off' },
+    ]);
+  });
+
+  it('keeps a host on the interface while other routes remain', () => {
+    const aliased = site({
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                config: { host: 'one', 'host-aliases': 'two,three', localRoute: 'two/admin' },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(planRouteUpdate([aliased], routeId('one'), false).ops[0]).toEqual({
+      op: 'replace',
+      path: '/spec/template/spec/hostInterfaces/0/config',
+      value: { host: 'two', 'host-aliases': 'three', localRoute: 'two/admin' },
+    });
+    const single = site({
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                config: { host: 'one', 'host-aliases': 'two' },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(planRouteUpdate([single], routeId('one'), false).ops[0]?.value).toEqual({
+      host: 'two',
+    });
+    const paths = site({
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                config: { host: 'one', localRoute: 'one/admin' },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(() => planRouteUpdate([paths], routeId('one'), false)).toThrow(
+      expect.objectContaining({ status: 409, code: 'ROUTE_REQUIRED' }),
+    );
+    expect(planRouteUpdate([paths], routeId('one', '/admin'), false).ops[0]?.value).toEqual({
+      host: 'one',
+    });
+  });
+
+  it('remembers component and service interfaces with their other settings', () => {
+    const component = managed('worker', {
+      spec: {
+        template: {
+          spec: {
+            components: [
+              {
+                name: 'worker',
+                hostInterfaces: [
+                  {
+                    namespace: 'wasi',
+                    package: 'http',
+                    interfaces: ['handler'],
+                    config: { host: 'worker', timeout: '5s' },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+    const off = planRouteUpdate([component], routeId('worker'), false);
+    expect(off.ops).toEqual([
+      { op: 'remove', path: '/spec/template/spec/components/0/hostInterfaces/0' },
+      {
+        op: 'add',
+        path: '/metadata/annotations',
+        value: {
+          'di-framework.dev/routes-off': JSON.stringify([{ host: 'worker', path: '/' }]),
+          'di-framework.dev/http-off': JSON.stringify({
+            array: '/spec/template/spec/components/0/hostInterfaces',
+            entry: {
+              namespace: 'wasi',
+              package: 'http',
+              interfaces: ['handler'],
+              config: { timeout: '5s' },
+            },
+          }),
+        },
+      },
+    ]);
+    const restored = managed('worker', {
+      metadata: {
+        annotations: {
+          'di-framework.dev/routes-off': JSON.stringify([{ host: 'worker', path: '/' }]),
+          'di-framework.dev/http-off': JSON.stringify({
+            array: '/spec/template/spec/components/0/hostInterfaces',
+            entry: { namespace: 'wasi', package: 'http', config: { timeout: '5s' } },
+          }),
+        },
+      },
+      spec: { template: { spec: { components: [{ name: 'worker' }] } } },
+    });
+    expect(planRouteUpdate([restored], routeId('worker'), true).ops[0]).toEqual({
+      op: 'add',
+      path: '/spec/template/spec/components/0/hostInterfaces',
+      value: [{ namespace: 'wasi', package: 'http', config: { timeout: '5s', host: 'worker' } }],
+    });
+
+    const service = (httpOff: unknown, spec: WorkloadDocument['spec']) =>
+      managed('daemon', {
+        metadata: {
+          annotations: {
+            'di-framework.dev/routes-off': JSON.stringify([{ host: 'daemon', path: '/' }]),
+            'di-framework.dev/http-off':
+              typeof httpOff === 'string' ? httpOff : JSON.stringify(httpOff),
+          },
+        },
+        spec,
+      });
+    const serviceSpec = {
+      template: {
+        spec: {
+          service: { name: 'daemon', hostInterfaces: [{ namespace: 'wasi', package: 'cli' }] },
+        },
+      },
+    };
+    expect(
+      planRouteUpdate(
+        [
+          service(
+            {
+              array: '/spec/template/spec/service/hostInterfaces',
+              entry: { namespace: 'wasi', package: 'http' },
+            },
+            serviceSpec,
+          ),
+        ],
+        routeId('daemon'),
+        true,
+      ).ops[0],
+    ).toEqual({
+      op: 'add',
+      path: '/spec/template/spec/service/hostInterfaces/-',
+      value: { namespace: 'wasi', package: 'http', config: { host: 'daemon' } },
+    });
+    const fallback = {
+      op: 'add' as const,
+      path: '/spec/template/spec/hostInterfaces',
+      value: [
+        {
+          namespace: 'wasi',
+          package: 'http',
+          version: '0.3.0',
+          interfaces: ['handler'],
+          config: { host: 'daemon' },
+        },
+      ],
+    };
+    for (const broken of [
+      '{',
+      '',
+      { array: '/metadata', entry: { namespace: 'wasi', package: 'http' } },
+      { array: '/spec/template/spec/hostInterfaces', entry: null },
+      { array: '/spec/template/spec/hostInterfaces', entry: [] },
+      { array: '/spec/template/spec/hostInterfaces', entry: { namespace: 'wasi', package: 'cli' } },
+      {
+        array: '/spec/template/spec/components/3/hostInterfaces',
+        entry: { namespace: 'wasi', package: 'http' },
+      },
+    ]) {
+      expect(
+        planRouteUpdate([service(broken, serviceSpec)], routeId('daemon'), true).ops[0],
+      ).toEqual(fallback);
+    }
+  });
+});
+
 describe('console command options', () => {
   it('binds loopback and requires a tenant credential', () => {
     expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 0 });
