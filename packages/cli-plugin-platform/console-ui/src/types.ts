@@ -47,9 +47,11 @@ export type ApplicationDetail = ApplicationSummary & {
   secrets: Array<{ name: string }>;
   backingServices: BackingBinding[];
   privateBindings: PrivateBinding[];
-  logs: { unpublished: true } | { lines: string[] };
+  logs: LogsView;
   signals?: SignalView;
 };
+
+export type LogsView = { unpublished: true } | { lines: string[] };
 
 export type SessionView = {
   csrfToken: string;
@@ -76,11 +78,13 @@ export type ApplicationSignals = SignalView & { application: string };
 
 export type ActivityStatus = 'success' | 'info' | 'warning' | 'danger';
 
-export type ActivityEntry = {
-  id: number;
-  at: Date;
-  status: ActivityStatus;
-  text: string;
-};
-
 export type Section = 'dashboard' | 'applications' | 'backing-services';
+
+export type ApplicationTab =
+  | 'overview'
+  | 'routes'
+  | 'environment'
+  | 'secrets'
+  | 'bindings'
+  | 'logs'
+  | 'signals';

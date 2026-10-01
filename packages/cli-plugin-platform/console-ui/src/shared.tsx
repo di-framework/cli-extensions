@@ -1,10 +1,7 @@
 import { Label } from '@patternfly/react-core';
 import type { JSX } from 'react';
-import { ApiError } from './api';
 
-export function messageOf(error: unknown): string {
-  return error instanceof ApiError ? error.message : 'The console request failed.';
-}
+export { messageOf } from './api';
 
 export function ReadyLabel({ ready, compact }: { ready: boolean; compact?: boolean }): JSX.Element {
   return (
