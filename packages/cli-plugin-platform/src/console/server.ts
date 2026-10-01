@@ -27,6 +27,7 @@ import {
   tenantIdentity,
   toSummary,
   type WorkloadDocument,
+  withServiceClasses,
   workloadInTenantScope,
 } from './catalog';
 import {
@@ -434,7 +435,24 @@ async function present(options: HandlerOptions, name: string) {
   const application = requireApplication(loaded.applications, name);
   const logs = await logsFor(options, loaded.connection, name);
   const signals = await options.cluster.readSignals(loaded.connection, name);
-  return withProjections(application, logs, signals);
+  const backingServices =
+    application.backingServices.length === 0
+      ? application.backingServices
+      : withServiceClasses(application.backingServices, await serviceClasses(options));
+  return withProjections({ ...application, backingServices }, logs, signals);
+}
+
+/** Class of each backing service by name; empty when the services cannot be read. */
+async function serviceClasses(options: HandlerOptions): Promise<Map<string, string>> {
+  try {
+    const listed = await options.services.list(options.target);
+    return new Map(listed.map((service) => [service.name, service.className]));
+  } catch (error) {
+    options.log(
+      sanitizePublicText(error instanceof Error ? error.message : 'service query failed'),
+    );
+    return new Map();
+  }
 }
 
 function withProjections(

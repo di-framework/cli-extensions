@@ -940,8 +940,10 @@ registry = "registry.example.com/team"
       },
     };
     const created: ServiceCreateInput[] = [];
+    let servicesFail = false;
     const services: ConsoleServices = {
       async list() {
+        if (servicesFail) throw new Error('service list failed');
         return [
           {
             name: 'orders',
@@ -1046,7 +1048,22 @@ registry = "registry.example.com/team"
         secrets: Array<{ name: string }>;
         logs: { unpublished?: boolean };
         signals?: unknown;
+        backingServices: Array<{ name: string; service: string; className: string }>;
       };
+      expect(application.backingServices).toEqual([
+        expect.objectContaining({
+          name: 'orders-db',
+          service: 'orders',
+          className: 'postgres-dedicated',
+        }),
+      ]);
+      servicesFail = true;
+      const unclassed = await request(server.port, {
+        path: '/api/applications/greeter',
+        headers: { cookie: session },
+      });
+      servicesFail = false;
+      expect(JSON.parse(unclassed.body).application.backingServices[0].className).toBe('');
       expect(application.parts[0]).toMatchObject({ kind: 'component', lifetime: 'on-demand' });
       expect(application.logs).toEqual({ unpublished: true });
       expect(application.signals).toBeUndefined();
