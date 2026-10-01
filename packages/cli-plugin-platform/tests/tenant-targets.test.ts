@@ -190,6 +190,37 @@ describe('tenant deployment targets', () => {
       ).toThrow('Kubernetes namespace');
     }
   });
+
+  it('resolves a relative KUBECONFIG against the invocation directory for every kubectl call', async () => {
+    const { root } = makeWorkspace();
+    writeFileSync(
+      join(root, 'di-framework.deploy.toml'),
+      `[targets.alice]
+kubeconfig = "\${KUBECONFIG}"
+namespace = "di-tenant-alice"
+hostgroup = "tenant-alice"
+registry = "registry.example.com/alice"
+`,
+    );
+    const invocations: RunnerInvocation[] = [];
+    await runWasmcloudDeploy(
+      ['greeter', '--target', 'alice'],
+      captureIo().io,
+      fakeDeps({
+        cwd: root,
+        invocations,
+        env: { KUBECONFIG: 'deploy/.tenant.kubeconfig' },
+      }),
+    );
+    const kubectl = invocations.filter((i) => i.command === 'kubectl');
+    expect(kubectl.length).toBeGreaterThan(0);
+    for (const invocation of kubectl)
+      expect(invocation.args.slice(0, 2)).toEqual([
+        '--kubeconfig',
+        join(root, 'deploy/.tenant.kubeconfig'),
+      ]);
+    expect(kubectl.some((i) => i.cwd !== root)).toBe(true);
+  });
 });
 
 describe('tenant targets selected by default-target', () => {

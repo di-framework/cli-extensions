@@ -23,6 +23,9 @@ export const EGRESS_BINDING_NAME = 'egress';
 /** Marks the BackingService the CLI owns for one WorkloadDeployment. */
 export const EGRESS_WORKLOAD_LABEL = 'di-framework.dev/egress-workload';
 const BINDING_RESOURCE = 'servicebindings.platform.di-framework.dev';
+/** kubectl's wording when the CRD itself is absent, as opposed to a missing object. */
+const MISSING_RESOURCE_TYPE =
+  /the server doesn't have a resource type|could not find the requested resource/i;
 const STATUS_ATTEMPTS = 5;
 const STATUS_INTERVAL_MS = 2_000;
 /** Tag marker for a tenant host image built with a wasi:tls provider. */
@@ -74,11 +77,22 @@ async function assertAdoptable(
     ['get', resource, name, '-o', 'json', '--ignore-not-found'],
     project.projectRoot,
   );
-  if (result.exitCode !== 0)
+  if (result.exitCode !== 0) {
+    const detail = (
+      result.stderr.trim() ||
+      result.stdout.trim() ||
+      `kubectl exited ${result.exitCode}`
+    )
+      .split('\n')
+      .slice(0, 12)
+      .join('\n');
     egressFailure(
-      `Cannot read ${kind} ${name}; install the platform backing-service CRDs and check tenant permissions`,
-      { name, namespace: connection.namespace },
+      MISSING_RESOURCE_TYPE.test(detail)
+        ? `Cannot read ${kind} ${name}: the cluster has no ${kind} resource type; install the platform backing-service CRDs`
+        : `Cannot read ${kind} ${name}: ${detail}`,
+      { name, namespace: connection.namespace, stderr: detail },
     );
+  }
   if (!result.stdout.trim()) return;
   const document = JSON.parse(result.stdout) as OwnedDocument;
   if (!ownedBy(document, label, project.witName))
@@ -193,12 +207,7 @@ export async function removeWorkloadEgress(
     ],
     project.projectRoot,
   );
-  if (
-    result.exitCode !== 0 &&
-    !/the server doesn't have a resource type|could not find the requested resource/i.test(
-      result.stderr,
-    )
-  )
+  if (result.exitCode !== 0 && !MISSING_RESOURCE_TYPE.test(result.stderr))
     egressFailure(`Cannot remove the egress BackingService for ${project.witName}`, {
       name: egressResourceName(project.witName),
     });

@@ -199,10 +199,35 @@ describe('egress grants for tenant workloads', () => {
       applyWorkloadEgress(egressProject(['a.example.com']), TENANT, bindingForeign.deps),
     ).rejects.toThrow('Refusing to adopt ServiceBinding mesh-site-egress');
 
-    const denied = scripted('/tmp', () => ({ exitCode: 1, stderr: 'forbidden' }));
+    const denied = scripted('/tmp', () => ({
+      exitCode: 1,
+      stderr: 'error: stat deploy/x.kubeconfig: no such file or directory\n',
+    }));
+    const failure = applyWorkloadEgress(egressProject(['a.example.com']), TENANT, denied.deps);
+    await expect(failure).rejects.toMatchObject({ code: 'WASMCLOUD_EGRESS_FAILED' });
+    await expect(failure).rejects.toThrow(
+      'Cannot read BackingService mesh-site-egress: error: stat deploy/x.kubeconfig: no such file or directory',
+    );
+    await expect(failure).rejects.not.toThrow('install the platform');
+
+    const silent = scripted('/tmp', () => ({ exitCode: 3 }));
     await expect(
-      applyWorkloadEgress(egressProject(['a.example.com']), TENANT, denied.deps),
-    ).rejects.toMatchObject({ code: 'WASMCLOUD_EGRESS_FAILED' });
+      applyWorkloadEgress(egressProject(['a.example.com']), TENANT, silent.deps),
+    ).rejects.toThrow('Cannot read BackingService mesh-site-egress: kubectl exited 3');
+    const stdoutOnly = scripted('/tmp', () => ({ exitCode: 1, stdout: 'Unauthorized' }));
+    await expect(
+      applyWorkloadEgress(egressProject(['a.example.com']), TENANT, stdoutOnly.deps),
+    ).rejects.toThrow('Cannot read BackingService mesh-site-egress: Unauthorized');
+
+    const noCrd = scripted('/tmp', () => ({
+      exitCode: 1,
+      stderr: `error: the server doesn't have a resource type "backingservices"`,
+    }));
+    await expect(
+      applyWorkloadEgress(egressProject(['a.example.com']), TENANT, noCrd.deps),
+    ).rejects.toThrow(
+      'Cannot read BackingService mesh-site-egress: the cluster has no BackingService resource type; install the platform backing-service CRDs',
+    );
   });
 
   it('removes only the deploy-owned BackingService and tolerates missing CRDs', async () => {
