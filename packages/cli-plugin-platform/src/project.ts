@@ -37,6 +37,11 @@ export type WasmcloudProject = {
    * dedicated hostPath volume (SQLite / migration history).
    */
   persistentStorage?: boolean;
+  /**
+   * False when `"logs": false` opts out of guest logs: no wasi:logging console and a
+   * `di-framework.dev/logs: "false"` WorkloadDeployment annotation. Absent means on.
+   */
+  logs?: false;
 };
 
 export function findUp(startDirectory: string, fileName: string): string | undefined {
@@ -140,6 +145,9 @@ export function loadProject(startDirectory: string): WasmcloudProject {
       configPath,
     );
   }
+  if (config.logs !== undefined && typeof config.logs !== 'boolean') {
+    configInvalid(`${CONFIG_FILE_NAME} "logs" must be a boolean when present`, configPath);
+  }
   const witName = asWitIdentifier(config.name);
   const entryPath = resolveInside(projectRoot, config.entry, 'entry', configPath);
   const outputPath = resolveInside(
@@ -190,6 +198,7 @@ export function loadProject(startDirectory: string): WasmcloudProject {
     ingress,
     ...(cronMode ? { cronMode } : {}),
     ...(persistentStorage ? { persistentStorage: true } : {}),
+    ...(config.logs === false ? { logs: false as const } : {}),
     ...(config.allowedIpNameLookups === undefined
       ? {}
       : { allowedIpNameLookups: config.allowedIpNameLookups as string[] }),

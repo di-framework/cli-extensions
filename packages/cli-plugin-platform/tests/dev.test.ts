@@ -125,6 +125,29 @@ export class Stock extends KeyValue {}
     expect(result.data).toMatchObject({ runner: 'wash' });
   });
 
+  it('leaves wasi:logging out of a wash dev build when logs are off', async () => {
+    const root = makeProject({ name: 'Demo App', entry: 'src/app.ts', logs: false });
+    const output = captureIo();
+    const deps = fakeDeps({
+      cwd: root,
+      invocations: [],
+      washBinaryPath: '/fake/wash',
+      env: { DI_FRAMEWORK_WASMCLOUD_DEV_RUNNER: 'wash' },
+    });
+    const bundles: (boolean | undefined)[] = [];
+    const bundle = deps.bundler;
+    deps.bundler = (options) => {
+      bundles.push(options.guestLogging);
+      return bundle(options);
+    };
+    const result = await runWasmcloudDev([], output.io, deps);
+    expect(result.data).toMatchObject({ runner: 'wash' });
+    // The opt-out wins over the runner: noop console, no logging host interface.
+    expect(bundles).toEqual([false]);
+    const washConfig = readFileSync(join(root, '.di-framework', 'wash-dev.yaml'), 'utf8');
+    expect(washConfig).not.toContain('package: logging');
+  });
+
   it('builds and then serves the component with wasmtime', async () => {
     const root = makeProject();
     const invocations: RunnerInvocation[] = [];

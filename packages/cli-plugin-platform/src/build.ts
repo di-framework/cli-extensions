@@ -372,7 +372,8 @@ export async function buildComponent(
       cronPath: cronJobs.length > 0 ? join(generatedDirectory, 'cron-invoker.js') : undefined,
       queuesPath: queueHandlers.length > 0 ? join(generatedDirectory, 'queues.js') : undefined,
       projectRoot: project.projectRoot,
-      guestLogging: options.guestLogging,
+      // `"logs": false` wins over the caller: the guest keeps the noop console.
+      guestLogging: project.logs === false ? false : options.guestLogging,
     });
   } catch (error) {
     throw new CommandFailure(

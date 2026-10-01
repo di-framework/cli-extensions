@@ -104,11 +104,22 @@ describe('loadProject', () => {
       { name: 'demo', entry: '' },
       { name: 'demo', entry: 'src/app.ts', output: 7 },
       { name: 'demo', entry: 'src/app.ts', bindings: 7 },
+      { name: 'demo', entry: 'src/app.ts', logs: 'false' },
     ]) {
       const root = mkdtempSync(join(tmpdir(), 'wasmcloud-invalid-'));
       writeFileSync(join(root, 'di-framework.config.json'), `${JSON.stringify(config)}\n`);
       expectFailure(() => loadProject(root), 'WASMCLOUD_CONFIG_INVALID', 2);
     }
+  });
+
+  it('keeps logs on by default and records an explicit opt-out', () => {
+    expect(loadProject(makeProject()).logs).toBeUndefined();
+    expect(
+      loadProject(makeProject({ name: 'demo', entry: 'src/app.ts', logs: true })).logs,
+    ).toBeUndefined();
+    expect(loadProject(makeProject({ name: 'demo', entry: 'src/app.ts', logs: false })).logs).toBe(
+      false,
+    );
   });
 
   it('rejects an unreadable entry module', () => {
