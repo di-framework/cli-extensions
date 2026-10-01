@@ -222,6 +222,10 @@ async function routeApi(
     sendJson(response, 200, await listApplications(options));
     return;
   }
+  if (method === 'GET' && url.pathname === '/api/signals') {
+    sendJson(response, 200, await listSignals(options));
+    return;
+  }
   if (method === 'GET' && url.pathname === '/api/backing-services') {
     sendJson(response, 200, {
       services: (await options.services.list(options.target)).map(publicService),
@@ -401,6 +405,27 @@ async function listApplications(options: HandlerOptions): Promise<{
       error instanceof ConsoleError ? error.message : 'The applications could not be read.';
     return { applications: [], error: message };
   }
+}
+
+/** Signals for every application in scope; an application whose projection fails is left out. */
+async function listSignals(
+  options: HandlerOptions,
+): Promise<{ signals: Array<SignalView & { application: string }> }> {
+  const loaded = await loadApplications(options);
+  const read = await Promise.all(
+    loaded.applications.map(async (application) => {
+      try {
+        const signals = await options.cluster.readSignals(loaded.connection, application.name);
+        return signals ? { application: application.name, ...signals } : undefined;
+      } catch (error) {
+        options.log(
+          sanitizePublicText(error instanceof Error ? error.message : 'signal query failed'),
+        );
+        return undefined;
+      }
+    }),
+  );
+  return { signals: read.filter((entry) => entry !== undefined) };
 }
 
 async function present(options: HandlerOptions, name: string) {

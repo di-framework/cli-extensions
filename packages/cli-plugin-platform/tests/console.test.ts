@@ -639,7 +639,8 @@ registry = "registry.example.com/team"
       async readLogs() {
         return logs;
       },
-      async readSignals() {
+      async readSignals(_connection, name) {
+        if (name === 'stored') throw new Error('projection failed');
         return signals;
       },
       async bindService() {
@@ -777,6 +778,21 @@ registry = "registry.example.com/team"
         headers: { cookie: session },
       });
       expect(withSignals.body).toContain('"success":4');
+      const dashboardSignals = await request(server.port, {
+        path: '/api/signals',
+        headers: { cookie: session },
+      });
+      expect(dashboardSignals.status).toBe(200);
+      expect(JSON.parse(dashboardSignals.body)).toEqual({
+        signals: [{ application: 'greeter', success: 4, error: 1, compute: [1, 2] }],
+      });
+      signals = undefined;
+      expect(
+        JSON.parse(
+          (await request(server.port, { path: '/api/signals', headers: { cookie: session } })).body,
+        ),
+      ).toEqual({ signals: [] });
+      signals = { success: 4, error: 1, compute: [1, 2] };
 
       const routeId = application.routes[0]?.id ?? '';
       const toggled = await request(server.port, {

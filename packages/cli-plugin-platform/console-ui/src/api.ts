@@ -1,5 +1,6 @@
 import type {
   ApplicationDetail,
+  ApplicationSignals,
   ApplicationSummary,
   BackingService,
   ServiceClass,
@@ -24,6 +25,10 @@ export function session(): Promise<SessionView> {
 
 export function applications(): Promise<{ applications: ApplicationSummary[]; error?: string }> {
   return send('/api/applications', 'GET');
+}
+
+export function signals(): Promise<{ signals: ApplicationSignals[] }> {
+  return send('/api/signals', 'GET');
 }
 
 export function application(name: string): Promise<{ application: ApplicationDetail }> {

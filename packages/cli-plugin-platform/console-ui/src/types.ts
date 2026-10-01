@@ -71,3 +71,16 @@ export type ServiceClass = {
   type: string;
   default: boolean;
 };
+
+export type ApplicationSignals = SignalView & { application: string };
+
+export type ActivityStatus = 'success' | 'info' | 'warning' | 'danger';
+
+export type ActivityEntry = {
+  id: number;
+  at: Date;
+  status: ActivityStatus;
+  text: string;
+};
+
+export type Section = 'dashboard' | 'applications' | 'backing-services';

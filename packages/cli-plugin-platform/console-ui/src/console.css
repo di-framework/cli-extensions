@@ -1,0 +1,118 @@
+/*
+ * PatternFly 6 only defines its dark palette under a root-level theme class, so the
+ * masthead and sidebar re-map the semantic tokens they read onto the base color ramps.
+ */
+.console-dark {
+  color-scheme: dark;
+  --pf-t--global--text--color--regular: var(--pf-t--color--white);
+  --pf-t--global--text--color--subtle: var(--pf-t--color--gray--30);
+  --pf-t--global--text--color--link--default: var(--pf-t--color--blue--20);
+  --pf-t--global--text--color--link--hover: var(--pf-t--color--blue--10);
+  --pf-t--global--icon--color--regular: var(--pf-t--color--gray--10);
+  --pf-t--global--icon--color--subtle: var(--pf-t--color--gray--40);
+  --pf-t--global--background--color--primary--default: var(--pf-t--color--gray--90);
+  --pf-t--global--background--color--secondary--default: var(--pf-t--color--gray--95);
+  --pf-t--global--background--color--floating--secondary--default: var(--pf-t--color--gray--95);
+  --pf-t--global--background--color--action--plain--hover: rgb(199 199 199 / 15%);
+  --pf-t--global--background--color--action--plain--clicked: rgb(199 199 199 / 15%);
+  --pf-t--global--background--color--action--plain--alt--hover: var(--pf-t--color--gray--80);
+  --pf-t--global--background--color--action--plain--alt--clicked: var(--pf-t--color--gray--80);
+  --pf-t--global--border--color--default: var(--pf-t--color--gray--60);
+  --pf-t--global--border--color--subtle: var(--pf-t--color--gray--60);
+  --pf-t--global--color--brand--default: var(--pf-t--color--blue--30);
+  --pf-t--global--color--brand--hover: var(--pf-t--color--blue--20);
+  color: var(--pf-t--global--text--color--regular);
+}
+
+.console-dark.pf-v6-c-masthead {
+  --pf-v6-c-masthead--BackgroundColor: var(--pf-t--color--gray--90);
+}
+
+.console-dark.pf-v6-c-page__sidebar {
+  --pf-v6-c-page__sidebar--BackgroundColor: var(--pf-t--color--gray--95);
+  --pf-v6-c-page__sidebar--xl--BackgroundColor: var(--pf-t--color--gray--95);
+}
+
+.console-masthead-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-t--global--spacer--sm);
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: var(--pf-t--global--text--color--regular);
+  font-size: var(--pf-t--global--font--size--heading--sm);
+  font-weight: var(--pf-t--global--font--weight--heading);
+  letter-spacing: 0.04em;
+  text-decoration: none;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.console-masthead-brand svg {
+  width: 28px;
+  height: 28px;
+}
+
+.console-status-item {
+  min-width: 10rem;
+}
+
+.console-status-item__detail {
+  color: var(--pf-t--global--text--color--subtle);
+  font-size: var(--pf-t--global--font--size--body--sm);
+  padding-inline-start: calc(1em + var(--pf-t--global--spacer--sm));
+}
+
+.console-sparkline {
+  display: block;
+  width: 100%;
+  max-width: 16rem;
+  height: 3rem;
+  overflow: visible;
+}
+
+.console-sparkline__area {
+  fill: var(--pf-t--chart--color--blue--300, #0066cc);
+  fill-opacity: 0.18;
+}
+
+.console-sparkline__line {
+  fill: none;
+  stroke: var(--pf-t--chart--color--blue--300, #0066cc);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.console-sparkline__marker {
+  fill: var(--pf-t--chart--color--blue--300, #0066cc);
+  stroke: var(--pf-t--global--background--color--primary--default);
+  stroke-width: 2;
+}
+
+.console-sparkline__hit {
+  fill: transparent;
+}
+
+.console-metric {
+  color: var(--pf-t--global--text--color--subtle);
+  font-size: var(--pf-t--global--font--size--body--sm);
+}
+
+.console-activity {
+  max-height: 32rem;
+  overflow-y: auto;
+}
+
+.console-activity__time {
+  color: var(--pf-t--global--text--color--subtle);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.console-logs {
+  max-height: 32rem;
+  overflow: auto;
+}
