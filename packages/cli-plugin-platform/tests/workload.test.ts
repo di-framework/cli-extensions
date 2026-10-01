@@ -6,6 +6,8 @@ import { loadProject } from '../src/project';
 import {
   applyWorkload,
   renderWorkloadManifest,
+  storageDirectoryName,
+  storageOwnershipConflict,
   WORKLOAD_DEPLOYMENT_RESOURCE,
   WORKLOAD_REPLICA_SET_RESOURCE,
   waitForReady,
@@ -367,6 +369,63 @@ export class Worker {
         }),
       ),
     ).rejects.toMatchObject({ code: 'WASMCLOUD_STORAGE_OWNERSHIP_CONFLICT', exitCode: 2 });
+  });
+
+  it('shares one storage directory across a persistent workload', () => {
+    const { greeter } = makeWorkspace();
+    const project = {
+      ...loadProject(greeter),
+      workload: 'mesh',
+      persistentStorage: true,
+    };
+    expect(storageDirectoryName(project)).toBe('mesh');
+    expect(storageDirectoryName({ ...project, persistentStorage: false })).toBe('greeter');
+    expect(storageDirectoryName({ applicationName: 'Queue App' })).toBe('Queue App');
+    const yaml = renderWorkloadManifest(
+      project,
+      {
+        target: 'development',
+        kubeconfig: '/tmp/kube',
+        namespace: 'wasmcloud',
+        registry: REGISTRY,
+      },
+      'registry.example.com/team/greeter:shared',
+      undefined,
+      [],
+      { hasPersistentStorage: true },
+    );
+    expect(yaml).toContain('path: "/var/lib/di-framework/storage/mesh"');
+    const claim = {
+      metadata: { name: 'mesh-collector', labels: { 'di-framework.dev/workload': 'mesh' } },
+      spec: {
+        template: {
+          spec: { volumes: [{ hostPath: { path: '/var/lib/di-framework/storage/mesh' } }] },
+        },
+      },
+    };
+    expect(storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [claim])).toBe(
+      undefined,
+    );
+    expect(
+      storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [
+        { metadata: { name: 'other' }, spec: claim.spec },
+      ]),
+    ).toEqual({ owner: 'other' });
+    expect(
+      storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [
+        { metadata: { name: 'empty' } },
+      ]),
+    ).toBe(undefined);
+    expect(
+      storageOwnershipConflict(project, '/var/lib/di-framework/storage/mesh', [
+        { spec: claim.spec },
+      ]),
+    ).toEqual({ owner: 'unknown' });
+    expect(
+      storageOwnershipConflict({ applicationName: 'lone' }, '/var/lib/di-framework/storage/mesh', [
+        claim,
+      ]),
+    ).toEqual({ owner: 'mesh-collector' });
   });
 
   it('creates localResources for control secrets and allowed IP lookups when no env is configured', () => {

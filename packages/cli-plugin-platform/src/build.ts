@@ -347,7 +347,7 @@ export async function buildComponent(
         `import { ${entry.exportName} as invoke } from ${JSON.stringify(project.entryPath)};`,
         `export * from ${JSON.stringify(project.entryPath)};`,
         `export default function fetch(request) {`,
-        ...(entry.path
+        ...(entry.path && entry.path !== '/'
           ? [
               `  if (new URL(request.url).pathname !== ${JSON.stringify(entry.path)}) return new Response(null, { status: 404 });`,
             ]
