@@ -389,6 +389,7 @@ export default {
       files: { '/app.config.json': '{"port":8080}' },
       env: { APP_PORT: '3000' },
       cwd: '/',
+      guestLogging: false,
     });
     const bundled = await import(pathToFileURL(outFile).href);
     expect(bundled.handler.cwd).toBe('/');

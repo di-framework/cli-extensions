@@ -8,7 +8,7 @@ import { requiresWasmCloudHost, resolveDevRunner } from './dev-runner';
 import { loadProject } from './project';
 import { invalidUsage, readOptionValue, toolFailed } from './support';
 import { writeWashDevConfig } from './wash-dev';
-import type { WitLock } from './wit';
+import { guestLoggingRequirement, type WitLock } from './wit';
 
 export type DevOptions = { host: string; port: string };
 
@@ -40,14 +40,17 @@ export async function runWasmcloudDev(
 ): Promise<CommandResult> {
   const options = parseDevArgs(args);
   const project = loadProject(deps.cwd());
-  await buildComponent(project, io, deps);
+  const projectRequirements = requirementsForProject(project, deps);
+  const runner = resolveDevRunner(deps, {
+    wasmCloudHost: requiresWasmCloudHost(projectRequirements),
+  });
+  // Only wash provides wasi:logging locally; other runners keep the noop console.
+  await buildComponent(project, io, deps, { guestLogging: runner.kind === 'wash' });
   const lockPath = join(project.projectRoot, '.di-framework', 'wit.lock.json');
   let tls: boolean;
-  let wasmCloudHost: boolean;
   try {
     const lock = JSON.parse(readFileSync(lockPath, 'utf8')) as WitLock;
     tls = lock.requirements.some((requirement) => requirement.package === 'wasi:tls');
-    wasmCloudHost = requiresWasmCloudHost(lock.requirements);
   } catch (error) {
     throw new CommandFailure(
       'WASMCLOUD_WIT_LOCK_INVALID',
@@ -56,12 +59,11 @@ export async function runWasmcloudDev(
       { path: lockPath, cause: String(error) },
     );
   }
-  const runner = resolveDevRunner(deps, { wasmCloudHost });
   const washConfigPath =
     runner.kind === 'wash'
       ? writeWashDevConfig(
           project,
-          requirementsForProject(project, deps),
+          [...projectRequirements, guestLoggingRequirement()],
           discoverBindings(project, deps),
           {
             host: options.host,

@@ -342,7 +342,7 @@ describe('HTTPS over host TLS', () => {
         entryPath,
         "import tls from 'tls'; import https from 'node:https'; export default () => [tls.connect, https.request];",
       );
-      await DEFAULT_DEPS.bundler({ adapterPath, entryPath, outFile });
+      await DEFAULT_DEPS.bundler({ adapterPath, entryPath, outFile, guestLogging: false });
       const source = await Bun.file(outFile).text();
       const requirements = runtimeRequirementsFromJavaScript(source);
       expect(requirements.find((r) => r.package === 'wasi:tls')?.interfaces).toEqual([

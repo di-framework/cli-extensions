@@ -266,6 +266,7 @@ export async function buildComponent(
   project: WasmcloudProject,
   io: CliIo,
   deps: WasmcloudDeps,
+  options: { guestLogging?: boolean } = {},
 ): Promise<BuildSummary> {
   const generatedDirectory = join(project.projectRoot, '.di-framework');
   const generatedWit = join(generatedDirectory, 'wit');
@@ -371,6 +372,7 @@ export async function buildComponent(
       cronPath: cronJobs.length > 0 ? join(generatedDirectory, 'cron-invoker.js') : undefined,
       queuesPath: queueHandlers.length > 0 ? join(generatedDirectory, 'queues.js') : undefined,
       projectRoot: project.projectRoot,
+      guestLogging: options.guestLogging,
     });
   } catch (error) {
     throw new CommandFailure(

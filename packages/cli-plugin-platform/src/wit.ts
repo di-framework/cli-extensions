@@ -7,6 +7,9 @@ export const COMPONENT_MODEL = '0.3';
 
 export const HTTP_ADAPTER_SOURCE = 'http-adapter';
 export const NODE_COMPAT_SOURCE = 'node-compat';
+export const WASI_LOGGING_PACKAGE = 'wasi:logging';
+export const WASI_LOGGING_VERSION = '0.1.0-draft';
+export const GUEST_CONSOLE_SOURCE = 'guest-console';
 export const WASI_HTTP_PACKAGE = 'wasi:http';
 export const WASI_HTTP_VERSION = '0.3.0';
 export const WASI_HTTP_INTERFACE = 'handler';
@@ -155,6 +158,9 @@ export function runtimeRequirementsFromJavaScript(source: string): WitRequiremen
       source: NODE_COMPAT_SOURCE,
     });
   }
+  if (source.includes(`${WASI_LOGGING_PACKAGE}/logging@${WASI_LOGGING_VERSION}`)) {
+    requirements.push(guestLoggingRequirement());
+  }
   if (source.includes('wasi:cli/environment@0.3.0')) {
     requirements.push({
       package: 'wasi:cli',
@@ -174,6 +180,17 @@ export function runtimeRequirementsFromJavaScript(source: string): WitRequiremen
     });
   }
   return requirements;
+}
+
+/** Guest console lines; the host binds its logging plugin only when this is declared. */
+export function guestLoggingRequirement(): WitRequirement {
+  return {
+    package: WASI_LOGGING_PACKAGE,
+    version: WASI_LOGGING_VERSION,
+    interfaces: ['logging'],
+    direction: 'import',
+    source: GUEST_CONSOLE_SOURCE,
+  };
 }
 
 /** @deprecated Use {@link runtimeRequirementsFromJavaScript}. */

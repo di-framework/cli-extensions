@@ -159,6 +159,15 @@ even when wasmtime is present. Set `DI_FRAMEWORK_WASMCLOUD_DEV_RUNNER` to
 `wasi:config` locally (`-S config-var=key=value` to seed values). wasmCloud-only imports
 such as `wasmcloud:postgres` still need `wash` or a wasmCloud host.
 
+Guest `console.log`, `info`, `debug`, `warn`, and `error` write through
+`wasi:logging/logging@0.1.0-draft`, one `log(level, "console", line)` call per line.
+QuickJS has no console of its own, and wash 2.8 writes raw guest stdio to the host log
+without saying which workload produced it; `wasi:logging` lines carry `workload.name`
+and `workload.namespace`. Builds therefore link that import and every WorkloadDeployment
+declares an unnamed `wasi:logging` host interface (`interfaces: [logging]`). `platform dev`
+links it only for `wash`; wasmtime and jco cannot provide it, so those builds keep a
+console that discards output.
+
 `wash` 2.5.x has no `--address` flag. The extension writes
 `.di-framework/wash-dev.yaml` (`dev.address`, `host_interfaces`,
 `wasm_proposals: [component-model-async]`) and runs `wash dev --user-config` against it.

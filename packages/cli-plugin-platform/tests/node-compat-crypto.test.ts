@@ -482,7 +482,7 @@ export default {
 };
 `,
     );
-    await DEFAULT_DEPS.bundler({ adapterPath, entryPath, outFile });
+    await DEFAULT_DEPS.bundler({ adapterPath, entryPath, outFile, guestLogging: false });
     const source = await Bun.file(outFile).text();
     expect(source).toContain('wasi:random/random@0.3.0');
     expect(source).not.toContain('wasi:sockets/types@0.3.0');

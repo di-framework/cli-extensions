@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseDevArgs, runWasmcloudDev } from '../src/dev';
 import { captureIo, expectFailure, fakeDeps, makeProject, type RunnerInvocation } from './helpers';
@@ -99,20 +99,28 @@ export class Stock extends KeyValue {}
     );
     const invocations: RunnerInvocation[] = [];
     const output = captureIo();
-    const result = await runWasmcloudDev(
-      [],
-      output.io,
-      fakeDeps({
-        cwd: root,
-        invocations,
-        washBinaryPath: '/fake/wash',
-        resolutions: { '@di-framework/bindings/catalog.json': catalogPath },
-      }),
-    );
+    const deps = fakeDeps({
+      cwd: root,
+      invocations,
+      washBinaryPath: '/fake/wash',
+      resolutions: { '@di-framework/bindings/catalog.json': catalogPath },
+    });
+    const bundles: (boolean | undefined)[] = [];
+    const bundle = deps.bundler;
+    deps.bundler = (options) => {
+      bundles.push(options.guestLogging);
+      return bundle(options);
+    };
+    const result = await runWasmcloudDev([], output.io, deps);
     expect(invocations[1]).toMatchObject({
       command: '/fake/wash',
       args: ['dev', '--user-config', join(root, '.di-framework', 'wash-dev.yaml')],
     });
+    // wash dev provides wasi:logging, so the guest console is linked and declared.
+    expect(bundles).toEqual([true]);
+    const washConfig = readFileSync(join(root, '.di-framework', 'wash-dev.yaml'), 'utf8');
+    expect(washConfig).toContain('package: logging');
+    expect(washConfig).toContain('0.1.0-draft');
     expect(output.stdout.join('')).toContain('(wash)');
     expect(result.data).toMatchObject({ runner: 'wash' });
   });
@@ -121,11 +129,16 @@ export class Stock extends KeyValue {}
     const root = makeProject();
     const invocations: RunnerInvocation[] = [];
     const output = captureIo();
-    const result = await runWasmcloudDev(
-      ['--port', '9123'],
-      output.io,
-      fakeDeps({ cwd: root, invocations }),
-    );
+    const deps = fakeDeps({ cwd: root, invocations });
+    const bundles: (boolean | undefined)[] = [];
+    const bundle = deps.bundler;
+    deps.bundler = (options) => {
+      bundles.push(options.guestLogging);
+      return bundle(options);
+    };
+    const result = await runWasmcloudDev(['--port', '9123'], output.io, deps);
+    // wasmtime cannot link wasi:logging; the guest keeps the noop console.
+    expect(bundles).toEqual([false]);
     expect(invocations[1]).toMatchObject({
       command: '/fake/wasmtime',
       args: [
