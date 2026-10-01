@@ -80,6 +80,26 @@ describe('guest node:events', () => {
     expect(shaped[kCapture]).toBe(false);
   });
 
+  it('aliases on/off to addListener/removeListener like Node', () => {
+    expect(EventEmitter.prototype.on).toBe(EventEmitter.prototype.addListener);
+    expect(EventEmitter.prototype.off).toBe(EventEmitter.prototype.removeListener);
+    // readable-stream's Readable: addListener is its own `on`, which calls the base `on`.
+    class Readableish extends EventEmitter {
+      override on(event: string, listener: (...args: unknown[]) => void): this {
+        return EventEmitter.prototype.on.call(this, event, listener) as this;
+      }
+      override addListener = this.on;
+    }
+    const readable = new Readableish();
+    const seen: string[] = [];
+    const listener = (value: unknown) => seen.push(String(value));
+    readable.addListener('data', listener);
+    readable.emit('data', 'chunk');
+    readable.off('data', listener);
+    readable.emit('data', 'ignored');
+    expect(seen).toEqual(['chunk']);
+  });
+
   it('keeps the prototype, statics and module exports', async () => {
     expect(events).toBe(EventEmitter);
     expect(EventEmitter.EventEmitter).toBe(EventEmitter);

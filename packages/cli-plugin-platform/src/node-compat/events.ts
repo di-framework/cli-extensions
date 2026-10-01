@@ -45,9 +45,15 @@ export function init(this: EmitterState, options?: EmitterOptions): void {
   initialize(this, options);
 }
 
+const emitterPrototype = UnenvEventEmitter.prototype;
+// Node aliases these; unenv's `on` calls `this.addListener`, which recurses forever when a
+// subclass points addListener back at its own `on` (readable-stream's Readable does).
+emitterPrototype.on = emitterPrototype.addListener;
+emitterPrototype.off = emitterPrototype.removeListener;
+
 Object.setPrototypeOf(EventEmitterConstructor, UnenvEventEmitter);
-EventEmitterConstructor.prototype = UnenvEventEmitter.prototype;
-Object.defineProperty(UnenvEventEmitter.prototype, 'constructor', {
+EventEmitterConstructor.prototype = emitterPrototype;
+Object.defineProperty(emitterPrototype, 'constructor', {
   value: EventEmitterConstructor,
   writable: true,
   configurable: true,
