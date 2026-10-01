@@ -27,6 +27,29 @@ const REGISTRY = {
 };
 
 describe('workload manifests', () => {
+  it('declares wasi:cli/run for a long-lived workload service', () => {
+    const { greeter } = makeWorkspace();
+    const project = {
+      ...loadProject(greeter),
+      ingress: false,
+      workloadEntry: { kind: 'service' as const, exportName: 'collect', path: '/collect' },
+    };
+    const yaml = renderWorkloadManifest(
+      project,
+      {
+        target: 'development',
+        kubeconfig: '/tmp/kube',
+        namespace: 'wasmcloud',
+        registry: REGISTRY,
+      },
+      'registry.example.com/collector:1',
+      [],
+    );
+    expect(yaml).toContain('package: cli');
+    expect(yaml).toContain('- run');
+    expect(yaml).not.toContain('volumeMounts:');
+  });
+
   it('renders Service and WorkloadDeployment from the project name and image', () => {
     const { greeter } = makeWorkspace();
     const project = loadProject(greeter);

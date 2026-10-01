@@ -241,11 +241,28 @@ spec:
     );
   }
 
+  const interfaceRequirements: readonly WitRequirement[] =
+    !hasHttp &&
+    !isWorker &&
+    project.workloadEntry?.kind === 'service' &&
+    project.workloadEntry.subscriptions === undefined
+      ? [
+          ...requirements,
+          {
+            package: 'wasi:cli',
+            version: '0.3.0',
+            interfaces: ['run'],
+            direction: 'export',
+            source: 'workload-service',
+          },
+        ]
+      : requirements;
   const hostInterfaces = renderHostInterfacesYaml(
     hostInterfacesFromRequirements(
-      hasHttp && !requirements.some((r) => r.package === 'wasi:http' && r.direction === 'export')
+      hasHttp &&
+        !interfaceRequirements.some((r) => r.package === 'wasi:http' && r.direction === 'export')
         ? [
-            ...requirements,
+            ...interfaceRequirements,
             {
               package: 'wasi:http',
               version: '0.3.0',
@@ -254,7 +271,7 @@ spec:
               source: 'control-http',
             },
           ]
-        : requirements,
+        : interfaceRequirements,
       {
         ...(hasHttp ? { httpHost: advertisedHttpHost } : {}),
         subscriptions: project.workloadEntry?.subscriptions,
