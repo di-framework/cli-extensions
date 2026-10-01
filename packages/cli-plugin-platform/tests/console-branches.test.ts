@@ -112,6 +112,16 @@ describe('console branches', () => {
     expect(store.loginAllowed('client', 15 * 60 * 1000 + 3)).toBe(true);
     store.clearFailures('client');
     expect(store.loginAllowed('client', 3)).toBe(true);
+    store.recordFailure('stale', 0);
+    store.recordFailure('fresh', 15 * 60 * 1000 + 4);
+    for (let index = 0; index < 100; index += 1) {
+      for (let failure = 0; failure < 8; failure += 1) {
+        store.recordFailure(`source-${index}`, 10);
+      }
+    }
+    store.recordFailure('overflow', 10);
+    expect(store.loginAllowed('source-0', 10)).toBe(true);
+    expect(store.loginAllowed('source-1', 10)).toBe(false);
 
     expect(readCookie(undefined, 'di_console_session')).toBeUndefined();
     expect(
@@ -194,6 +204,41 @@ describe('console branches', () => {
         { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
       ),
     ).toBe(true);
+    expect(
+      workloadInTenantScope(
+        {
+          metadata: { namespace: 'di-tenant-warehouse' },
+          spec: { template: { spec: { hostSelector: { hostgroup: 'storage' } } } },
+        },
+        { namespace: 'di-tenant-warehouse', hostgroup: 'tenant-warehouse' },
+      ),
+    ).toBe(true);
+    expect(
+      workloadInTenantScope(
+        {
+          metadata: { namespace: 'di-tenant-warehouse' },
+          spec: { template: { spec: { hostSelector: { hostgroup: 'tenant-warehouse-storage' } } } },
+        },
+        {
+          namespace: 'di-tenant-warehouse',
+          hostgroup: 'tenant-warehouse',
+          storageHostgroup: 'tenant-warehouse-storage',
+        },
+      ),
+    ).toBe(true);
+    expect(
+      workloadInTenantScope(
+        {
+          metadata: { namespace: 'di-tenant-warehouse' },
+          spec: { template: { spec: { hostSelector: { hostgroup: 'storage' } } } },
+        },
+        {
+          namespace: 'di-tenant-warehouse',
+          hostgroup: 'tenant-warehouse',
+          storageHostgroup: 'tenant-warehouse-storage',
+        },
+      ),
+    ).toBe(false);
     expect(
       cronInTenantScope({ metadata: { namespace: 'di-tenant-other' } }, 'di-tenant-warehouse'),
     ).toBe(false);

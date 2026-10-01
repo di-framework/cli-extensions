@@ -1,5 +1,6 @@
 import type { DeployManifest, DeployTarget } from '../manifest';
 import { materializeRegistry, registryReferenceHost } from '../registry';
+import { STORAGE_HOSTGROUP } from '../workload';
 import { ConsoleError } from './errors';
 
 const RESOURCE_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
@@ -181,18 +182,17 @@ function targetView(target: DeployTarget, defaultTarget: string | undefined): Ta
   };
 }
 
-/** A tenant credential is one namespace and, when set, one host group. */
+/** A tenant credential is one namespace. Persistent workloads use the storage host group. */
 export function workloadInTenantScope(
   document: WorkloadDocument,
-  scope: { namespace: string; hostgroup?: string },
+  scope: { namespace: string; hostgroup?: string; storageHostgroup?: string },
 ): boolean {
   const namespace = document.metadata?.namespace;
   if (namespace !== undefined && namespace !== scope.namespace) return false;
   const hostgroup = document.spec?.template?.spec?.hostSelector?.hostgroup;
-  if (scope.hostgroup !== undefined && hostgroup !== undefined && hostgroup !== scope.hostgroup) {
-    return false;
-  }
-  return true;
+  if (scope.hostgroup === undefined || hostgroup === undefined) return true;
+  const storageHostgroup = scope.storageHostgroup ?? STORAGE_HOSTGROUP;
+  return hostgroup === scope.hostgroup || hostgroup === storageHostgroup;
 }
 
 export function cronInTenantScope(document: CronJobDocument, namespace: string): boolean {
