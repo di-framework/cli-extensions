@@ -5,11 +5,29 @@ import {
   installFetchRuntime,
 } from '../src/node-compat/fetch-runtime';
 
+// installFetchRuntime(true) overwrites every fetch global, so restore them all
+// or later test files run against the polyfills instead of Bun's natives.
+const installedGlobals = [
+  'TextEncoder',
+  'TextDecoder',
+  'URLSearchParams',
+  'URL',
+  'Headers',
+  'Request',
+  'Response',
+  'Blob',
+  'AbortSignal',
+  'AbortController',
+  'self',
+  'console',
+] as const;
+
 describe('guest Blob', () => {
-  const previous = globalThis.Blob;
+  const global = globalThis as Record<string, unknown>;
+  const previous = Object.fromEntries(installedGlobals.map((key) => [key, global[key]]));
 
   afterEach(() => {
-    globalThis.Blob = previous;
+    for (const key of installedGlobals) global[key] = previous[key];
   });
 
   it('counts string and binary parts', () => {
@@ -25,9 +43,9 @@ describe('guest Blob', () => {
   it('installs the polyfill when the guest has no Blob', () => {
     Reflect.deleteProperty(globalThis, 'Blob');
     installFetchRuntime();
-    expect(globalThis.Blob).toBe(BlobPolyfill);
+    expect(globalThis.Blob as unknown).toBe(BlobPolyfill);
     installFetchRuntime(true);
-    expect(globalThis.Blob).toBe(BlobPolyfill);
+    expect(globalThis.Blob as unknown).toBe(BlobPolyfill);
   });
 
   it('aborts once and installs self for libraries that read window globals', () => {
@@ -52,12 +70,10 @@ describe('guest Blob', () => {
     stringReason.abort('stopped');
     expect(() => stringReason.signal.throwIfAborted()).toThrow('This operation was aborted');
 
-    const previousSelf = globalThis.self;
     globalThis.self = null as unknown as typeof globalThis.self;
     Reflect.deleteProperty(globalThis, 'AbortController');
     installFetchRuntime();
-    expect(globalThis.self).toBe(globalThis);
-    expect(globalThis.AbortController).toBe(AbortControllerPolyfill);
-    globalThis.self = previousSelf;
+    expect(globalThis.self as unknown).toBe(globalThis);
+    expect(globalThis.AbortController as unknown).toBe(AbortControllerPolyfill);
   });
 });

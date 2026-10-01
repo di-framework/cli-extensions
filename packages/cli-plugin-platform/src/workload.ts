@@ -72,10 +72,9 @@ export function storageOwnershipConflict(
     ) {
       continue;
     }
-    for (const volume of item.spec?.template?.spec?.volumes ?? []) {
-      if (volume.hostPath?.path === hostPath) {
-        return { owner: item.metadata?.name ?? 'unknown' };
-      }
+    const volumes = item.spec?.template?.spec?.volumes ?? [];
+    if (volumes.some((volume) => volume.hostPath?.path === hostPath)) {
+      return { owner: item.metadata?.name ?? 'unknown' };
     }
   }
   return undefined;
