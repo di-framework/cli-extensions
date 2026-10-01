@@ -78,19 +78,71 @@ describe('tenant deployment targets', () => {
     }
   });
 
-  it('selects the tenant storage pool while keeping the namespace environment', async () => {
-    const { root, greeter, manifest } = tenantWorkspace();
+  async function aliceConnection(root: string, manifest: string) {
     const parsed = parseDeployManifest(join(root, 'di-framework.deploy.toml'), manifest, {});
     const target = parsed.targets.alice;
     if (!target) throw new Error('missing target');
-    const connection = await resolveConnection(target, root, parsed.path, fakeDeps({ cwd: root }));
+    return resolveConnection(target, root, parsed.path, fakeDeps({ cwd: root }));
+  }
+
+  it('asks the platform for storage instead of naming a host path', async () => {
+    const { root, greeter, manifest } = tenantWorkspace();
+    const connection = await aliceConnection(root, manifest);
     const yaml = renderWorkloadManifest(
       { ...loadProject(greeter), persistentStorage: true },
       connection,
       'registry.example.com/alice/greeter:test',
     );
-    expect(yaml).toContain('hostgroup: alice-storage');
+    expect(yaml).toContain(
+      '  annotations:\n    di-framework.dev/persistent-storage: "true"\nspec:\n  replicas: 1\n  deployPolicy: Recreate',
+    );
+    expect(yaml).not.toContain('di-framework.dev/storage-mount');
+    // The tenant host carries the platform mount; the storage pool is not a tenant concept.
+    expect(yaml).toContain('hostgroup: alice\n');
+    expect(yaml).not.toContain('alice-storage');
+    expect(yaml).not.toContain('volumes:');
+    expect(yaml).not.toContain('volumeMounts:');
+    expect(yaml).not.toContain('hostPath');
+    expect(yaml).toContain('DI_STORAGE_DIR: "/data"');
     expect(yaml).toContain('environment: "tenant-alice"');
+  });
+
+  it('names the actor mount and rejects mounts the platform does not provide', async () => {
+    const { root, greeter, manifest } = tenantWorkspace();
+    const connection = await aliceConnection(root, manifest);
+    const project = { ...loadProject(greeter), persistentStorage: true };
+    const actors = renderWorkloadManifest(project, connection, 'image:test', undefined, [], {
+      hasActors: true,
+    });
+    expect(actors).toContain('    di-framework.dev/storage-mount: "/data/actors"');
+    expect(actors).toContain('ACTOR_STORAGE_DIR: "/data/actors"');
+    expect(() =>
+      renderWorkloadManifest(project, connection, 'image:test', undefined, [], {
+        storageVolume: { volumeName: 'app-storage', mountPath: '/srv', hostPath: '/tmp/x' },
+      }),
+    ).toThrow('Tenant storage mounts at /data or /data/actors, not /srv');
+  });
+
+  it('skips the host-path ownership scan for tenant storage', async () => {
+    const { root, greeter } = tenantWorkspace();
+    const config = JSON.parse(readFileSync(join(greeter, 'di-framework.config.json'), 'utf8'));
+    writeFileSync(
+      join(greeter, 'di-framework.config.json'),
+      JSON.stringify({ ...config, persistentStorage: true }),
+    );
+    const invocations: RunnerInvocation[] = [];
+    await runWasmcloudDeploy(
+      ['greeter', '--target', 'alice'],
+      captureIo().io,
+      fakeDeps({ cwd: root, invocations }),
+    );
+    expect(
+      invocations.some((invocation) =>
+        invocation.args.includes('di-framework.dev/application!=greeter'),
+      ),
+    ).toBe(false);
+    const manifest = readFileSync(join(greeter, '.di-framework/deploy/workload.yaml'), 'utf8');
+    expect(manifest).toContain('di-framework.dev/persistent-storage: "true"');
   });
 
   it('destroys only within the selected tenant and never changes the platform', async () => {
