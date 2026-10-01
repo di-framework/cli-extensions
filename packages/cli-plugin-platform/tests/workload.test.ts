@@ -49,12 +49,15 @@ describe('workload manifests', () => {
     // wash 2.8 runs wasi:cli/run only from spec.template.spec.service; a host interface
     // named wasi:cli/run is never provided and stops the workload from starting.
     expect(yaml).toContain(
-      '      service:\n        image: "registry.example.com/collector:1"\n        localResources:\n          allowedIpNameLookups: ["nats.example.com"]\n',
+      '      service:\n        image: "registry.example.com/collector:1"\n        localResources:\n          allowedIpNameLookups: ["nats.example.com"]\n      hostInterfaces:\n',
     );
-    expect(yaml).not.toContain('hostInterfaces:');
     expect(yaml).not.toContain('components:');
     expect(yaml).not.toContain('package: cli');
     expect(yaml).not.toContain('kubernetes:');
+    // Every deployed guest links the wasi:logging console; the host binds it only when declared.
+    expect(yaml).toMatch(
+      /- namespace: wasi\n\s+package: logging\n\s+version: "?0\.1\.0-draft"?\n\s+interfaces:\n\s+- logging/,
+    );
     expect(yaml).not.toContain('volumeMounts:');
   });
 

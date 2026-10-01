@@ -13,7 +13,12 @@ import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import type { ClusterConnection } from './target';
-import { defaultProjectRequirements, queueProjectRequirements, type WitRequirement } from './wit';
+import {
+  defaultProjectRequirements,
+  guestLoggingRequirement,
+  queueProjectRequirements,
+  type WitRequirement,
+} from './wit';
 
 export const MANAGED_BY_LABEL = 'di-framework';
 export const WAIT_ATTEMPTS = 30;
@@ -247,7 +252,11 @@ spec:
     !isWorker &&
     project.workloadEntry?.kind === 'service' &&
     project.workloadEntry.subscriptions === undefined;
-  const interfaceRequirements: readonly WitRequirement[] = requirements;
+  // Deploy builds always link the wasi:logging console (see buildComponent).
+  const interfaceRequirements: readonly WitRequirement[] = [
+    ...requirements,
+    guestLoggingRequirement(),
+  ];
   const hostInterfaces = renderHostInterfacesYaml(
     hostInterfacesFromRequirements(
       hasHttp &&

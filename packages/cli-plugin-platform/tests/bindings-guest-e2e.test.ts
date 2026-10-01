@@ -83,6 +83,10 @@ describe('config binding guest wiring', () => {
     );
     expect(inspected.exitCode).toBe(0);
     expect(`${inspected.stdout}\n${inspected.stderr}`).toContain('wasi:config/store@0.2.0-rc.1');
+    // Deploy builds link the guest console through wasi:logging.
+    expect(`${inspected.stdout}\n${inspected.stderr}`).toContain(
+      'wasi:logging/logging@0.1.0-draft',
+    );
   }, 60_000);
 
   it('componentizes unlabeled async wasmcloud:postgres with a wasmtime-48 qjs CLI', async () => {
@@ -172,7 +176,8 @@ export default async (request: Request): Promise<Response> => {
           ? join(root, 'catalog.json')
           : undefined,
     };
-    await buildComponent(loadProject(root), captureIo().io, deps);
+    // wasmtime serve cannot link wasi:logging; dev builds for it the same way.
+    await buildComponent(loadProject(root), captureIo().io, deps, { guestLogging: false });
 
     const port = 18000 + Math.floor(Math.random() * 1000);
     const child = Bun.spawn(

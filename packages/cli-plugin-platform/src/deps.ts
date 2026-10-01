@@ -54,6 +54,8 @@ export type BundleOptions = {
   cronPath?: string;
   queuesPath?: string;
   projectRoot?: string;
+  /** Link the wasi:logging console. Off for local runners that cannot provide it. */
+  guestLogging?: boolean;
   files?: Record<string, string>;
   env?: Record<string, string | undefined>;
   cwd?: string;
@@ -352,6 +354,7 @@ export const DEFAULT_DEPS: WasmcloudDeps = {
     cronPath,
     queuesPath,
     projectRoot,
+    guestLogging,
     files,
     env,
     cwd,
@@ -369,12 +372,16 @@ export const DEFAULT_DEPS: WasmcloudDeps = {
           },
           load(id) {
             if (id === '\0virtual:di-framework-runtime-entry') {
-              const bootstrap = join(
-                dirname(fileURLToPath(import.meta.url)),
-                'node-compat',
-                `bootstrap.${import.meta.url.endsWith('.ts') ? 'ts' : 'js'}`,
-              );
-              return `import ${JSON.stringify(bootstrap)}; export * from ${JSON.stringify(adapterPath)};`;
+              const runtimeFile = (name: string) =>
+                join(
+                  dirname(fileURLToPath(import.meta.url)),
+                  'node-compat',
+                  `${name}.${import.meta.url.endsWith('.ts') ? 'ts' : 'js'}`,
+                );
+              // The console import comes after bootstrap so it replaces the noop console.
+              const console =
+                guestLogging === false ? '' : `import ${JSON.stringify(runtimeFile('console'))}; `;
+              return `import ${JSON.stringify(runtimeFile('bootstrap'))}; ${console}export * from ${JSON.stringify(adapterPath)};`;
             }
           },
         },

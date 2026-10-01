@@ -111,6 +111,14 @@ declare module 'di-framework:sqlite/database@0.1.0' {
   export function open(path: string): { tag: 'ok'; val: Connection } | { tag: 'err'; val: SqlError };
 }
 
+declare module 'wasi:logging/logging@0.1.0-draft' {
+  export function log(
+    level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'critical',
+    context: string,
+    message: string,
+  ): void;
+}
+
 declare module 'wasi:cli/environment@0.3.0' {
   export function getEnvironment(): Array<[string, string]>;
 }

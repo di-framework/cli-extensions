@@ -423,7 +423,7 @@ export default async function echo(payload: string): Promise<string> {
 }
 `,
     );
-    await DEFAULT_DEPS.bundler({ adapterPath, entryPath, outFile });
+    await DEFAULT_DEPS.bundler({ adapterPath, entryPath, outFile, guestLogging: false });
     const source = await Bun.file(outFile).text();
     expect(source).toContain('wasi:sockets/types@0.3.0');
     expect(source).toContain('wasi:sockets/ip-name-lookup@0.3.0');
