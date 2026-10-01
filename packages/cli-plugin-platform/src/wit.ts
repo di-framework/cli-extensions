@@ -16,6 +16,9 @@ export const WASI_HTTP_INTERFACE = 'handler';
 export const WASI_SOCKETS_PACKAGE = 'wasi:sockets';
 export const WASI_SOCKETS_VERSION = '0.3.0';
 export const WASI_RANDOM_PACKAGE = 'wasi:random';
+/** The sync preview-2 filesystem: node:fs storage paths and the SQLite provider use it. */
+export const WASI_FILESYSTEM_PACKAGE = 'wasi:filesystem';
+export const WASI_FILESYSTEM_VERSION = '0.2.12';
 export const WASI_RANDOM_VERSION = '0.3.0';
 export const QUEUE_ADAPTER_SOURCE = 'queue-adapter';
 export const DI_QUEUES_PACKAGE = 'di-framework:queues';
@@ -145,6 +148,15 @@ export function runtimeRequirementsFromJavaScript(source: string): WitRequiremen
       package: WASI_RANDOM_PACKAGE,
       version: WASI_RANDOM_VERSION,
       interfaces: ['random'],
+      direction: 'import',
+      source: NODE_COMPAT_SOURCE,
+    });
+  }
+  if (source.includes(`${WASI_FILESYSTEM_PACKAGE}/preopens@${WASI_FILESYSTEM_VERSION}`)) {
+    requirements.push({
+      package: WASI_FILESYSTEM_PACKAGE,
+      version: WASI_FILESYSTEM_VERSION,
+      interfaces: ['types', 'preopens'],
       direction: 'import',
       source: NODE_COMPAT_SOURCE,
     });

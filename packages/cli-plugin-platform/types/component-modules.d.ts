@@ -122,3 +122,8 @@ declare module 'wasi:logging/logging@0.1.0-draft' {
 declare module 'wasi:cli/environment@0.3.0' {
   export function getEnvironment(): Array<[string, string]>;
 }
+
+declare module 'wasi:filesystem/preopens@0.2.12' {
+  /** Preopened directories as [descriptor, guest path]; see src/node-compat/storage.ts. */
+  export function getDirectories(): Array<[unknown, string]>;
+}

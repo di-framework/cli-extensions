@@ -88,7 +88,9 @@ it does not implicitly grant unrestricted DNS access.
 
 Guest JS keeps the framework's Node contract. The bundler runs [unenv](https://github.com/unjs/unenv)
 `nodeCompat` plus a wasmCloud preset: `node:path`, `Buffer`, and the rest of
-the Node builtin map come from unenv; `node:fs` is an in-memory filesystem (with `ENOENT`),
+the Node builtin map come from unenv; `node:fs` and `node:fs/promises` are an in-memory
+filesystem (with `ENOENT`), except under the storage mount (`/data`, or `DI_STORAGE_DIR`), which
+reads and writes the host's preopened directory through `wasi:filesystem@0.2.12`,
 `process.env` / `process.cwd()` are guest-shaped (not the host process), and `createRequire` throws
 `MODULE_NOT_FOUND`. `node:net` and `node:dgram` overlay WASI 0.3 `wasi:sockets` (`tcp-socket` /
 `udp-socket` / `ip-name-lookup`) so `@di-framework/socket`'s Node TCP/UDP adapters run unchanged.
@@ -413,7 +415,8 @@ Actors, queues, workers, and `persistentStorage: true` deploy with the annotatio
 "/data/actors"` for actors) and no volume, volume mount, or host path. The platform
 controller creates `<storageRoot>/di-tenants/<tenant uid>/workloads/<workload>`, shared by
 the members of one `di-framework.dev/workload` and private to the tenant, and injects the
-volume and the `/data` preopen. The guest still reads `DI_STORAGE_DIR`. `storage-hostgroup`
+volume and the `/data` preopen. The guest still reads `DI_STORAGE_DIR`; `node:fs` paths under
+it reach that directory, so members see each other's files. `storage-hostgroup`
 applies only to targets without a `hostgroup`, which keep the host path under
 `/var/lib/di-framework/storage` on the `storage` pool.
 
