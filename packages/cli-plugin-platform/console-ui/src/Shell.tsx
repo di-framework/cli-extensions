@@ -31,6 +31,7 @@ import { ApplicationList } from './ApplicationList';
 import { ApplicationPage } from './ApplicationPage';
 import { BackingServicesPage } from './BackingServicesPage';
 import { Dashboard } from './Dashboard';
+import markUrl from './di-framework-mark.png';
 import { ErrorAlert } from './ErrorAlert';
 import { PageHeader } from './PageHeader';
 import { useStore } from './StoreContext';
@@ -201,19 +202,5 @@ const SectionContent = observer(function SectionContent(): JSX.Element {
 });
 
 function BrandMark(): JSX.Element {
-  return (
-    <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-      <path
-        d="M16 2 29 9.5v13L16 30 3 22.5v-13Z"
-        fill="none"
-        stroke="var(--pf-t--global--color--brand--default)"
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M16 9 22.5 12.75v6.5L16 23l-6.5-3.75v-6.5Z"
-        fill="var(--pf-t--global--color--brand--default)"
-      />
-    </svg>
-  );
+  return <img className="console-brand-mark" src={markUrl} alt="" />;
 }

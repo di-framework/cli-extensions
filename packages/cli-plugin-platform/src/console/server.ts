@@ -57,7 +57,16 @@ const SECURITY_HEADERS = {
   'cache-control': 'no-store',
 } as const;
 
-const ASSET_EXTENSIONS = new Set(['.js', '.css', '.map', '.woff', '.woff2', '.ttf', '.svg']);
+const ASSET_EXTENSIONS = new Set([
+  '.js',
+  '.css',
+  '.map',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.svg',
+  '.png',
+]);
 const MAX_BODY_BYTES = 65_536;
 const WRITES_FORBIDDEN = 'This credential cannot change the application.';
 
@@ -837,6 +846,8 @@ function contentType(extension: string): string {
       return 'text/css; charset=utf-8';
     case '.svg':
       return 'image/svg+xml';
+    case '.png':
+      return 'image/png';
     case '.woff':
       return 'font/woff';
     case '.woff2':
