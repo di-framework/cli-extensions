@@ -27,6 +27,7 @@ import {
   tenantIdentity,
   toSummary,
   type WorkloadDocument,
+  withRouteUrls,
   withServiceClasses,
   workloadInTenantScope,
 } from './catalog';
@@ -444,11 +445,18 @@ async function present(options: HandlerOptions, name: string) {
   const application = requireApplication(loaded.applications, name);
   const logs = await logsFor(options, loaded.connection, name);
   const signals = await options.cluster.readSignals(loaded.connection, name);
+  const routes =
+    application.routes.length === 0
+      ? application.routes
+      : withRouteUrls(
+          application.routes,
+          await options.cluster.readRouteTemplate(loaded.connection),
+        );
   const backingServices =
     application.backingServices.length === 0
       ? application.backingServices
       : withServiceClasses(application.backingServices, await serviceClasses(options));
-  return withProjections({ ...application, backingServices }, logs, signals);
+  return withProjections({ ...application, routes, backingServices }, logs, signals);
 }
 
 /** Class of each backing service by name; empty when the services cannot be read. */

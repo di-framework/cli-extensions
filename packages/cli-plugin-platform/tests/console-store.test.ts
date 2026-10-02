@@ -170,6 +170,24 @@ describe('console store loading', () => {
     await store.openApplication('mesh');
     expect(store.application?.failed).toBe(true);
     expect(store.application?.parts[0]?.failure).toBe('service did not properly execute');
+    expect(store.application?.routes[0]?.url).toBeUndefined();
+    route('GET', '/api/applications/mesh', {
+      body: {
+        application: detail({
+          routes: [
+            {
+              id: 'r1',
+              host: 'mesh.local',
+              path: '/',
+              enabled: true,
+              url: 'http://mesh.local.warehouse.localhost:28180/',
+            },
+          ],
+        }),
+      },
+    });
+    await store.refreshAll();
+    expect(store.application?.routes[0]?.url).toBe('http://mesh.local.warehouse.localhost:28180/');
   });
 
   test('a failed session leaves the store closed with the error', async () => {

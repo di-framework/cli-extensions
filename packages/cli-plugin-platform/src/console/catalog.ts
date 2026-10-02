@@ -70,6 +70,8 @@ export type RouteView = {
   host: string;
   path: string;
   enabled: boolean;
+  /** Gateway address of an enabled route, when the platform publishes a route URL template. */
+  url?: string;
 };
 
 /** One variable on one part; the same name can be set on several parts. */
@@ -298,6 +300,35 @@ export function toSummary(application: ApplicationView): ApplicationSummary {
     components: application.components,
     routeCount: application.routeCount,
   };
+}
+
+/**
+ * A route's gateway address from the tenant's `di-platform-routes` URL template, e.g.
+ * `http://{host}.meshtastic.localhost:28180`. Undefined when the result is not an http(s) URL.
+ */
+export function routeUrl(template: string, host: string, path: string): string | undefined {
+  if (!template.includes('{host}')) return undefined;
+  const base = template.replaceAll('{host}', host);
+  try {
+    const url = new URL(path === '/' ? base : `${base.replace(/\/$/, '')}${path}`);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
+    if (url.username !== '' || url.password !== '') return undefined;
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Adds gateway links to the enabled routes. */
+export function withRouteUrls(
+  routes: readonly RouteView[],
+  template: string | undefined,
+): RouteView[] {
+  if (template === undefined) return [...routes];
+  return routes.map((route) => {
+    const url = route.enabled ? routeUrl(template, route.host, route.path) : undefined;
+    return url === undefined ? route : { ...route, url };
+  });
 }
 
 /**

@@ -9,10 +9,12 @@ import {
   planEnvironmentSet,
   planRouteUpdate,
   planSecretReassign,
+  routeUrl,
   summarizeApplications,
   tenantIdentity,
   toSummary,
   type WorkloadDocument,
+  withRouteUrls,
   workloadInTenantScope,
 } from '../src/console/catalog';
 import type { ConsoleCluster } from '../src/console/cluster';
@@ -949,6 +951,35 @@ describe('console host failures', () => {
   });
 });
 
+describe('console route links', () => {
+  const template = 'http://{host}.meshtastic.localhost:28180';
+
+  it('builds a gateway address for each enabled route', () => {
+    expect(routeUrl(template, 'mesh-site', '/')).toBe(
+      'http://mesh-site.meshtastic.localhost:28180/',
+    );
+    expect(routeUrl(template, 'api.v2', '/admin')).toBe(
+      'http://api.v2.meshtastic.localhost:28180/admin',
+    );
+    expect(routeUrl(`${template}/`, 'mesh-site', '/admin')).toBe(
+      'http://mesh-site.meshtastic.localhost:28180/admin',
+    );
+    expect(routeUrl('https://{host}.example.test', 'site', '/')).toBe('https://site.example.test/');
+    expect(routeUrl('http://gateway.localhost', 'site', '/')).toBeUndefined();
+    expect(routeUrl('javascript:{host}', 'site', '/')).toBeUndefined();
+    expect(routeUrl('http://user:pw@{host}.localhost', 'site', '/')).toBeUndefined();
+    expect(routeUrl('http://[{host}', 'site', '/')).toBeUndefined();
+    const live = { id: 'a', host: 'mesh-site', path: '/', enabled: true };
+    const paused = { id: 'b', host: 'paused', path: '/', enabled: false };
+    const routes = [live, paused];
+    expect(withRouteUrls(routes, template)).toEqual([
+      { ...live, url: 'http://mesh-site.meshtastic.localhost:28180/' },
+      paused,
+    ]);
+    expect(withRouteUrls(routes, undefined)).toEqual(routes);
+  });
+});
+
 describe('console command options', () => {
   it('binds loopback and requires a tenant credential', () => {
     expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 0 });
@@ -1046,9 +1077,13 @@ registry = "registry.example.com/team"
     const writable = true;
     let logs: string[] | undefined;
     let signals: { success: number; error: number; compute?: number[] } | undefined;
+    let routeTemplate: string | undefined;
     const cluster: ConsoleCluster = {
       async readFailures() {
         return new Map();
+      },
+      async readRouteTemplate() {
+        return routeTemplate;
       },
       async listWorkloads() {
         return structuredClone(documents);
@@ -1215,6 +1250,16 @@ registry = "registry.example.com/team"
       servicesFail = false;
       expect(JSON.parse(unclassed.body).application.backingServices[0].className).toBe('');
       expect(application.parts[0]).toMatchObject({ kind: 'component', lifetime: 'on-demand' });
+      expect(application.routes[0]).not.toHaveProperty('url');
+      routeTemplate = 'http://{host}.warehouse.localhost:28180';
+      const linked = await request(server.port, {
+        path: '/api/applications/greeter',
+        headers: { cookie: session },
+      });
+      routeTemplate = undefined;
+      expect(JSON.parse(linked.body).application.routes[0].url).toBe(
+        'http://greeter.warehouse.localhost:28180/',
+      );
       expect(application.logs).toEqual({ unpublished: true });
       expect(application.signals).toBeUndefined();
       expect(detail.body).not.toContain(SECRET);
