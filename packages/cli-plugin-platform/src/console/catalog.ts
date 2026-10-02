@@ -810,12 +810,21 @@ function backingBindings(
     views.push({
       name,
       service,
-      className: binding.spec?.capability ?? '',
+      // The bound service's class comes from the BackingService; see withServiceClasses.
+      className: '',
       ready,
       ...(detail ? { detail } : {}),
     });
   }
   return views.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** Names each binding's class from the bound BackingService (service name to class name). */
+export function withServiceClasses(
+  bindings: readonly BackingBindingView[],
+  classes: ReadonlyMap<string, string>,
+): BackingBindingView[] {
+  return bindings.map((binding) => ({ ...binding, className: classes.get(binding.service) ?? '' }));
 }
 
 function privateBindings(members: readonly WorkloadDocument[]): PrivateBindingView[] {
