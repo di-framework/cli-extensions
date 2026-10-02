@@ -57,6 +57,27 @@ describe('runWasmcloudDeploy', () => {
     expect(root).toBeTruthy();
   });
 
+  it('carries a logs opt-out from the config through build and deploy', async () => {
+    const { greeter } = makeWorkspace();
+    const configPath = join(greeter, 'di-framework.config.json');
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ ...JSON.parse(readFileSync(configPath, 'utf8')), logs: false })}\n`,
+    );
+    const deps = fakeDeps({ cwd: greeter, invocations: [] });
+    const bundles: (boolean | undefined)[] = [];
+    const bundle = deps.bundler;
+    deps.bundler = (options) => {
+      bundles.push(options.guestLogging);
+      return bundle(options);
+    };
+    await runWasmcloudDeploy(['--target', 'development'], captureIo().io, deps);
+    expect(bundles).toEqual([false]);
+    const yaml = readFileSync(join(greeter, '.di-framework', 'deploy', 'workload.yaml'), 'utf8');
+    expect(yaml).toContain('di-framework.dev/logs: "false"');
+    expect(yaml).not.toContain('package: logging');
+  });
+
   it('resolves greeter from the workspace root and another directory', async () => {
     const { root, echo, kubeconfig } = makeWorkspace();
     const fromRoot = await runWasmcloudDeploy(

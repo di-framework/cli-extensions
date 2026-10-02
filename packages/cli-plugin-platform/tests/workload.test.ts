@@ -98,6 +98,37 @@ describe('workload manifests', () => {
     expect(yaml).toContain('"subscriptions": "mesh.events"');
   });
 
+  it('opts a deployment out of guest logs with an annotation and no wasi:logging', () => {
+    const { greeter } = makeWorkspace();
+    const project = loadProject(greeter);
+    const connection = {
+      target: 'development',
+      kubeconfig: '/tmp/kube',
+      namespace: 'wasmcloud',
+      registry: REGISTRY,
+    };
+    const on = renderWorkloadManifest(project, connection, 'registry.example.com/greeter:1');
+    expect(on).toContain('package: logging');
+    expect(on).not.toContain('annotations:');
+    const off = renderWorkloadManifest(
+      { ...project, logs: false },
+      connection,
+      'registry.example.com/greeter:1',
+    );
+    expect(off).not.toContain('package: logging');
+    expect(off).toContain('  annotations:\n    di-framework.dev/logs: "false"\nspec:');
+    // Tenant storage annotations share the one annotations block.
+    const tenant = renderWorkloadManifest(
+      { ...project, logs: false, persistentStorage: true },
+      { ...connection, namespace: 'di-tenant-acme', hostgroup: 'tenant-acme' },
+      'registry.example.com/greeter:1',
+    );
+    expect(tenant.match(/annotations:/g)).toHaveLength(1);
+    expect(tenant).toContain(
+      '  annotations:\n    di-framework.dev/persistent-storage: "true"\n    di-framework.dev/logs: "false"\n',
+    );
+  });
+
   it('renders Service and WorkloadDeployment from the project name and image', () => {
     const { greeter } = makeWorkspace();
     const project = loadProject(greeter);

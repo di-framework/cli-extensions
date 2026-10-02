@@ -63,7 +63,9 @@ export async function runWasmcloudDev(
     runner.kind === 'wash'
       ? writeWashDevConfig(
           project,
-          [...projectRequirements, guestLoggingRequirement()],
+          project.logs === false
+            ? projectRequirements
+            : [...projectRequirements, guestLoggingRequirement()],
           discoverBindings(project, deps),
           {
             host: options.host,

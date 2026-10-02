@@ -38,6 +38,11 @@ export const DEFAULT_STORAGE_MOUNT = '/data';
  * the preopen; tenant credentials cannot set either.
  */
 export const PERSISTENT_STORAGE_ANNOTATION = 'di-framework.dev/persistent-storage';
+/**
+ * "false" when the project opts out of guest logs: the platform publishes no wasi:logging
+ * lines for the deployment, only host failure lines.
+ */
+export const LOGS_ANNOTATION = 'di-framework.dev/logs';
 /** Guest mount when it is not the default `/data`; the controller accepts only these two. */
 export const STORAGE_MOUNT_ANNOTATION = 'di-framework.dev/storage-mount';
 const PLATFORM_STORAGE_MOUNTS = [DEFAULT_STORAGE_MOUNT, `${DEFAULT_STORAGE_MOUNT}/actors`];
@@ -178,15 +183,14 @@ export function renderWorkloadManifest(
       { mountPath },
     );
   }
-  const annotations = platformStorage
-    ? [
-        '  annotations:',
-        `    ${PERSISTENT_STORAGE_ANNOTATION}: "true"`,
-        ...(mountPath === DEFAULT_STORAGE_MOUNT
-          ? []
-          : [`    ${STORAGE_MOUNT_ANNOTATION}: ${yamlQuote(mountPath)}`]),
-      ]
-    : [];
+  const annotationLines = [
+    ...(platformStorage ? [`    ${PERSISTENT_STORAGE_ANNOTATION}: "true"`] : []),
+    ...(platformStorage && mountPath !== DEFAULT_STORAGE_MOUNT
+      ? [`    ${STORAGE_MOUNT_ANNOTATION}: ${yamlQuote(mountPath)}`]
+      : []),
+    ...(project.logs === false ? [`    ${LOGS_ANNOTATION}: "false"`] : []),
+  ];
+  const annotations = annotationLines.length > 0 ? ['  annotations:', ...annotationLines] : [];
 
   const environment: Record<string, string> = { ...(opts.environment ?? {}) };
   if (needsPersistentStorage) {
@@ -284,11 +288,10 @@ spec:
     !isWorker &&
     project.workloadEntry?.kind === 'service' &&
     project.workloadEntry.subscriptions === undefined;
-  // Deploy builds always link the wasi:logging console (see buildComponent).
-  const interfaceRequirements: readonly WitRequirement[] = [
-    ...requirements,
-    guestLoggingRequirement(),
-  ];
+  // Deploy builds link the wasi:logging console unless the project opts out of logs
+  // (see buildComponent).
+  const interfaceRequirements: readonly WitRequirement[] =
+    project.logs === false ? requirements : [...requirements, guestLoggingRequirement()];
   const hostInterfaces = renderHostInterfacesYaml(
     hostInterfacesFromRequirements(
       hasHttp &&

@@ -170,6 +170,21 @@ declares an unnamed `wasi:logging` host interface (`interfaces: [logging]`). `pl
 links it only for `wash`; wasmtime and jco cannot provide it, so those builds keep a
 console that discards output.
 
+Logs are on by default. Set `"logs": false` in `di-framework.config.json` to opt a project out:
+
+```json
+{ "name": "quiet-app", "entry": "src/app.ts", "logs": false }
+```
+
+The build then links no `wasi:logging` import and keeps the console that discards output, in
+`platform deploy` and `platform dev` alike. The WorkloadDeployment declares no `wasi:logging`
+host interface and carries the annotation `di-framework.dev/logs: "false"`, so the platform
+publishes none of the application's console lines. It still publishes the host's WARN and
+ERROR lines for the application's workloads (for example a workload that failed to start)
+with the application's logs, and the console still uses them to mark a failed workload.
+Each workload member reads its own config, so the setting applies per member. `logs` must
+be a boolean; omitting it or setting `true` keeps logs on and adds no annotation.
+
 `wash` 2.5.x has no `--address` flag. The extension writes
 `.di-framework/wash-dev.yaml` (`dev.address`, `host_interfaces`,
 `wasm_proposals: [component-model-async]`) and runs `wash dev --user-config` against it.
