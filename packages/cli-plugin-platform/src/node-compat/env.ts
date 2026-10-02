@@ -35,6 +35,8 @@ export function wasmcloudUnenvPreset(
       'node:timers': runtimeFile('timers'),
       fs: fsPath,
       'node:fs': fsPath,
+      'fs/promises': runtimeFile('fs-promises'),
+      'node:fs/promises': runtimeFile('fs-promises'),
       process: processPath,
       'node:process': processPath,
       module: modulePath,

@@ -2,6 +2,7 @@ import {
   type AggregatedRequirement,
   aggregateRequirements,
   parsePackageId,
+  WASI_FILESYSTEM_PACKAGE,
   WASI_HTTP_INTERFACE,
   WASI_HTTP_PACKAGE,
   WASI_RANDOM_PACKAGE,
@@ -90,6 +91,7 @@ export function hostInterfacesFromRequirements(
       (requirement) =>
         requirement.package !== WASI_SOCKETS_PACKAGE &&
         requirement.package !== WASI_RANDOM_PACKAGE &&
+        requirement.package !== WASI_FILESYSTEM_PACKAGE &&
         requirement.package !== 'wasi:tls' &&
         requirement.package !== 'wasi:clocks',
     )

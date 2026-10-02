@@ -11,26 +11,6 @@ import {
   wasmcloudNodeEnv,
   wasmcloudUnenvPreset,
 } from '../src/node-compat/env';
-import {
-  accessSync,
-  closeSync,
-  constants,
-  createReadStream,
-  existsSync,
-  fstatSync,
-  mkdirSync as guestMkdirSync,
-  writeFileSync as guestWriteFileSync,
-  lstatSync,
-  openSync,
-  readdirSync,
-  readFileSync,
-  readSync,
-  renameSync,
-  rmSync,
-  statSync,
-  unlinkSync,
-  writeSync,
-} from '../src/node-compat/fs';
 import { builtinModules, createRequire } from '../src/node-compat/module';
 import guestProcess, { cwd, env, nextTick } from '../src/node-compat/process';
 import {
@@ -53,6 +33,28 @@ afterEach(() => {
 });
 
 mock.module('wasi:clocks/monotonic-clock@0.3.0', () => clock);
+// No preopens: every path stays in the in-memory filesystem (see node-compat-storage tests).
+mock.module('wasi:filesystem/preopens@0.2.12', () => ({ getDirectories: () => [] }));
+const {
+  accessSync,
+  closeSync,
+  constants,
+  createReadStream,
+  existsSync,
+  fstatSync,
+  mkdirSync: guestMkdirSync,
+  writeFileSync: guestWriteFileSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} = await import('../src/node-compat/fs');
 
 describe('guest memfs', () => {
   it('reads and writes utf8, reports ENOENT, and resolves relative paths', () => {

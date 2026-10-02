@@ -1,4 +1,23 @@
 import { nodeCompatSeed } from './seed-virtual';
+import { type Storage, storage as wasiStorage } from './storage';
+
+/** Host-mounted storage; paths outside it stay in the in-memory filesystem below. */
+let storage: Storage = wasiStorage;
+
+/** Swap the storage backend (tests run several workload members in one process). */
+export function useStorage(next: Storage): Storage {
+  const previous = storage;
+  storage = next;
+  return previous;
+}
+
+function stored(path: string): boolean {
+  return storage.owns(path);
+}
+
+function asBuffer(bytes: Uint8Array): Uint8Array {
+  return typeof Buffer === 'undefined' ? bytes : Buffer.from(bytes);
+}
 
 type ErrnoException = Error & {
   code: string;
@@ -51,13 +70,17 @@ export function readFileSync(
   encoding?: string | { encoding?: string | null },
 ): string | Uint8Array {
   const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) {
+    const bytes = storage.readFile(normalized);
+    return encodingName(encoding) !== undefined ? new TextDecoder().decode(bytes) : asBuffer(bytes);
+  }
   const content = nodeCompatSeed.files[normalized];
   if (content === undefined) {
     throw errno('ENOENT', 'open', normalized, -2);
   }
   if (encodingName(encoding) !== undefined) return content;
   const bytes = new TextEncoder().encode(content);
-  return typeof Buffer === 'undefined' ? bytes : Buffer.from(bytes);
+  return asBuffer(bytes);
 }
 
 export function writeFileSync(
@@ -65,7 +88,25 @@ export function writeFileSync(
   data: string | Uint8Array,
   _encoding?: string | { encoding?: string | null },
 ): void {
-  nodeCompatSeed.files[normalizeFsPath(String(path))] = asText(data);
+  const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) {
+    storage.writeFile(normalized, asBytes(data));
+    return;
+  }
+  nodeCompatSeed.files[normalized] = asText(data);
+}
+
+export function appendFileSync(
+  path: string,
+  data: string | Uint8Array,
+  _encoding?: string | { encoding?: string | null },
+): void {
+  const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) {
+    storage.appendFile(normalized, asBytes(data));
+    return;
+  }
+  nodeCompatSeed.files[normalized] = (nodeCompatSeed.files[normalized] ?? '') + asText(data);
 }
 
 function directoryKey(path: string): string {
@@ -75,6 +116,7 @@ function directoryKey(path: string): string {
 
 export function existsSync(path: string): boolean {
   const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) return storage.exists(normalized);
   return normalized in nodeCompatSeed.files || directoryKey(normalized) in nodeCompatSeed.files;
 }
 
@@ -84,6 +126,10 @@ export function mkdirSync(
 ): string | undefined {
   const normalized = normalizeFsPath(String(path)).replace(/\/$/, '') || '/';
   const recursive = typeof options === 'object' && options?.recursive === true;
+  if (stored(normalized)) {
+    storage.mkdir(normalized, recursive);
+    return recursive ? normalized : undefined;
+  }
   if (normalized in nodeCompatSeed.files || directoryKey(normalized) in nodeCompatSeed.files) {
     if (recursive) return undefined;
     const error = errno('EEXIST', 'mkdir', normalized, -17);
@@ -108,6 +154,17 @@ export function readdirSync(
   options?: { withFileTypes?: boolean } | string | null,
 ): string[] | Array<{ name: string; isFile(): boolean; isDirectory(): boolean }> {
   const normalized = normalizeFsPath(String(path)).replace(/\/$/, '') || '/';
+  const withFileTypes =
+    options !== null && typeof options === 'object' && options.withFileTypes === true;
+  if (stored(normalized)) {
+    const entries = storage.readdir(normalized);
+    if (!withFileTypes) return entries.map((entry) => entry.name);
+    return entries.map((entry) => ({
+      name: entry.name,
+      isFile: () => !entry.directory,
+      isDirectory: () => entry.directory,
+    }));
+  }
   const prefix = normalized === '/' ? '/' : `${normalized}/`;
   const names = new Set<string>();
   for (const key of Object.keys(nodeCompatSeed.files)) {
@@ -117,8 +174,6 @@ export function readdirSync(
     if (name) names.add(name.replace(/\/$/, ''));
   }
   const list = [...names].sort();
-  const withFileTypes =
-    options !== null && typeof options === 'object' && options.withFileTypes === true;
   if (!withFileTypes) return list;
   return list.map((name) => {
     const child = normalizeFsPath(`${normalized}/${name}`);
@@ -139,6 +194,15 @@ export function statSync(path: string): {
   mtimeMs: number;
 } {
   const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) {
+    const result = storage.stat(normalized);
+    return {
+      isFile: () => !result.directory,
+      isDirectory: () => result.directory,
+      size: result.size,
+      mtimeMs: result.mtimeMs,
+    };
+  }
   const content = nodeCompatSeed.files[normalized];
   if (content !== undefined) {
     return {
@@ -170,12 +234,24 @@ export function fstatSync(fd: number) {
 }
 
 let nextFd = 3;
-const openHandles = new Map<number, { path: string; position: number; flags: string }>();
+const openHandles = new Map<
+  number,
+  { path: string; position: number; flags: string; stored: boolean }
+>();
 
 export function openSync(path: string, flags: string | number = 'r', _mode?: number): number {
   const normalized = normalizeFsPath(String(path));
   const flag = typeof flags === 'string' ? flags : 'r';
   const writing = flag.includes('w') || flag.includes('a') || flag.includes('+');
+  if (stored(normalized)) {
+    if (flag.includes('w')) storage.truncate(normalized);
+    else if (writing && !storage.exists(normalized))
+      storage.writeFile(normalized, new Uint8Array());
+    else if (!writing) storage.stat(normalized);
+    const fd = nextFd++;
+    openHandles.set(fd, { path: normalized, position: 0, flags: flag, stored: true });
+    return fd;
+  }
   if (!(normalized in nodeCompatSeed.files) && !writing) {
     throw errno('ENOENT', 'open', normalized, -2);
   }
@@ -187,6 +263,7 @@ export function openSync(path: string, flags: string | number = 'r', _mode?: num
     path: normalized,
     position: flag.includes('a') ? Number.MAX_SAFE_INTEGER : 0,
     flags: flag,
+    stored: false,
   });
   return fd;
 }
@@ -204,9 +281,10 @@ export function readSync(
 ): number {
   const handle = openHandles.get(fd);
   if (handle === undefined) throw errno('EBADF', 'read', String(fd), -9);
-  const content = asBytes(nodeCompatSeed.files[handle.path] ?? '');
   const start = position === null ? handle.position : position;
-  const slice = content.subarray(start, start + length);
+  const slice = handle.stored
+    ? storage.readAt(handle.path, length, start)
+    : asBytes(nodeCompatSeed.files[handle.path] ?? '').subarray(start, start + length);
   buffer.set(slice, offset);
   if (position === null) handle.position = start + slice.byteLength;
   return slice.byteLength;
@@ -225,6 +303,12 @@ export function writeSync(
     offset ?? 0,
     (offset ?? 0) + (length ?? asBytes(data).byteLength),
   );
+  if (handle.stored) {
+    const target = position ?? (handle.flags.includes('a') ? 'end' : handle.position);
+    const end = storage.writeAt(handle.path, bytes, target);
+    if (position == null) handle.position = end;
+    return bytes.byteLength;
+  }
   const existing = asBytes(nodeCompatSeed.files[handle.path] ?? '');
   const start =
     position == null
@@ -276,6 +360,11 @@ export function createReadStream(path: string): {
 
 export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void {
   const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) {
+    if (options?.force && !storage.exists(normalized)) return;
+    storage.remove(normalized, options?.recursive === true);
+    return;
+  }
   const prefix = normalized === '/' ? '/' : `${normalized}/`;
   const keys = Object.keys(nodeCompatSeed.files).filter(
     (key) => key === normalized || key === directoryKey(normalized) || key.startsWith(prefix),
@@ -289,6 +378,10 @@ export function rmSync(path: string, options?: { recursive?: boolean; force?: bo
 
 export function unlinkSync(path: string): void {
   const normalized = normalizeFsPath(String(path));
+  if (stored(normalized)) {
+    storage.unlink(normalized);
+    return;
+  }
   if (!(normalized in nodeCompatSeed.files)) throw errno('ENOENT', 'unlink', normalized, -2);
   delete nodeCompatSeed.files[normalized];
 }
@@ -296,6 +389,10 @@ export function unlinkSync(path: string): void {
 export function renameSync(from: string, to: string): void {
   const source = normalizeFsPath(String(from));
   const target = normalizeFsPath(String(to));
+  if (stored(source) || stored(target)) {
+    storage.rename(source, target);
+    return;
+  }
   if (!(source in nodeCompatSeed.files) && !(directoryKey(source) in nodeCompatSeed.files)) {
     throw errno('ENOENT', 'rename', source, -2);
   }
@@ -321,8 +418,31 @@ export function accessSync(path: string, _mode?: number): void {
   if (!existsSync(path)) throw errno('ENOENT', 'access', normalizeFsPath(String(path)), -2);
 }
 
+type Encoding = string | { encoding?: string | null };
+
+/** `fs/promises`: the synchronous operations above, settled as promises. */
+export const promises = {
+  access: async (path: string, mode?: number) => accessSync(path, mode),
+  appendFile: async (path: string, data: string | Uint8Array, encoding?: Encoding) =>
+    appendFileSync(path, data, encoding),
+  mkdir: async (path: string, options?: { recursive?: boolean } | number) =>
+    mkdirSync(path, options),
+  readFile: async (path: string, encoding?: Encoding) => readFileSync(path, encoding),
+  readdir: async (path: string, options?: { withFileTypes?: boolean } | string | null) =>
+    readdirSync(path, options),
+  rename: async (from: string, to: string) => renameSync(from, to),
+  rm: async (path: string, options?: { recursive?: boolean; force?: boolean }) =>
+    rmSync(path, options),
+  stat: async (path: string) => statSync(path),
+  lstat: async (path: string) => lstatSync(path),
+  unlink: async (path: string) => unlinkSync(path),
+  writeFile: async (path: string, data: string | Uint8Array, encoding?: Encoding) =>
+    writeFileSync(path, data, encoding),
+};
+
 export default {
   accessSync,
+  appendFileSync,
   closeSync,
   constants,
   createReadStream,
@@ -340,4 +460,5 @@ export default {
   unlinkSync,
   writeFileSync,
   writeSync,
+  promises,
 };
