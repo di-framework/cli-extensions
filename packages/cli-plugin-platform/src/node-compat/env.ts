@@ -31,6 +31,10 @@ export function wasmcloudUnenvPreset(
     alias: {
       async_hooks: runtimeFile('async-hooks'),
       'node:async_hooks': runtimeFile('async-hooks'),
+      events: runtimeFile('events'),
+      'node:events': runtimeFile('events'),
+      stream: runtimeFile('stream'),
+      'node:stream': runtimeFile('stream'),
       timers: runtimeFile('timers'),
       'node:timers': runtimeFile('timers'),
       fs: fsPath,

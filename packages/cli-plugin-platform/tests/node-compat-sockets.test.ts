@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, mock } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { DEFAULT_DEPS } from '../src/deps';
 import { hostInterfacesFromRequirements } from '../src/host-interface';
@@ -171,6 +172,33 @@ describe('node:net overlay', () => {
     socket.write('ping');
     expect(await echoed).toBe('ping');
     socket.end();
+    server.close();
+  });
+
+  it('pipes a socket into a writable like a Node stream', async () => {
+    const server = createServer((socket) => {
+      socket.pipe(socket);
+    });
+    server.listen(0, '127.0.0.1');
+    const port = server.address()?.port ?? 0;
+    const client = await new Promise<ReturnType<typeof createConnection>>((resolve, reject) => {
+      const connection = createConnection({ host: '127.0.0.1', port }, () => resolve(connection));
+      connection.once('error', reject);
+    });
+    const written: string[] = [];
+    const echoed = new Promise<string>((resolve) => {
+      const sink = new Writable({
+        write(chunk, _encoding, done) {
+          written.push(Buffer.from(chunk).toString());
+          resolve(written.join(''));
+          done();
+        },
+      });
+      client.pipe(sink);
+    });
+    client.write('piped');
+    expect(await echoed).toBe('piped');
+    client.end();
     server.close();
   });
 
@@ -402,10 +430,13 @@ describe('bundled node:net overlay', () => {
       entryPath,
       `
 import { createConnection, createServer } from 'node:net';
+import { Stream } from 'node:stream';
 
 export default async function echo(payload: string): Promise<string> {
   const server = createServer((socket) => {
-    socket.on('data', (chunk) => socket.write(chunk));
+    if (!(socket instanceof Stream)) throw new Error('net.Socket is not a Stream');
+    // Legacy Stream pipe, as mqtt pipes its connection.
+    socket.pipe(socket);
   });
   server.listen(0, '127.0.0.1');
   const port = server.address()?.port ?? 0;
