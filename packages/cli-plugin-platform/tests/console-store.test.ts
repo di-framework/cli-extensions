@@ -46,7 +46,7 @@ function detail(overrides: Partial<ApplicationDetail> = {}): ApplicationDetail {
     routeCount: 1,
     parts: [{ name: 'mesh-site', kind: 'component', lifetime: 'on-demand' }],
     routes: [{ id: 'r1', host: 'mesh.local', path: '/', enabled: true }],
-    environment: [{ key: 'MODE', value: 'prod' }],
+    environment: [{ key: 'MODE', value: 'prod', part: 'mesh-site' }],
     secrets: [{ name: 'token' }],
     backingServices: [],
     privateBindings: [{ name: 'objects', contract: 'wasmcloud:blobstore', bound: true }],
@@ -381,16 +381,25 @@ describe('console store changes', () => {
     const store = await started();
     await store.openApplication('mesh');
     route('PUT', '/api/applications/mesh/environment', ({ body }) => ({
-      body: { application: detail({ environment: [body as { key: string; value: string }] }) },
+      body: {
+        application: detail({
+          environment: [body as { key: string; value: string; part: string }],
+        }),
+      },
     }));
-    expect(await store.setEnvironment('LEVEL', 'debug')).toBe(true);
-    expect(store.application?.environment.map((entry) => entry.key)).toEqual(['LEVEL']);
+    expect(await store.setEnvironment('LEVEL', 'debug', 'mesh-site')).toBe(true);
+    expect(seen.at(-1)?.body).toEqual({ key: 'LEVEL', value: 'debug', part: 'mesh-site' });
+    expect(store.application?.environment.map((entry) => `${entry.part}/${entry.key}`)).toEqual([
+      'mesh-site/LEVEL',
+    ]);
+    expect(store.activity[0]?.text).toBe('Set LEVEL on mesh-site in mesh.');
 
-    route('DELETE', '/api/applications/mesh/environment/LEVEL', {
+    route('DELETE', '/api/applications/mesh/environment/mesh-site/LEVEL', {
       body: { application: detail({ environment: [] }) },
     });
-    expect(await store.deleteEnvironment('LEVEL')).toBe(true);
+    expect(await store.deleteEnvironment('LEVEL', 'mesh-site')).toBe(true);
     expect(store.application?.environment).toHaveLength(0);
+    expect(store.activity[0]?.text).toBe('Removed LEVEL from mesh-site in mesh.');
 
     route('POST', '/api/applications/mesh/secrets/token', { body: { name: 'token' } });
     expect(await store.reassignSecret('token', 's3cret')).toBe(true);
@@ -433,14 +442,14 @@ describe('console store changes', () => {
       status: 409,
       body: { error: 'MODE is managed by the platform.' },
     });
-    expect(await store.setEnvironment('MODE', 'dev')).toBe(false);
+    expect(await store.setEnvironment('MODE', 'dev', 'mesh-site')).toBe(false);
     expect(store.application?.environment[0]?.value).toBe('prod');
     expect(store.ui.error).toBe('MODE is managed by the platform.');
   });
 
   test('application changes need an open application', async () => {
     const store = await started();
-    expect(await store.setEnvironment('A', 'b')).toBe(false);
+    expect(await store.setEnvironment('A', 'b', 'mesh-site')).toBe(false);
     expect(await store.reassignSecret('token', 'value')).toBe(false);
   });
 

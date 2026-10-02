@@ -30,6 +30,8 @@ const Route = types.model('Route', {
 const EnvironmentEntry = types.model('EnvironmentEntry', {
   key: types.string,
   value: types.string,
+  /** The part (service or component) that has the variable. */
+  part: types.string,
 });
 
 const SecretEntry = types.model('SecretEntry', { name: types.string });

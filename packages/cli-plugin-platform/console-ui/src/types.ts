@@ -43,7 +43,7 @@ export type SignalView = {
 export type ApplicationDetail = ApplicationSummary & {
   parts: PartView[];
   routes: RouteView[];
-  environment: Array<{ key: string; value: string }>;
+  environment: Array<{ key: string; value: string; part: string }>;
   secrets: Array<{ name: string }>;
   backingServices: BackingBinding[];
   privateBindings: PrivateBinding[];

@@ -59,11 +59,15 @@ export function createClient(session: ClientSession) {
         'PATCH',
         { enabled },
       ),
-    setEnvironment: (name: string, key: string, value: string) =>
-      send<{ application: ApplicationDetail }>(`${app(name)}/environment`, 'PUT', { key, value }),
-    deleteEnvironment: (name: string, key: string) =>
+    setEnvironment: (name: string, key: string, value: string, part: string) =>
+      send<{ application: ApplicationDetail }>(`${app(name)}/environment`, 'PUT', {
+        key,
+        value,
+        part,
+      }),
+    deleteEnvironment: (name: string, key: string, part: string) =>
       send<{ application: ApplicationDetail }>(
-        `${app(name)}/environment/${encodeURIComponent(key)}`,
+        `${app(name)}/environment/${encodeURIComponent(part)}/${encodeURIComponent(key)}`,
         'DELETE',
       ),
     reassignSecret: (name: string, secret: string, value: string) =>
