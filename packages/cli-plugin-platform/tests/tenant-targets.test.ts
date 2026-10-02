@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { selectConsoleTenant } from '../src/console/run';
 import { runWasmcloudDeploy } from '../src/deploy';
 import { runWasmcloudDestroy } from '../src/destroy';
-import { parseDeployManifest } from '../src/manifest';
+import { loadDeployManifest, parseDeployManifest } from '../src/manifest';
 import { loadProject } from '../src/project';
 import { resolveConnection } from '../src/target';
 import { renderWorkloadManifest } from '../src/workload';
@@ -185,5 +186,70 @@ describe('tenant deployment targets', () => {
         ),
       ).toThrow('Kubernetes namespace');
     }
+  });
+});
+
+describe('tenant targets selected by default-target', () => {
+  function defaultTenantWorkspace() {
+    const workspace = makeWorkspace();
+    const kubeconfig = join(workspace.root, 'dev.kubeconfig');
+    writeFileSync(
+      join(workspace.root, 'di-framework.deploy.toml'),
+      `default-target = "dev"
+
+[targets.dev]
+kubeconfig = "${kubeconfig}"
+tenant = "meshtastic"
+registry = "registry.example.com/meshtastic"
+`,
+    );
+    return { ...workspace, kubeconfig };
+  }
+
+  function expectTenantScope(invocations: RunnerInvocation[], kubeconfig: string) {
+    const kubectl = invocations.filter((i) => i.command === 'kubectl');
+    expect(kubectl.length).toBeGreaterThan(0);
+    for (const invocation of kubectl) {
+      expect(invocation.args.slice(0, 4)).toEqual([
+        '--kubeconfig',
+        kubeconfig,
+        '--namespace',
+        'di-tenant-meshtastic',
+      ]);
+    }
+  }
+
+  it('deploys and destroys without --target into the derived namespace and host group', async () => {
+    const { root, greeter, kubeconfig } = defaultTenantWorkspace();
+    const deployed: RunnerInvocation[] = [];
+    const result = await runWasmcloudDeploy(
+      ['greeter'],
+      captureIo().io,
+      fakeDeps({ cwd: root, invocations: deployed }),
+    );
+    expectTenantScope(deployed, kubeconfig);
+    expect(result.data).toMatchObject({ target: 'dev', namespace: 'di-tenant-meshtastic' });
+    const manifest = readFileSync(join(greeter, '.di-framework/deploy/workload.yaml'), 'utf8');
+    expect(manifest).toContain('namespace: di-tenant-meshtastic');
+    expect(manifest).toContain('hostgroup: tenant-meshtastic');
+
+    const destroyed: RunnerInvocation[] = [];
+    await runWasmcloudDestroy(
+      ['greeter'],
+      captureIo().io,
+      fakeDeps({ cwd: root, invocations: destroyed }),
+    );
+    expectTenantScope(destroyed, kubeconfig);
+  });
+
+  it('opens the console on the default tenant target without --target', () => {
+    const { root } = defaultTenantWorkspace();
+    const tenant = selectConsoleTenant(loadDeployManifest(root, {}), undefined);
+    expect(tenant).toMatchObject({
+      name: 'dev',
+      tenant: 'meshtastic',
+      namespace: 'di-tenant-meshtastic',
+      hostgroup: 'tenant-meshtastic',
+    });
   });
 });

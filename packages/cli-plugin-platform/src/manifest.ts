@@ -27,6 +27,8 @@ export type ManagedTarget = {
 export type ExternalTarget = {
   kind: 'external';
   name: string;
+  /** Platform tenant this target deploys into; derives namespace and hostgroup when they are unset. */
+  tenant?: string;
   kubeconfig: string;
   namespace: string;
   registry: RegistryInput;
@@ -44,6 +46,24 @@ export type DeployManifest = {
   discovery: DiscoveryConfig;
   targets: Record<string, DeployTarget>;
 };
+
+/** Tenant names follow the platform's Tenant resource: a DNS label of at most 40 characters. */
+const TENANT_NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+const TENANT_NAME_MAX_LENGTH = 40;
+
+export function isTenantName(value: string): boolean {
+  return value.length <= TENANT_NAME_MAX_LENGTH && TENANT_NAME.test(value);
+}
+
+/** Workload namespace the platform creates for a tenant. */
+export function tenantNamespace(tenant: string): string {
+  return `di-tenant-${tenant}`;
+}
+
+/** Host group the platform creates for a tenant. */
+export function tenantHostgroup(tenant: string): string {
+  return `tenant-${tenant}`;
+}
 
 const ENV_TOKEN = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
@@ -211,6 +231,13 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
   const stack = optionalString(value.stack, `targets.${name}.stack`, manifestPath);
   const kubeconfig = optionalString(value.kubeconfig, `targets.${name}.kubeconfig`, manifestPath);
   const context = optionalString(value.context, `targets.${name}.context`, manifestPath);
+  const tenant = optionalString(value.tenant, `targets.${name}.tenant`, manifestPath);
+  if (tenant !== undefined && !isTenantName(tenant)) {
+    manifestInvalid(
+      `targets.${name}.tenant must be a platform tenant name: 1-40 lowercase letters, digits, and single hyphens, starting with a letter (got "${tenant}")`,
+      { manifestPath, target: name, tenant },
+    );
+  }
   const hostgroup = optionalString(value.hostgroup, `targets.${name}.hostgroup`, manifestPath);
   const storageHostgroup = optionalString(
     value['storage-hostgroup'],
@@ -241,6 +268,7 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     'stack',
     'kubeconfig',
     'context',
+    'tenant',
     'namespace',
     'registry',
     'hostgroup',
@@ -249,7 +277,7 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
   const unknown = Object.keys(value).filter((key) => !known.has(key));
   if (unknown.length > 0) {
     manifestInvalid(
-      `Target "${name}" has unsupported fields: ${unknown.join(', ')}. Managed targets accept platform and stack; external targets accept kubeconfig, context, namespace, registry, hostgroup, and storage-hostgroup.`,
+      `Target "${name}" has unsupported fields: ${unknown.join(', ')}. Managed targets accept platform and stack; external targets accept kubeconfig, context, tenant, namespace, registry, hostgroup, and storage-hostgroup.`,
       { manifestPath, target: name, fields: unknown },
     );
   }
@@ -260,6 +288,7 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
   const externalFields = [
     kubeconfig ? 'kubeconfig' : undefined,
     context ? 'context' : undefined,
+    tenant ? 'tenant' : undefined,
     hostgroup ? 'hostgroup' : undefined,
     storageHostgroup ? 'storage-hostgroup' : undefined,
     namespace ? 'namespace' : undefined,
@@ -268,7 +297,7 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
 
   if (managedFields.length > 0 && externalFields.length > 0) {
     manifestInvalid(
-      `Target "${name}" mixes managed-platform and kubeconfig fields (${[...managedFields, ...externalFields].join(', ')}). Use either platform (and optional stack), or kubeconfig + namespace + registry.`,
+      `Target "${name}" mixes managed-platform and kubeconfig fields (${[...managedFields, ...externalFields].join(', ')}). Use either platform (and optional stack), or kubeconfig + registry + tenant or namespace.`,
       { manifestPath, target: name },
     );
   }
@@ -284,15 +313,25 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     return { kind: 'managed', name, platform, stack: stack ?? 'dev' };
   }
 
-  if (kubeconfig !== undefined || namespace !== undefined || registry !== undefined) {
+  if (
+    kubeconfig !== undefined ||
+    tenant !== undefined ||
+    namespace !== undefined ||
+    registry !== undefined
+  ) {
+    // Explicit namespace/hostgroup win over the values a tenant derives.
+    const resolvedNamespace =
+      namespace ?? (tenant === undefined ? undefined : tenantNamespace(tenant));
+    const resolvedHostgroup =
+      hostgroup ?? (tenant === undefined ? undefined : tenantHostgroup(tenant));
     const missing = [
       kubeconfig === undefined ? 'kubeconfig' : undefined,
-      namespace === undefined ? 'namespace' : undefined,
+      resolvedNamespace === undefined ? 'tenant or namespace' : undefined,
       registry === undefined ? 'registry' : undefined,
     ].filter((field): field is string => field !== undefined);
     if (missing.length > 0) {
       manifestInvalid(
-        `Target "${name}" is incomplete; external targets require kubeconfig, namespace, and registry. Missing: ${missing.join(', ')}.`,
+        `Target "${name}" is incomplete; external targets require kubeconfig, registry, and either tenant (deploys into the platform tenant's di-tenant-<tenant> namespace and tenant-<tenant> host group) or namespace. Missing: ${missing.join(', ')}.`,
         { manifestPath, target: name, missing },
       );
     }
@@ -300,16 +339,17 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
       kind: 'external',
       name,
       kubeconfig: kubeconfig as string,
-      namespace: namespace as string,
+      namespace: resolvedNamespace as string,
       registry: registry as RegistryInput,
       context,
-      ...(hostgroup ? { hostgroup } : {}),
+      ...(tenant ? { tenant } : {}),
+      ...(resolvedHostgroup ? { hostgroup: resolvedHostgroup } : {}),
       ...(storageHostgroup ? { storageHostgroup } : {}),
     };
   }
 
   manifestInvalid(
-    `Target "${name}" is empty. Set platform (and optional stack) for a managed Pulumi platform, or kubeconfig, namespace, and registry for an external cluster.`,
+    `Target "${name}" is empty. Set platform (and optional stack) for a managed Pulumi platform, or kubeconfig, registry, and tenant (or namespace) for an external cluster.`,
     { manifestPath, target: name },
   );
 }

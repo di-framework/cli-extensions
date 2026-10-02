@@ -529,8 +529,8 @@ describe('console command options', () => {
       {},
     );
     expect(selectConsoleTenant(tenant, 'warehouse').namespace).toBe('di-tenant-warehouse');
-    expect(() => selectConsoleTenant(tenant, 'local')).toThrow('tenant kubeconfig');
-    expect(() => selectConsoleTenant(tenant, undefined)).toThrow('tenant kubeconfig');
+    expect(() => selectConsoleTenant(tenant, 'local')).toThrow("tenant user's kubeconfig");
+    expect(() => selectConsoleTenant(tenant, undefined)).toThrow("tenant user's kubeconfig");
   });
 });
 

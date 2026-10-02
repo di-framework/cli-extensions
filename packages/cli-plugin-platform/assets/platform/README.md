@@ -11,7 +11,7 @@ This generated Pulumi project provisions platform resources only:
 Application components, Services, and WorkloadDeployments remain owned by
 `di-framework platform deploy`. No application name is stored here.
 
-`di-framework platform cluster up local --yes` runs `pulumi install`
+`di-framework platform cluster up --yes` runs `pulumi install`
 before selecting the stack, so this directory does not need a manual package
 manager install and does not need to belong to a root workspace.
 
@@ -56,11 +56,14 @@ registry content.
 From the workspace root:
 
 ```sh
-di-framework platform cluster up local --yes
+di-framework platform cluster up --yes
 di-framework platform deploy <configured-project-name>
 di-framework platform destroy <configured-project-name>
-di-framework platform cluster destroy local --yes
+di-framework platform cluster destroy --yes
 ```
+
+These use `default-target` (`local` after `di-framework platform cluster init`). Add
+`--target <name>` to choose another target.
 
 Send the configured project name as the HTTP `Host` header, for example:
 
@@ -96,7 +99,7 @@ config:
           role: viewer
 ```
 
-Run the existing `di-framework platform cluster up local --yes` command.
+Run the existing `di-framework platform cluster up --yes` command.
 Pulumi installs the cluster-scoped `Tenant` and `User` CRDs in
 `platform.di-framework.dev/v1alpha1`, admission policies, a TypeScript controller,
 and the declared custom resources. It waits for their `Ready` conditions. There
@@ -146,8 +149,21 @@ certificate/key. Kubernetes may shorten the requested token lifetime. Tokens are
 never stored in User status or Pulumi outputs. The `users` output identifies the
 ServiceAccount; `tenants` identifies the namespaces and host group.
 
-Configure a deployment target with the user's kubeconfig,
-`namespace = "di-tenant-warehouse"` and `hostgroup = "tenant-warehouse"`.
+Configure a deployment target with the user's kubeconfig and `tenant = "warehouse"`,
+which selects `namespace = "di-tenant-warehouse"` and `hostgroup = "tenant-warehouse"`:
+
+```toml
+default-target = "alice"
+
+[targets.alice]
+kubeconfig = "${ALICE_KUBECONFIG}"
+tenant = "warehouse"
+registry = "<registry>/warehouse"
+```
+
+That target is a local deploy destination; the tenant is the isolation unit declared
+here. Each user of a tenant can have their own target.
+
 Port-forward `service/di-http` in `di-runtime-warehouse` to reach its HTTP routes.
 The default platform HTTP entrypoint continues to target the default host group.
 For shared tenant keyvalue storage, reference the controller-managed ConfigMap

@@ -7,7 +7,8 @@ export type AppCommandOptions = {
 };
 
 export type PlatformCommandOptions = {
-  target: string;
+  /** Omitted when the command should use default-target. */
+  target?: string;
   yes: boolean;
 };
 
@@ -69,10 +70,16 @@ export function parsePlatformCommandArgs(
   let target: string | undefined;
   let yes = false;
 
-  for (const token of args) {
+  for (let position = 0; position < args.length; position++) {
+    const token = args[position] ?? '';
     if (token === '--yes') {
       if (yes) invalidUsage(`Option may be provided only once: ${token}`, token);
       yes = true;
+      continue;
+    }
+    if (token === '--target') {
+      if (target !== undefined) invalidUsage(`Option may be provided only once: ${token}`, token);
+      target = readOptionValue(args, ++position, token);
       continue;
     }
     if (token.startsWith('--')) {
@@ -84,8 +91,5 @@ export function parsePlatformCommandArgs(
     target = token;
   }
 
-  if (target === undefined) {
-    invalidUsage(`Missing target name for ${command}`, command, { command });
-  }
-  return { target, yes };
+  return { ...(target === undefined ? {} : { target }), yes };
 }

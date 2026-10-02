@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   findDeployManifest,
   interpolateEnv,
+  isTenantName,
   loadDeployManifest,
   parseDeployManifest,
 } from '../src/manifest';
@@ -202,6 +203,81 @@ insecure = true
       'WASMCLOUD_DEPLOY_MANIFEST_INVALID',
       2,
     );
+  });
+
+  it('derives namespace and hostgroup from a tenant; explicit values win', () => {
+    const path = '/workspace/di-framework.deploy.toml';
+    const manifest = parseDeployManifest(
+      path,
+      `default-target = "dev"
+
+[targets.dev]
+kubeconfig = "/tmp/dev.kubeconfig"
+tenant = "meshtastic"
+registry = "registry.example.com/meshtastic"
+
+[targets.ci]
+kubeconfig = "/tmp/ci.kubeconfig"
+tenant = "meshtastic"
+namespace = "di-tenant-meshtastic-ci"
+hostgroup = "tenant-meshtastic-ci"
+registry = "registry.example.com/ci"
+`,
+      {},
+    );
+    expect(manifest.targets.dev).toEqual({
+      kind: 'external',
+      name: 'dev',
+      kubeconfig: '/tmp/dev.kubeconfig',
+      tenant: 'meshtastic',
+      namespace: 'di-tenant-meshtastic',
+      hostgroup: 'tenant-meshtastic',
+      registry: 'registry.example.com/meshtastic',
+      context: undefined,
+    });
+    expect(manifest.targets.ci).toMatchObject({
+      tenant: 'meshtastic',
+      namespace: 'di-tenant-meshtastic-ci',
+      hostgroup: 'tenant-meshtastic-ci',
+    });
+  });
+
+  it('validates tenant names like the platform and explains a missing tenant or namespace', () => {
+    const path = '/workspace/di-framework.deploy.toml';
+    const target = (fields: string) =>
+      `[targets.dev]\nkubeconfig = "/tmp/kube"\nregistry = "r.example.com/x"\n${fields}`;
+    expect(isTenantName('a'.repeat(40))).toBe(true);
+    for (const tenant of [
+      '',
+      'Mesh',
+      '1mesh',
+      'mesh-',
+      'mesh--tastic',
+      'mesh_tastic',
+      'a'.repeat(41),
+    ]) {
+      expect(isTenantName(tenant)).toBe(false);
+      if (tenant === '') continue;
+      expect(() => parseDeployManifest(path, target(`tenant = "${tenant}"\n`), {})).toThrow(
+        'targets.dev.tenant must be a platform tenant name',
+      );
+    }
+    expect(() => parseDeployManifest(path, target(''), {})).toThrow(
+      'external targets require kubeconfig, registry, and either tenant',
+    );
+    expect(() => parseDeployManifest(path, target(''), {})).toThrow(
+      'Missing: tenant or namespace.',
+    );
+    expect(() => parseDeployManifest(path, `[targets.dev]\ntenant = "meshtastic"\n`, {})).toThrow(
+      'Missing: kubeconfig, registry.',
+    );
+    expect(() =>
+      parseDeployManifest(
+        path,
+        `[targets.dev]\nplatform = "deploy/platform"\ntenant = "meshtastic"\n`,
+        {},
+      ),
+    ).toThrow('mixes managed-platform and kubeconfig fields (platform, tenant)');
   });
 
   it('rejects malformed TOML', () => {

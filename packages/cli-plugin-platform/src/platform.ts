@@ -9,6 +9,7 @@ import { isNamespace } from './namespace';
 import { resolveInsideRoot } from './paths';
 import { pulumiEnvironment, runPulumi } from './pulumi';
 import { materializeRegistry, type RegistryInput, type RegistryLocation } from './registry';
+import { resolveTarget } from './target';
 
 export const PLATFORM_OUTPUT_SCHEMA_VERSION = 2;
 
@@ -132,17 +133,9 @@ export function resolvePlatformDirectory(
   return resolved.path;
 }
 
-function loadManagedPlatform(deps: WasmcloudDeps, targetName: string) {
+function loadManagedPlatform(deps: WasmcloudDeps, targetName: string | undefined) {
   const manifest = loadDeployManifest(deps.cwd(), deps.env);
-  const target = manifest.targets[targetName];
-  if (target === undefined) {
-    throw new CommandFailure(
-      'WASMCLOUD_TARGET_NOT_FOUND',
-      `Unknown target "${targetName}". Known targets: ${Object.keys(manifest.targets).join(', ')}`,
-      2,
-      { target: targetName, targets: Object.keys(manifest.targets), manifestPath: manifest.path },
-    );
-  }
+  const target = resolveTarget(manifest, targetName);
   if (target.kind !== 'managed') {
     throw new CommandFailure(
       'WASMCLOUD_TARGET_INVALID',

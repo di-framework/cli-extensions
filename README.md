@@ -54,29 +54,36 @@ With Docker running and Pulumi, kubectl, and ORAS installed, run the following
 from the workspace root containing the `greeter` project:
 
 ```sh
-di-framework platform cluster init            # generate deploy/platform and a local target
-di-framework platform cluster up local --yes  # provision the platform
-di-framework platform deploy greeter --target local
+di-framework platform cluster init      # generate deploy/platform and the default local target
+di-framework platform cluster up --yes  # provision the platform
+di-framework platform deploy greeter
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
 The generated `local` target is the platform admin credential. The console is a separate
-command for a tenant target (`kubeconfig`, `namespace`, and `hostgroup`), described in the
-[platform guide](packages/cli-plugin-platform/README.md#console). The generated
-`di-framework.deploy.toml` describes deployment targets. Named
+command for a tenant target, described in the
+[platform guide](packages/cli-plugin-platform/README.md#console). A target is a local deploy
+destination in `di-framework.deploy.toml` (credential, namespace, host group, registry); a tenant
+is the platform's isolation unit (namespaces `di-tenant-<t>` and `di-runtime-<t>`, host group
+`tenant-<t>`, RBAC). One tenant can have several targets, and `tenant = "<t>"` points a target at
+one. See [Targets and tenants](packages/cli-plugin-platform/README.md#targets-and-tenants).
+The generated `di-framework.deploy.toml` describes deployment targets. Named
 projects are discovered by their configured `name` within the workspace. The
 HTTP example uses the generated platform's default port.
 
 To remove the application and then tear down the local platform:
 
 ```sh
-di-framework platform destroy greeter --target local
-di-framework platform cluster destroy local --yes
+di-framework platform destroy greeter
+di-framework platform cluster destroy --yes
 ```
+
+Every command uses `default-target` from `di-framework.deploy.toml` unless you pass
+`--target <name>`.
 
 For deployment to an existing cluster, configure a target as described in the
 [deployment manifest guide](packages/cli-plugin-platform/README.md#deployment-manifest),
-then select it explicitly:
+then select it explicitly (or make it the `default-target`):
 
 ```sh
 di-framework platform deploy greeter --target development

@@ -50,12 +50,32 @@ describe('parsePlatformInitArgs', () => {
 });
 
 describe('parsePlatformCommandArgs', () => {
-  it('requires a target name', () => {
+  it('accepts an optional positional or --target name', () => {
     expect(parsePlatformCommandArgs(['local', '--yes'], 'platform cluster up')).toEqual({
       target: 'local',
       yes: true,
     });
-    expectFailure(() => parsePlatformCommandArgs([], 'platform cluster up'), 'INVALID_USAGE', 2);
+    expect(parsePlatformCommandArgs(['--target', 'local'], 'platform cluster up')).toEqual({
+      target: 'local',
+      yes: false,
+    });
+    expect(parsePlatformCommandArgs([], 'platform cluster up')).toEqual({ yes: false });
+    expect(parsePlatformCommandArgs(['--yes'], 'platform cluster up')).toEqual({ yes: true });
+    expectFailure(
+      () => parsePlatformCommandArgs(['--target', 'a', '--target', 'b'], 'platform cluster up'),
+      'INVALID_USAGE',
+      2,
+    );
+    expectFailure(
+      () => parsePlatformCommandArgs(['--target'], 'platform cluster up'),
+      'INVALID_USAGE',
+      2,
+    );
+    expectFailure(
+      () => parsePlatformCommandArgs(['--target', 'a', 'b'], 'platform cluster up'),
+      'INVALID_USAGE',
+      2,
+    );
     expectFailure(
       () => parsePlatformCommandArgs(['local', 'extra'], 'platform cluster up'),
       'INVALID_USAGE',
