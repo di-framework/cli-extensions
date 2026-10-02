@@ -344,8 +344,11 @@ registry = "registry.example.com/warehouse"
 
 ```bash
 di-framework platform console
-di-framework platform console --port 8787
+di-framework platform console --port 8790
 ```
+
+Without `--port` the system picks a free port. The console prints `Console listening on <url>` with
+the real address as soon as it is serving, also when stdout is redirected to a file.
 
 `--target` defaults to `default-target`. The target must be a tenant credential (a tenant user's
 `kubeconfig` with `tenant`, or with `namespace` and `hostgroup`), not the platform admin

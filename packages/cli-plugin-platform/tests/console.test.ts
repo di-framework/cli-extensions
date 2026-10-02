@@ -517,12 +517,14 @@ describe('console catalog', () => {
 
 describe('console command options', () => {
   it('binds loopback and requires a tenant credential', () => {
-    expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 8787 });
+    expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 0 });
+    expect(parseConsoleArgs(['--port', '0']).port).toBe(0);
     expect(parseConsoleArgs(['--host', 'localhost', '--port', '8791']).host).toBe('localhost');
     expect(parseConsoleArgs(['--host', '::1']).host).toBe('::1');
     expect(() => parseConsoleArgs(['--host', '0.0.0.0'])).toThrow(CommandFailure);
     expect(() => parseConsoleArgs(['--host', '10.1.1.8'])).toThrow('loopback');
-    expect(() => parseConsoleArgs(['--port', '0'])).toThrow(CommandFailure);
+    expect(() => parseConsoleArgs(['--port', '-1'])).toThrow(CommandFailure);
+    expect(() => parseConsoleArgs(['--port', '65536'])).toThrow(CommandFailure);
     const tenant = parseDeployManifest(
       '/workspace/di-framework.deploy.toml',
       `default-target = "local"\n[targets.local]\nplatform = "deploy/platform"\n[targets.warehouse]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "di-tenant-warehouse"\nhostgroup = "tenant-warehouse"\nregistry = "registry.example.com/warehouse"\n`,
