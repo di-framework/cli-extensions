@@ -345,6 +345,7 @@ async function routeApplication(
     const input = parseBind(await readBody(request), name);
     const loaded = await loadApplications(options);
     requireApplication(loaded.applications, name);
+    if (input.capability === 'egress') input.workload = egressWorkload(membersOf(loaded, name));
     await options.cluster.bindService(loaded.connection, input);
     sendJson(response, 200, { application: await present(options, name) });
     return;
@@ -545,6 +546,13 @@ function parseServiceCreate(body: unknown, target: string): ServiceCreateInput {
       'Service name must use lowercase letters, digits, and hyphens.',
     );
   }
+  if (record.type === 'egress') {
+    throw new ConsoleError(
+      400,
+      'INVALID_SERVICE',
+      'Egress services need destinations; create them with di-framework platform service create egress.',
+    );
+  }
   const input: ServiceCreateInput = { target, type: record.type, name: record.name };
   for (const key of ['className', 'memory', 'storage', 'cpu'] as const) {
     const value = record[key];
@@ -562,6 +570,19 @@ function parseServiceCreate(body: unknown, target: string): ServiceCreateInput {
     input[key] = value;
   }
   return input;
+}
+
+/** Egress is granted to one WorkloadDeployment, so only a single-part application can bind it here. */
+export function egressWorkload(members: readonly WorkloadDocument[]): string {
+  const only = members.length === 1 ? members[0]?.metadata?.name : undefined;
+  if (only === undefined) {
+    throw new ConsoleError(
+      409,
+      'EGRESS_PER_PART',
+      'Egress is granted per part; set allowedIpNameLookups in that part and deploy it.',
+    );
+  }
+  return only;
 }
 
 function parseBind(body: unknown, workload: string): BindInput {

@@ -82,9 +82,10 @@ to the project configuration, for example:
 }
 ```
 
-The deployer writes these names under the component's
+On a target without a `hostgroup`, the deployer writes these names under the component's
 `localResources.allowedIpNameLookups`. Omission keeps the host's default denial;
-it does not implicitly grant unrestricted DNS access.
+it does not implicitly grant unrestricted DNS access. Tenant targets request egress from
+the platform instead; see [Egress on tenant targets](#egress-on-tenant-targets).
 
 Guest JS keeps the framework's Node contract. The bundler runs [unenv](https://github.com/unjs/unenv)
 `nodeCompat` plus a wasmCloud preset: `node:path`, `Buffer`, and the rest of
@@ -531,3 +532,49 @@ container becomes its own object-store bucket. An unnamed blobstore without
 neither shared between components nor kept across restarts, so a workload whose
 members share objects should bind a created service. `serviceName` stays
 Postgres-only.
+
+### Egress on tenant targets
+
+Tenant credentials cannot write `allowedHosts` or `allowedIpNameLookups` into a
+WorkloadDeployment. On a tenant target (one with a `hostgroup`), `deploy` turns the
+project's `allowedIpNameLookups` into a platform request instead:
+
+- BackingService `<deployment>-egress` with `spec.type: egress` and
+  `spec.destinations` set to the names, and
+- ServiceBinding `<deployment>-egress` with `capability: egress`,
+  `bindingName: egress`, and `workloadName: <deployment>`.
+
+`<deployment>` is the WorkloadDeployment name. Deploys update the destinations when the
+names change, and remove both resources when the setting is removed or the application is
+destroyed. The resources carry `app.kubernetes.io/managed-by: di-framework`; deploy refuses
+to adopt same-named resources it did not create. `"*"` cannot be requested on a tenant
+target. The WorkloadDeployment itself carries neither field: once the platform approves
+the destinations, its controller patches `allowedHosts` and `allowedIpNameLookups` in and
+opens the tenant host's network policy for the approved ports.
+
+Approval comes from the egress class policy (`egressAllowedDestinations` in the platform's
+Pulumi config, empty by default). After the rollout, deploy prints the approved `host:port`
+entries, or a note when the service is `NotApproved` or not yet Ready. The deploy itself
+still succeeds; outbound connections stay blocked until a platform admin allows the
+destination.
+
+You can also create and bind an egress service yourself:
+
+```sh
+di-framework platform service create egress outbound \
+  --destination api.example.com:443 --destination '*.example.org'
+di-framework platform service get outbound    # Destinations / Approved / Ready reason
+```
+
+Each destination is `host`, `*.suffix`, `host:port`, or `*.suffix:port`; a destination
+without a port is approved for the policy ports that match its name. Bind it from the
+console's Bindings tab (single-part applications only, since egress is granted per
+WorkloadDeployment). `list`, `get`, and `delete` work for egress like the other types; the
+console create form does not offer egress because it does not collect destinations.
+
+**TLS.** If the built component imports `wasi:tls` and the target is a tenant
+(`hostgroup = "tenant-<t>"`), deploy reads the image of the host pods labelled
+`wasmcloud.com/hostgroup=tenant-<t>` in `di-runtime-<t>`. Unless the image tag contains
+`wasi-tls` (for example `…/wash:2.8.0-wasi-tls`), it warns that TLS connections will fail;
+stock `ghcr.io/wasmcloud/wash:<version>` images have no `wasi:tls` provider. The check
+never blocks the deploy and stays silent when the pods cannot be read.

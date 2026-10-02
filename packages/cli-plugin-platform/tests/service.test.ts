@@ -9,6 +9,7 @@ import {
   buildBackingServiceManifest,
   DEFAULT_SERVICE_CLASSES,
   isBackingServiceName,
+  isEgressDestination,
   parseServiceCreateArgs,
   parseServiceListArgs,
   parseServiceNameArgs,
@@ -167,7 +168,8 @@ describe('service argument parsing', () => {
     expect(isBackingServiceName('stock')).toBe(true);
     expect(isBackingServiceName('Stock')).toBe(false);
     expect(isBackingServiceName('a'.repeat(41))).toBe(false);
-    expect(SERVICE_TYPES).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres']);
+    expect(SERVICE_TYPES).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress']);
+    expect(DEFAULT_SERVICE_CLASSES.egress).toBe('egress-public');
     expect(DEFAULT_SERVICE_CLASSES.blobstore).toBe('blobstore-nats');
     expect(DEFAULT_SERVICE_CLASSES.keyvalue).toBe('keyvalue-redis');
   });
@@ -809,5 +811,144 @@ describe('service edge cases for coverage', () => {
         status: { endpoint: { host: 'h', port: 4222 } },
       }).className,
     ).toBe('messaging-nats');
+  });
+});
+
+describe('egress backing services', () => {
+  it('parses a positional name and repeated destinations', () => {
+    expect(
+      parseServiceCreateArgs([
+        'egress',
+        'outbound',
+        '--destination',
+        'api.example.com',
+        '--destination=*.example.org:443',
+      ]),
+    ).toMatchObject({
+      type: 'egress',
+      name: 'outbound',
+      destinations: ['api.example.com', '*.example.org:443'],
+    });
+    expect(() => parseServiceCreateArgs(['egress', 'a', 'b'])).toThrow(/Unexpected argument: b/);
+  });
+
+  it('validates destinations', () => {
+    for (const ok of ['api.example.com', '*.example.org', 'api.example.com:443', '10.0.0.1:1'])
+      expect(isEgressDestination(ok)).toBe(true);
+    for (const bad of ['*', 'API.example.com', 'a.example.com:0', 'a.example.com:70000', 'x:']) {
+      expect(isEgressDestination(bad)).toBe(false);
+    }
+    expect(
+      isEgressDestination(
+        `${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.${'d'.repeat(60)}.${'e'.repeat(60)}.com`,
+      ),
+    ).toBe(false);
+  });
+
+  it('creates an egress BackingService with destinations and the egress-public class', async () => {
+    const { root } = makeWorkspace();
+    let capturedManifest = '';
+    const deps = serviceDeps({ cwd: root });
+    const original = deps.runCaptured;
+    deps.runCaptured = async (command, args, options) => {
+      if (command === 'kubectl' && args.includes('create')) {
+        const path = args[args.indexOf('-f') + 1];
+        if (path) capturedManifest = readFileSync(path, 'utf8');
+      }
+      return original(command, args, options);
+    };
+    const result = await runWasmcloudServiceCreate(
+      ['egress', 'outbound', '--destination', 'api.example.com:443', '--target=development'],
+      captureIo().io,
+      deps,
+    );
+    expect(result.data).toMatchObject({
+      type: 'egress',
+      className: 'egress-public',
+      destinations: ['api.example.com:443'],
+    });
+    expect(JSON.parse(capturedManifest)).toEqual({
+      apiVersion: BACKING_SERVICE_API_VERSION,
+      kind: BACKING_SERVICE_KIND,
+      metadata: { name: 'outbound' },
+      spec: { type: 'egress', destinations: ['api.example.com:443'] },
+    });
+  });
+
+  it('rejects missing, invalid, and misplaced destination options', async () => {
+    const { root } = makeWorkspace();
+    const create = (args: string[]) =>
+      runWasmcloudServiceCreate(
+        [...args, '--target=development'],
+        captureIo().io,
+        serviceDeps({ cwd: root }),
+      );
+    await expect(create(['egress', 'outbound'])).rejects.toThrow(/Missing required --destination/);
+    await expect(create(['egress', 'outbound', '--destination=*'])).rejects.toThrow(
+      /Invalid destination "\*"/,
+    );
+    await expect(
+      create(['egress', 'outbound', '--destination=a.example.com', '--memory=1Gi']),
+    ).rejects.toThrow(/no sizing or deletion-policy/);
+    await expect(
+      create(['egress', 'outbound', '--destination=a.example.com', '--deletion-policy=Delete']),
+    ).rejects.toThrow(/no sizing or deletion-policy/);
+    await expect(create(['keyvalue', 'cache', '--destination=a.example.com'])).rejects.toThrow(
+      /only to egress services/,
+    );
+  });
+
+  it('shows destinations and approvals, and skips retention notes on delete', async () => {
+    const egress = {
+      metadata: { name: 'outbound', namespace: 'wasmcloud' },
+      spec: { type: 'egress', destinations: ['api.example.com'] },
+      status: {
+        approved: ['api.example.com:443'],
+        conditions: [{ type: 'Ready', status: 'True' }],
+      },
+    };
+    expect(summarizeService(egress)).toMatchObject({
+      className: 'egress-public',
+      destinations: ['api.example.com'],
+      approved: ['api.example.com:443'],
+    });
+    const { root } = makeWorkspace();
+    const deps = serviceDeps({
+      cwd: root,
+      capturedStdout: {
+        'kubectl get backingservice': JSON.stringify(egress),
+        'kubectl get backingservices': JSON.stringify({ items: [egress] }),
+      },
+    });
+    const list = await runWasmcloudServiceList(['--target=development'], captureIo().io, deps);
+    expect(list.text).toMatch(/outbound\s+egress\s+egress-public\s+True\s+api\.example\.com/);
+    const got = await runWasmcloudServiceGet(
+      ['outbound', '--target=development'],
+      captureIo().io,
+      deps,
+    );
+    expect(got.text).toContain('Destinations: api.example.com');
+    expect(got.text).toContain('Approved: api.example.com:443');
+    const pending = summarizeService({ ...egress, status: { approved: [] } });
+    expect(pending.approved).toEqual([]);
+    const pendingDeps = serviceDeps({
+      cwd: root,
+      capturedStdout: {
+        'kubectl get backingservice': JSON.stringify({ ...egress, status: { approved: [] } }),
+      },
+    });
+    const pendingGet = await runWasmcloudServiceGet(
+      ['outbound', '--target=development'],
+      captureIo().io,
+      pendingDeps,
+    );
+    expect(pendingGet.text).toContain('Approved: -');
+    const deleted = await runWasmcloudServiceDelete(
+      ['outbound', '--target=development'],
+      captureIo().io,
+      deps,
+    );
+    expect(deleted.data).not.toHaveProperty('deletionPolicy');
+    expect(deleted.text).toBe('Deleted BackingService outbound from wasmcloud.');
   });
 });

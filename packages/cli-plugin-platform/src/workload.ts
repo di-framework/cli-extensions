@@ -6,6 +6,13 @@ import { discoverActors } from './actors';
 import { type BindingRecord, discoverBindings, requirementsFromBindings } from './bindings';
 import { type DiscoveredCronJob, discoverScheduledJobs } from './cron';
 import type { WasmcloudDeps } from './deps';
+import {
+  applyWorkloadEgress,
+  removeWorkloadEgress,
+  reportEgressStatus,
+  usesPlatformEgress,
+  warnIfTenantHostLacksTls,
+} from './egress';
 import { hostInterfacesFromRequirements, renderHostInterfacesYaml } from './host-interface';
 import { captureKubectl, runKubectl } from './kubernetes';
 import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings';
@@ -251,6 +258,8 @@ spec:
   }
 
   const localResourcesLines: string[] = [];
+  // Tenant admission rejects these fields; the platform's egress binding writes them.
+  const ipNameLookups = usesPlatformEgress(connection) ? undefined : project.allowedIpNameLookups;
   const envKeys = Object.keys(environment).sort();
   if (envKeys.length > 0 || controlSecretName !== undefined) {
     localResourcesLines.push('          localResources:');
@@ -265,7 +274,7 @@ spec:
       localResourcesLines.push('              secretFrom:');
       localResourcesLines.push(`                - name: ${controlSecretName}`);
     }
-  } else if (project.allowedIpNameLookups !== undefined) {
+  } else if (ipNameLookups !== undefined) {
     localResourcesLines.push('          localResources:');
   }
 
@@ -275,10 +284,8 @@ spec:
     localResourcesLines.push(`                mountPath: ${mountPath}`);
   }
 
-  if (project.allowedIpNameLookups !== undefined) {
-    localResourcesLines.push(
-      `            allowedIpNameLookups: ${JSON.stringify(project.allowedIpNameLookups)}`,
-    );
+  if (ipNameLookups !== undefined) {
+    localResourcesLines.push(`            allowedIpNameLookups: ${JSON.stringify(ipNameLookups)}`);
   }
 
   // A long-lived wasi:cli/run program is a WorkloadService: wash runs it only from
@@ -506,7 +513,10 @@ export async function applyWorkload(
       direction: 'export',
       source: 'workload-service',
     });
+  await warnIfTenantHostLacksTls(project, connection, io, deps);
   const associations = await applyManagedBindings(project, connection, bindings, deps);
+  const egress = await applyWorkloadEgress(project, connection, deps);
+  if (egress !== undefined) associations.add(egress);
   await assertStorageOwnership(project, connection, deps, {
     hasActors,
     hasQueues: queueHandlers.length > 0,
@@ -533,6 +543,8 @@ export async function applyWorkload(
   await runKubectl(deps, connection, ['apply', '-f', path], project.projectRoot);
   await waitForReady(project, connection, deps, io);
   await cleanupManagedBindings(project, connection, associations, deps);
+  if (egress === undefined) await removeWorkloadEgress(project, connection, deps);
+  else await reportEgressStatus(project, connection, io, deps);
   return path;
 }
 
@@ -599,6 +611,7 @@ export async function deleteWorkload(
     project.projectRoot,
   );
   await cleanupManagedBindings(project, connection, new Set(), deps);
+  await removeWorkloadEgress(project, connection, deps);
 }
 
 export async function waitForReady(

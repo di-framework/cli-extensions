@@ -14,7 +14,7 @@ export const BACKING_SERVICE_KIND = 'BackingService';
 export const BACKING_SERVICE_RESOURCE = 'backingservices.platform.di-framework.dev';
 export const BACKING_SERVICE_CLASS_RESOURCE = 'backingserviceclasses.platform.di-framework.dev';
 
-export const SERVICE_TYPES = ['keyvalue', 'messaging', 'blobstore', 'postgres'] as const;
+export const SERVICE_TYPES = ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'] as const;
 export type ServiceType = (typeof SERVICE_TYPES)[number];
 
 export const DEFAULT_SERVICE_CLASSES = {
@@ -22,6 +22,7 @@ export const DEFAULT_SERVICE_CLASSES = {
   messaging: 'messaging-nats',
   blobstore: 'blobstore-nats',
   postgres: 'postgres-dedicated',
+  egress: 'egress-public',
 } as const satisfies Record<ServiceType, string>;
 
 export const DEFAULT_SERVICE_PROVIDERS = {
@@ -29,6 +30,7 @@ export const DEFAULT_SERVICE_PROVIDERS = {
   messaging: 'nats',
   blobstore: 'nats',
   postgres: 'postgres',
+  egress: 'platform',
 } as const satisfies Record<ServiceType, string>;
 
 export const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
@@ -36,6 +38,9 @@ export const WAIT_POLL_INTERVAL_MS = 2_000;
 
 const NAME_PATTERN = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const QUANTITY_PATTERN = /^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$/;
+/** `host`, `*.suffix`, optionally with `:port`; matches the BackingService egress schema. */
+const DESTINATION_PATTERN =
+  /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([0-9]{1,5}))?$/;
 const DELETION_POLICIES = ['Retain', 'Delete'] as const;
 export type DeletionPolicy = (typeof DELETION_POLICIES)[number];
 
@@ -51,6 +56,8 @@ export type ServiceCreateOptions = {
   className?: string;
   parameters?: ServiceSizingParameters;
   deletionPolicy?: DeletionPolicy;
+  /** Egress only: hosts the workload may reach. */
+  destinations?: string[];
   target?: string;
   namespace?: string;
   context?: string;
@@ -85,9 +92,11 @@ type BackingServiceDocument = {
     className?: string;
     parameters?: ServiceSizingParameters;
     deletionPolicy?: string;
+    destinations?: string[];
   };
   status?: {
     conditions?: ReadyCondition[];
+    approved?: string[];
     endpoint?: { host?: string; port?: number; capability?: string };
     classRef?: { name?: string };
     runtimeNamespace?: string;
@@ -104,10 +113,19 @@ export type ServiceSummary = {
   message?: string;
   endpoint?: { host: string; port: number; capability: string };
   deletionPolicy?: string;
+  destinations?: string[];
+  approved?: string[];
 };
 
 export function isServiceType(value: string): value is ServiceType {
   return (SERVICE_TYPES as readonly string[]).includes(value);
+}
+
+/** An egress destination: `host`, `*.suffix`, `host:port`, or `*.suffix:port`. */
+export function isEgressDestination(value: string): boolean {
+  const match = DESTINATION_PATTERN.exec(value);
+  if (match === null || value.length > 260) return false;
+  return match[1] === undefined || (Number(match[1]) >= 1 && Number(match[1]) <= 65535);
 }
 
 /** DNS-label rules aligned with the BackingService CRD metadata.name schema (max 40). */
@@ -122,8 +140,10 @@ export function serviceTypeDiscoveryText(): string {
     '  messaging   default class messaging-nats',
     '  blobstore   default class blobstore-nats',
     '  postgres    default class postgres-dedicated',
+    '  egress      default class egress-public (needs --destination)',
     '',
     'Usage: di-framework platform service create <type> --name=<name> [--class=<class>]',
+    '       di-framework platform service create egress <name> --destination <host[:port]> [--destination …]',
     'Discover classes: di-framework platform service classes',
   ];
   return `${lines.join('\n')}\n`;
@@ -135,8 +155,10 @@ export function buildBackingServiceManifest(options: {
   className?: string;
   parameters?: ServiceSizingParameters;
   deletionPolicy?: DeletionPolicy;
+  destinations?: readonly string[];
 }): Record<string, unknown> {
   const spec: Record<string, unknown> = { type: options.type };
+  if (options.destinations !== undefined) spec.destinations = [...options.destinations];
   if (options.className !== undefined) spec.className = options.className;
   if (options.parameters !== undefined && Object.keys(options.parameters).length > 0) {
     spec.parameters = options.parameters;
@@ -162,6 +184,7 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
   let timeoutMs = DEFAULT_WAIT_TIMEOUT_MS;
   let timeoutExplicit = false;
   const parameters: ServiceSizingParameters = {};
+  const destinations: string[] = [];
 
   for (let position = 0; position < args.length; position++) {
     const token = args[position] ?? '';
@@ -253,6 +276,12 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
       position = timeoutOpt.consumedThrough;
       continue;
     }
+    const destinationOpt = matchOption(args, position, token, '--destination');
+    if (destinationOpt) {
+      destinations.push(destinationOpt.value);
+      position = destinationOpt.consumedThrough;
+      continue;
+    }
     if (token === '--wait') {
       if (wait) invalidUsage('Option may be provided only once: --wait', '--wait');
       wait = true;
@@ -262,7 +291,13 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
       invalidUsage(`Unknown option: ${token}`, token, { command: 'platform service create' });
     }
     if (type !== undefined) {
-      invalidUsage(`Unexpected argument: ${token}`, token, { command: 'platform service create' });
+      // `service create egress <name>`: the name may follow the type instead of --name.
+      if (name !== undefined)
+        invalidUsage(`Unexpected argument: ${token}`, token, {
+          command: 'platform service create',
+        });
+      name = token;
+      continue;
     }
     if (!isServiceType(token)) {
       invalidUsage(
@@ -285,6 +320,7 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
     wait,
     timeoutMs,
     parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
+    ...(destinations.length > 0 ? { destinations } : {}),
   };
 }
 
@@ -383,6 +419,31 @@ function validateSizing(parameters: ServiceSizingParameters | undefined): void {
   }
 }
 
+function validateDestinations(type: ServiceType, options: ServiceCreateOptions): void {
+  const command = { command: 'platform service create' };
+  if (type !== 'egress') {
+    if (options.destinations !== undefined)
+      invalidUsage('--destination applies only to egress services', '--destination', command);
+    return;
+  }
+  if (options.destinations === undefined)
+    invalidUsage(
+      'Missing required --destination for an egress service (host, *.suffix, host:port, or *.suffix:port)',
+      '--destination',
+      command,
+    );
+  for (const destination of options.destinations) {
+    if (!isEgressDestination(destination))
+      invalidUsage(
+        `Invalid destination "${destination}". Use host, *.suffix, host:port, or *.suffix:port`,
+        destination,
+        command,
+      );
+  }
+  if (options.parameters !== undefined || options.deletionPolicy !== undefined)
+    invalidUsage('Egress services take no sizing or deletion-policy options', 'egress', command);
+}
+
 function validateCreateOptions(options: ServiceCreateOptions): {
   type: ServiceType;
   name: string;
@@ -419,6 +480,7 @@ function validateCreateOptions(options: ServiceCreateOptions): {
     );
   }
   validateSizing(options.parameters);
+  validateDestinations(options.type, options);
   return { type: options.type, name: options.name };
 }
 
@@ -538,6 +600,8 @@ export function summarizeService(document: BackingServiceDocument): ServiceSumma
         }
       : {}),
     ...(document.spec?.deletionPolicy ? { deletionPolicy: document.spec.deletionPolicy } : {}),
+    ...(document.spec?.destinations ? { destinations: document.spec.destinations } : {}),
+    ...(document.status?.approved ? { approved: document.status.approved } : {}),
   };
 }
 
@@ -549,7 +613,9 @@ function formatServiceTable(services: ServiceSummary[]): string {
     service.type,
     service.className || '-',
     service.ready,
-    service.endpoint ? `${service.endpoint.host}:${service.endpoint.port}` : '-',
+    service.endpoint
+      ? `${service.endpoint.host}:${service.endpoint.port}`
+      : (service.destinations?.join(',') ?? '-'),
   ]);
   const widths = headers.map((header, index) =>
     Math.max(header.length, ...rows.map((row) => row[index]?.length ?? 0)),
@@ -574,6 +640,8 @@ function formatServiceDetail(summary: ServiceSummary): string {
     );
   }
   if (summary.deletionPolicy) lines.push(`Deletion policy: ${summary.deletionPolicy}`);
+  if (summary.destinations) lines.push(`Destinations: ${summary.destinations.join(', ')}`);
+  if (summary.approved) lines.push(`Approved: ${summary.approved.join(', ') || '-'}`);
   return `${lines.join('\n')}\n`;
 }
 
@@ -696,6 +764,7 @@ export async function runWasmcloudServiceCreate(
     className: options.className,
     parameters: options.parameters,
     deletionPolicy: options.deletionPolicy,
+    destinations: options.destinations,
   });
   const dir = mkdtempSync(join(tmpdir(), 'di-backing-service-'));
   const path = join(dir, `${name}.json`);
@@ -742,6 +811,7 @@ export async function runWasmcloudServiceCreate(
         : {}),
       ...(options.parameters ? { parameters: options.parameters } : {}),
       ...(options.deletionPolicy ? { deletionPolicy: options.deletionPolicy } : {}),
+      ...(options.destinations ? { destinations: options.destinations } : {}),
       wait: options.wait,
       ready: summary.ready,
       ...(summary.endpoint ? { endpoint: summary.endpoint } : {}),
@@ -853,7 +923,9 @@ export async function runWasmcloudServiceDelete(
   let deletionPolicy: string | undefined;
   try {
     const existing = await getServiceDocument(connection, options.name, deps);
-    deletionPolicy = existing.spec?.deletionPolicy ?? 'Retain';
+    // Egress provisions nothing, so there is nothing to retain.
+    if (existing.spec?.type !== 'egress')
+      deletionPolicy = existing.spec?.deletionPolicy ?? 'Retain';
   } catch (error) {
     if (error instanceof CommandFailure && error.code === 'WASMCLOUD_SERVICE_NOT_FOUND') {
       throw error;

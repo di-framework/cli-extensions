@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { CommandFailure } from '@di-framework/cli-extension';
 import type { WasmcloudDeps } from './deps';
 import type { DeployManifest, DeployTarget, ExternalTarget, ManagedTarget } from './manifest';
@@ -48,7 +49,11 @@ export async function resolveConnection(
   if (target.kind === 'managed') {
     return resolveManagedConnection(target, workspaceRoot, manifestPath, deps);
   }
-  return resolveExternalConnection(target);
+  const connection = resolveExternalConnection(target);
+  // kubectl runs from the project directory; a relative kubeconfig (e.g. from
+  // ${KUBECONFIG}) means the directory the command was invoked from.
+  connection.kubeconfig = resolve(deps.cwd(), connection.kubeconfig);
+  return connection;
 }
 
 async function resolveManagedConnection(
