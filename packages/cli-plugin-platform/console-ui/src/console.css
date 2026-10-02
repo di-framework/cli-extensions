@@ -25,6 +25,12 @@
 
   --console-chrome: var(--pf-t--color--gray--90);
   --console-chrome-nav: var(--pf-t--color--gray--95);
+  /* The mark's field is black, so the masthead sits between gray-90 and gray-80. */
+  --console-masthead: color-mix(
+    in srgb,
+    var(--pf-t--color--gray--90) 35%,
+    var(--pf-t--color--gray--80)
+  );
 }
 
 /* ---- Page: the console fills the viewport and the content is one working surface. ---- */
@@ -81,7 +87,7 @@
 }
 
 .console-dark.pf-v6-c-masthead {
-  --pf-v6-c-masthead--BackgroundColor: var(--console-chrome);
+  --pf-v6-c-masthead--BackgroundColor: var(--console-masthead);
 }
 
 .console-dark.pf-v6-c-page__sidebar {
@@ -102,10 +108,15 @@
   white-space: nowrap;
 }
 
-.console-masthead-brand svg {
+.console-brand-mark {
   width: 28px;
   height: 28px;
   flex: none;
+  border-radius: 8px;
+  /* A short highlight on one edge and a short shadow on the other. */
+  box-shadow:
+    -1px -1px 2px rgb(255 255 255 / 16%),
+    1px 1px 3px rgb(0 0 0 / 50%);
 }
 
 .console-masthead-title {
