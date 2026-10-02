@@ -99,21 +99,22 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
         options: [
           '--target <tenant>  Tenant target (default: default-target). Uses that target’s kubeconfig only',
           '--host <address>  Loopback bind address (default: 127.0.0.1)',
-          '--port <port>  Listen port (default: 8787)',
+          '--port <port>  Listen port (default: a free port chosen by the system)',
         ],
         run: ({ args, io }) => runWasmcloudConsole(args, io, deps),
       },
       service: {
         description:
-          'Create and manage BackingService custom resources (keyvalue/messaging/blobstore/postgres) via the cluster API',
+          'Create and manage BackingService custom resources (keyvalue/messaging/blobstore/postgres/egress) via the cluster API',
         children: {
           create: {
             description: 'Create a BackingService custom resource for an approved capability type',
             usage:
-              'di-framework platform service create <keyvalue|messaging|blobstore|postgres> --name=<name> [--class=<class>] [--target <name>] [--namespace <ns>] [--wait]',
+              'di-framework platform service create <keyvalue|messaging|blobstore|postgres|egress> [<name> | --name=<name>] [--class=<class>] [--destination <host[:port]>]… [--target <name>] [--namespace <ns>] [--wait]',
             options: [
-              '--name <name>  Required BackingService metadata.name (DNS label, max 40)',
-              '--class <name>  Optional approved BackingServiceClass (defaults: keyvalue-redis, messaging-nats, blobstore-nats, postgres-dedicated)',
+              '--name <name>  Required BackingService metadata.name (DNS label, max 40); may also follow the type',
+              '--class <name>  Optional approved BackingServiceClass (defaults: keyvalue-redis, messaging-nats, blobstore-nats, postgres-dedicated, egress-public)',
+              '--destination <d>  Egress only, repeatable: host, *.suffix, host:port, or *.suffix:port',
               '--memory <qty>  Optional sizing parameter (Kubernetes quantity)',
               '--storage <qty>  Optional sizing parameter (Kubernetes quantity)',
               '--cpu <qty>  Optional sizing parameter (Kubernetes quantity)',

@@ -9,7 +9,7 @@ import { createSessionStore, readCookie, sessionCookie, tokensMatch } from '../s
 import type { WorkloadDocument } from '../src/console/catalog';
 import { type ConsoleCluster, createKubectlConsoleCluster } from '../src/console/cluster';
 import { consoleAssetsDirectory, parseConsoleArgs, runWasmcloudConsole } from '../src/console/run';
-import { startConsoleServer } from '../src/console/server';
+import { egressWorkload, startConsoleServer } from '../src/console/server';
 import { type ConsoleServices, createCliConsoleServices } from '../src/console/services';
 import type { ClusterConnection } from '../src/target';
 import { captureIo, fakeDeps, makeWorkspace } from './helpers';
@@ -210,6 +210,107 @@ describe('console branches', () => {
     });
   });
 
+  it('reads host failures from every logs projection', async () => {
+    const failure = (
+      workload: string,
+      time: string,
+      message = 'service did not properly execute',
+    ) => ({
+      workload,
+      time,
+      level: 'WARN',
+      message,
+    });
+    const projections = clusterFrom((args) => {
+      expect(args).toContain('di-framework.dev/projection=logs');
+      return {
+        stdout: JSON.stringify({
+          items: [
+            {
+              data: {
+                failures: JSON.stringify({
+                  'mesh-collector': failure(
+                    'mesh-collector-ff55d9589-795c7b5cd6',
+                    '2026-10-01T19:19:39Z',
+                  ),
+                  'mesh-site': failure('mesh-site-dd5fc4dc-558f5d4b4', '2026-10-01T18:56:38Z'),
+                  partial: { workload: 'x', time: 't', level: 'INFO', message: 'm' },
+                  empty: null,
+                }),
+              },
+            },
+            {
+              data: {
+                failures: JSON.stringify({
+                  'mesh-site': failure('mesh-site-64f85bb94f-1', '2026-10-01T19:00:00Z', 'newer'),
+                  'mesh-collector': failure('mesh-collector-old-1', '2026-10-01T18:00:00Z'),
+                }),
+              },
+            },
+            { data: { failures: '{' } },
+            { data: { failures: '[]' } },
+            { data: { failures: 3 } },
+            { data: {} },
+            null,
+          ],
+        }),
+      };
+    });
+    const read = await projections.cluster.readFailures(connection);
+    expect([...read.keys()].sort()).toEqual(['mesh-collector', 'mesh-site']);
+    expect(read.get('mesh-site')).toEqual({
+      workload: 'mesh-site-64f85bb94f-1',
+      time: '2026-10-01T19:00:00Z',
+      level: 'WARN',
+      message: 'newer',
+    });
+    expect(read.get('mesh-collector')?.workload).toBe('mesh-collector-ff55d9589-795c7b5cd6');
+
+    const denied = clusterFrom(() => ({ exitCode: 1, stderr: 'Error from server (Forbidden)' }));
+    expect((await denied.cluster.readFailures(connection)).size).toBe(0);
+    const failed = clusterFrom(() => ({ exitCode: 1, stdout: 'connection timed out' }));
+    await expect(failed.cluster.readFailures(connection)).rejects.toMatchObject({ status: 502 });
+    const malformed = clusterFrom(() => ({ stdout: '{' }));
+    await expect(malformed.cluster.readFailures(connection)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('reads the route address template', async () => {
+    const published = clusterFrom((args) => {
+      expect(args).toEqual(expect.arrayContaining(['configmap', 'di-platform-routes']));
+      return {
+        stdout: JSON.stringify({
+          data: { urlTemplate: 'http://{host}.development.localhost:28180' },
+        }),
+      };
+    });
+    expect(await published.cluster.readRouteTemplate(connection)).toBe(
+      'http://{host}.development.localhost:28180',
+    );
+    const missing = clusterFrom(() => ({
+      exitCode: 1,
+      stderr: 'Error from server (NotFound): configmaps "di-platform-routes" not found',
+    }));
+    expect(await missing.cluster.readRouteTemplate(connection)).toBeUndefined();
+    expect(missing.logs).toEqual([]);
+    const failed = clusterFrom(() => ({ exitCode: 1, stderr: 'connection timed out' }));
+    expect(await failed.cluster.readRouteTemplate(connection)).toBeUndefined();
+    expect(failed.logs.join('\n')).toContain('timed out');
+    const silent = clusterFrom(() => ({ exitCode: 1 }));
+    expect(await silent.cluster.readRouteTemplate(connection)).toBeUndefined();
+    const malformed = clusterFrom(() => ({ stdout: '{' }));
+    expect(await malformed.cluster.readRouteTemplate(connection)).toBeUndefined();
+    for (const stdout of [
+      'null',
+      '{}',
+      '{"data":{"urlTemplate":""}}',
+      '{"data":{"urlTemplate":3}}',
+    ]) {
+      expect(
+        await clusterFrom(() => ({ stdout })).cluster.readRouteTemplate(connection),
+      ).toBeUndefined();
+    }
+  });
+
   it('reads backing services through the service commands', async () => {
     const workspace = makeWorkspace({
       manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
@@ -319,6 +420,12 @@ describe('console branches', () => {
               status: { readyReplicas: 1 },
             },
           ] as WorkloadDocument[];
+        },
+        async readRouteTemplate() {
+          return 'http://{host}.development.localhost:28180';
+        },
+        async readFailures() {
+          throw new Error('projection list failed');
         },
         async listBindings() {
           return [];
@@ -556,6 +663,24 @@ describe('console branches', () => {
       expect(
         (
           await request(server.port, {
+            path: '/api/applications/greeter/bindings',
+            method: 'POST',
+            headers: auth,
+            body: JSON.stringify({ binding: 'egress', service: 'outbound', capability: 'egress' }),
+          })
+        ).status,
+      ).toBe(200);
+      const egressCreate = await request(server.port, {
+        path: '/api/backing-services',
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ type: 'egress', name: 'outbound' }),
+      });
+      expect(egressCreate.status).toBe(400);
+      expect(egressCreate.body).toContain('platform service create egress');
+      expect(
+        (
+          await request(server.port, {
             path: '/api/applications/greeter/bindings/missing',
             method: 'DELETE',
             headers: auth,
@@ -707,22 +832,30 @@ describe('console branches', () => {
     const previousBody = previous ? await Bun.file(indexPath).text() : '';
     writeFileSync(indexPath, '<!doctype html><title>console</title>');
     const captured = captureIo();
-    const port = 18787 + Math.floor(Math.random() * 1000);
+    const live: string[] = [];
     const running = runWasmcloudConsole(
-      ['--port', String(port)],
+      [],
       captured.io,
       fakeDeps({ cwd: workspace.root, env: { kubeconfig: workspace.kubeconfig } }),
+      { write: (chunk: string) => live.push(chunk) },
     );
     const started = Date.now();
-    while (!captured.stdout.join('').includes('Console listening') && Date.now() - started < 5000) {
+    while (!live.join('').includes('Console listening') && Date.now() - started < 5000) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
+    const banner = live.join('');
+    const address = /Console listening on (http:\/\/127\.0\.0\.1:(\d+))\n/.exec(banner);
+    expect(Number(address?.[2])).toBeGreaterThan(0);
+    const page = await fetch(`${address?.[1]}/`);
+    expect(page.status).toBe(200);
+    await page.text();
     process.emit('SIGINT');
     const stopped = await running;
-    expect(stopped.text).toContain('Console stopped');
-    expect(captured.stdout.join('')).toContain('tenant development');
-    expect(captured.stdout.join('')).toContain('tenant-development');
-    expect(captured.stdout.join('')).not.toContain('namespace');
+    expect(stopped.text).toContain(`Console stopped (${address?.[1]})`);
+    expect(captured.stdout.join('')).toBe('');
+    expect(banner).toContain('tenant development');
+    expect(banner).toContain('tenant-development');
+    expect(banner).not.toContain('namespace');
 
     const hidden = `${indexPath}.aside`;
     renameSync(indexPath, hidden);
@@ -736,6 +869,29 @@ describe('console branches', () => {
       else unlinkSync(indexPath);
     }
   });
+
+  it('binds egress to the single WorkloadDeployment of an application', () => {
+    expect(egressWorkload([{ metadata: { name: 'mesh-site' } }] as WorkloadDocument[])).toBe(
+      'mesh-site',
+    );
+    for (const members of [[], [{ metadata: { name: 'a' } }, { metadata: { name: 'b' } }], [{}]])
+      expect(() => egressWorkload(members as WorkloadDocument[])).toThrow(
+        'Egress is granted per part',
+      );
+  });
+
+  it('unbinds the deploy-named egress binding when no console binding exists', async () => {
+    const deleted: string[] = [];
+    const { cluster } = clusterFrom((args) => {
+      const name = args[args.indexOf('delete') + 2] ?? '';
+      deleted.push(name);
+      return name.startsWith('di-bind-')
+        ? { exitCode: 1, stderr: 'Error from server (NotFound): not found' }
+        : {};
+    });
+    await cluster.unbindService(connection, 'mesh-site', 'egress');
+    expect(deleted).toEqual([expect.stringMatching(/^di-bind-/), 'mesh-site-egress']);
+  });
 });
 
 function tenantWorkspace() {
@@ -748,6 +904,12 @@ function idleCluster(canWrite: ConsoleCluster['canWrite'] = async () => true): C
   return {
     async listWorkloads() {
       return [];
+    },
+    async readFailures() {
+      return new Map();
+    },
+    async readRouteTemplate() {
+      return undefined;
     },
     async listBindings() {
       return [];

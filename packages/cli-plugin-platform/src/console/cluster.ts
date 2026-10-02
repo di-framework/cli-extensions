@@ -2,14 +2,17 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WasmcloudDeps } from '../deps';
+import { EGRESS_BINDING_NAME, egressResourceName } from '../egress';
 import { captureKubectl } from '../kubernetes';
 import { associationName } from '../managed-bindings';
 import type { ClusterConnection } from '../target';
 import { MANAGED_BY_LABEL, WORKLOAD_DEPLOYMENT_RESOURCE } from '../workload';
-import type { BindingDocument, JsonPatchOp, WorkloadDocument } from './catalog';
+import type { BindingDocument, HostFailure, JsonPatchOp, WorkloadDocument } from './catalog';
 import { ConsoleError, sanitizePublicText } from './errors';
 
 const BINDING_RESOURCE = 'servicebindings.platform.di-framework.dev';
+/** Published by the platform controller in each tenant namespace (contract C-ROUTES). */
+const ROUTES_CONFIG_MAP = 'di-platform-routes';
 
 export type SignalView = {
   success: number;
@@ -36,6 +39,10 @@ export type ConsoleCluster = {
   canWrite(connection: ClusterConnection): Promise<boolean>;
   readLogs(connection: ClusterConnection, application: string): Promise<string[] | undefined>;
   readSignals(connection: ClusterConnection, application: string): Promise<SignalView | undefined>;
+  /** `data.urlTemplate` of the tenant's `di-platform-routes` ConfigMap, if the platform has one. */
+  readRouteTemplate(connection: ClusterConnection): Promise<string | undefined>;
+  /** Host failures by WorkloadDeployment name, from every logs projection in the namespace. */
+  readFailures(connection: ClusterConnection): Promise<Map<string, HostFailure>>;
   bindService(connection: ClusterConnection, input: BindInput): Promise<void>;
   unbindService(connection: ClusterConnection, workload: string, binding: string): Promise<void>;
 };
@@ -143,6 +150,57 @@ export function createKubectlConsoleCluster(
         return { success, error, ...(compute ? { compute } : {}) };
       });
     },
+    async readRouteTemplate(connection) {
+      const result = await captureKubectl(
+        deps,
+        connection,
+        ['get', 'configmap', ROUTES_CONFIG_MAP, '-o', 'json'],
+        deps.cwd(),
+      );
+      if (result.exitCode !== 0) {
+        // No ConfigMap means no gateway is known; the console then shows hosts as text.
+        if (/not ?found|forbidden/i.test(result.stderr)) return undefined;
+        log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));
+        return undefined;
+      }
+      try {
+        const template = (JSON.parse(result.stdout) as { data?: { urlTemplate?: unknown } } | null)
+          ?.data?.urlTemplate;
+        return typeof template === 'string' && template.length > 0 ? template : undefined;
+      } catch {
+        log('The route address template could not be read.');
+        return undefined;
+      }
+    },
+    async readFailures(connection) {
+      const result = await captureKubectl(
+        deps,
+        connection,
+        ['get', 'configmap', '-l', 'di-framework.dev/projection=logs', '-o', 'json'],
+        deps.cwd(),
+      );
+      const failures = new Map<string, HostFailure>();
+      if (result.exitCode !== 0) {
+        log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));
+        if (/forbidden|not found/i.test(result.stderr)) return failures;
+        throw new ConsoleError(502, 'REQUEST_FAILED', 'The application could not be read.');
+      }
+      let list: unknown[];
+      try {
+        list = items(JSON.parse(result.stdout) as unknown);
+      } catch {
+        log('The logs projections could not be read.');
+        throw new ConsoleError(502, 'REQUEST_FAILED', 'The application could not be read.');
+      }
+      for (const entry of list) {
+        const raw = (entry as { data?: { failures?: unknown } } | null)?.data?.failures;
+        for (const [name, failure] of parseFailures(raw)) {
+          const current = failures.get(name);
+          if (current === undefined || failure.time > current.time) failures.set(name, failure);
+        }
+      }
+      return failures;
+    },
     async bindService(connection, input) {
       const directory = mkdtempSync(join(tmpdir(), 'di-console-binding-'));
       try {
@@ -180,12 +238,24 @@ export function createKubectlConsoleCluster(
       }
     },
     async unbindService(connection, workload, binding) {
-      const result = await captureKubectl(
+      let result = await captureKubectl(
         deps,
         connection,
         ['delete', BINDING_RESOURCE, associationName(workload, binding)],
         deps.cwd(),
       );
+      // Deploy names the egress binding after the WorkloadDeployment.
+      if (
+        result.exitCode !== 0 &&
+        binding === EGRESS_BINDING_NAME &&
+        /not ?found/i.test(result.stderr)
+      )
+        result = await captureKubectl(
+          deps,
+          connection,
+          ['delete', BINDING_RESOURCE, egressResourceName(workload)],
+          deps.cwd(),
+        );
       if (result.exitCode !== 0 && /not ?found/i.test(result.stderr)) {
         log(sanitizePublicText(result.stderr));
         throw new ConsoleError(
@@ -296,6 +366,39 @@ function items(body: unknown): unknown[] {
     throw new ConsoleError(502, 'REQUEST_FAILED', 'The application could not be read.');
   }
   return list;
+}
+
+/** `data.failures` entries; malformed JSON or entries are ignored. */
+function parseFailures(raw: unknown): Array<[string, HostFailure]> {
+  if (typeof raw !== 'string') return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+  const entries: Array<[string, HostFailure]> = [];
+  for (const [name, value] of Object.entries(parsed)) {
+    const failure = value as Partial<HostFailure> | null;
+    if (
+      typeof failure?.workload === 'string' &&
+      typeof failure.time === 'string' &&
+      (failure.level === 'WARN' || failure.level === 'ERROR') &&
+      typeof failure.message === 'string'
+    ) {
+      entries.push([
+        name,
+        {
+          workload: failure.workload,
+          time: failure.time,
+          level: failure.level,
+          message: failure.message,
+        },
+      ]);
+    }
+  }
+  return entries;
 }
 
 function whole(value: string | undefined): number | undefined {

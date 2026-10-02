@@ -156,8 +156,11 @@ describe('tenant deployment targets', () => {
         fakeDeps({ cwd: root, invocations }),
       );
       expectScope(invocations, root, user);
-      expect(invocations).toHaveLength(2);
+      expect(invocations).toHaveLength(3);
       expect(invocations[0]?.args).toContain('delete');
+      expect(invocations[2]?.args).toContain(
+        'di-framework.dev/egress-workload=greeter,app.kubernetes.io/managed-by=di-framework',
+      );
     }
   });
 
@@ -186,6 +189,37 @@ describe('tenant deployment targets', () => {
         ),
       ).toThrow('Kubernetes namespace');
     }
+  });
+
+  it('resolves a relative KUBECONFIG against the invocation directory for every kubectl call', async () => {
+    const { root } = makeWorkspace();
+    writeFileSync(
+      join(root, 'di-framework.deploy.toml'),
+      `[targets.alice]
+kubeconfig = "\${KUBECONFIG}"
+namespace = "di-tenant-alice"
+hostgroup = "tenant-alice"
+registry = "registry.example.com/alice"
+`,
+    );
+    const invocations: RunnerInvocation[] = [];
+    await runWasmcloudDeploy(
+      ['greeter', '--target', 'alice'],
+      captureIo().io,
+      fakeDeps({
+        cwd: root,
+        invocations,
+        env: { KUBECONFIG: 'deploy/.tenant.kubeconfig' },
+      }),
+    );
+    const kubectl = invocations.filter((i) => i.command === 'kubectl');
+    expect(kubectl.length).toBeGreaterThan(0);
+    for (const invocation of kubectl)
+      expect(invocation.args.slice(0, 2)).toEqual([
+        '--kubeconfig',
+        join(root, 'deploy/.tenant.kubeconfig'),
+      ]);
+    expect(kubectl.some((i) => i.cwd !== root)).toBe(true);
   });
 });
 

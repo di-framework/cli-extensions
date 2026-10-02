@@ -27,6 +27,8 @@ import {
   tenantIdentity,
   toSummary,
   type WorkloadDocument,
+  withRouteUrls,
+  withServiceClasses,
   workloadInTenantScope,
 } from './catalog';
 import {
@@ -303,7 +305,7 @@ async function routeApplication(
     return;
   }
   if (rest.length === 1 && rest[0] === 'environment' && method === 'PUT') {
-    const body = recordBody(await readBody(request), ['key', 'value']);
+    const body = recordBody(await readBody(request), ['key', 'value', 'part']);
     if (typeof body.key !== 'string' || typeof body.value !== 'string') {
       throw new ConsoleError(
         400,
@@ -311,16 +313,25 @@ async function routeApplication(
         'An environment variable needs a name and a value.',
       );
     }
+    if (body.part !== undefined && typeof body.part !== 'string') {
+      throw new ConsoleError(400, 'INVALID_BODY', 'part must be the name of a part.');
+    }
     const loaded = await loadApplications(options);
-    const change = planEnvironmentSet(membersOf(loaded, name), body.key, body.value);
+    const change = planEnvironmentSet(membersOf(loaded, name), body.key, body.value, body.part);
     if (change.ops.length > 0)
       await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
     sendJson(response, 200, { application: await present(options, name) });
     return;
   }
-  if (rest.length === 2 && rest[0] === 'environment' && method === 'DELETE') {
+  // DELETE environment/<key> removes the first match; environment/<part>/<key> names the part.
+  if (
+    (rest.length === 2 || rest.length === 3) &&
+    rest[0] === 'environment' &&
+    method === 'DELETE'
+  ) {
     const loaded = await loadApplications(options);
-    const change = planEnvironmentDelete(membersOf(loaded, name), rest[1] ?? '');
+    const [part, key] = rest.length === 3 ? [rest[1], rest[2]] : [undefined, rest[1]];
+    const change = planEnvironmentDelete(membersOf(loaded, name), key ?? '', part);
     await options.cluster.patchWorkload(loaded.connection, change.workload, change.ops);
     sendJson(response, 200, { application: await present(options, name) });
     return;
@@ -345,6 +356,7 @@ async function routeApplication(
     const input = parseBind(await readBody(request), name);
     const loaded = await loadApplications(options);
     requireApplication(loaded.applications, name);
+    if (input.capability === 'egress') input.workload = egressWorkload(membersOf(loaded, name));
     await options.cluster.bindService(loaded.connection, input);
     sendJson(response, 200, { application: await present(options, name) });
     return;
@@ -433,7 +445,31 @@ async function present(options: HandlerOptions, name: string) {
   const application = requireApplication(loaded.applications, name);
   const logs = await logsFor(options, loaded.connection, name);
   const signals = await options.cluster.readSignals(loaded.connection, name);
-  return withProjections(application, logs, signals);
+  const routes =
+    application.routes.length === 0
+      ? application.routes
+      : withRouteUrls(
+          application.routes,
+          await options.cluster.readRouteTemplate(loaded.connection),
+        );
+  const backingServices =
+    application.backingServices.length === 0
+      ? application.backingServices
+      : withServiceClasses(application.backingServices, await serviceClasses(options));
+  return withProjections({ ...application, routes, backingServices }, logs, signals);
+}
+
+/** Class of each backing service by name; empty when the services cannot be read. */
+async function serviceClasses(options: HandlerOptions): Promise<Map<string, string>> {
+  try {
+    const listed = await options.services.list(options.target);
+    return new Map(listed.map((service) => [service.name, service.className]));
+  } catch (error) {
+    options.log(
+      sanitizePublicText(error instanceof Error ? error.message : 'service query failed'),
+    );
+    return new Map();
+  }
 }
 
 function withProjections(
@@ -457,15 +493,22 @@ async function logsFor(
 
 async function loadApplications(options: HandlerOptions) {
   const connection = await connectionFor(options, options.target);
-  const [documents, bindings] = await Promise.all([
+  const [documents, bindings, failures] = await Promise.all([
     options.cluster.listWorkloads(connection),
     options.cluster.listBindings(connection),
+    // Status without host failures is still useful; a projection read error is only logged.
+    options.cluster.readFailures(connection).catch((error: unknown) => {
+      options.log(
+        sanitizePublicText(error instanceof Error ? error.message : 'failure query failed'),
+      );
+      return new Map();
+    }),
   ]);
   const scoped = documents.filter((document) => workloadInTenantScope(document, connection));
   return {
     connection,
     documents: scoped,
-    applications: summarizeApplications(scoped, bindings),
+    applications: summarizeApplications(scoped, bindings, failures),
   };
 }
 
@@ -545,6 +588,13 @@ function parseServiceCreate(body: unknown, target: string): ServiceCreateInput {
       'Service name must use lowercase letters, digits, and hyphens.',
     );
   }
+  if (record.type === 'egress') {
+    throw new ConsoleError(
+      400,
+      'INVALID_SERVICE',
+      'Egress services need destinations; create them with di-framework platform service create egress.',
+    );
+  }
   const input: ServiceCreateInput = { target, type: record.type, name: record.name };
   for (const key of ['className', 'memory', 'storage', 'cpu'] as const) {
     const value = record[key];
@@ -562,6 +612,19 @@ function parseServiceCreate(body: unknown, target: string): ServiceCreateInput {
     input[key] = value;
   }
   return input;
+}
+
+/** Egress is granted to one WorkloadDeployment, so only a single-part application can bind it here. */
+export function egressWorkload(members: readonly WorkloadDocument[]): string {
+  const only = members.length === 1 ? members[0]?.metadata?.name : undefined;
+  if (only === undefined) {
+    throw new ConsoleError(
+      409,
+      'EGRESS_PER_PART',
+      'Egress is granted per part; set allowedIpNameLookups in that part and deploy it.',
+    );
+  }
+  return only;
 }
 
 function parseBind(body: unknown, workload: string): BindInput {

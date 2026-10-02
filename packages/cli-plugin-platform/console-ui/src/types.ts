@@ -2,6 +2,8 @@ export type PartView = {
   name: string;
   kind: 'service' | 'component';
   lifetime: 'long-lived' | 'on-demand';
+  /** The host failed to start this part's current revision. */
+  failure?: string;
 };
 
 export type RouteView = {
@@ -9,11 +11,14 @@ export type RouteView = {
   host: string;
   path: string;
   enabled: boolean;
+  /** Gateway address, when the platform publishes one for this tenant. */
+  url?: string;
 };
 
 export type ApplicationSummary = {
   name: string;
   ready: boolean;
+  failed?: boolean;
   detail?: string;
   services: number;
   components: number;
@@ -43,7 +48,7 @@ export type SignalView = {
 export type ApplicationDetail = ApplicationSummary & {
   parts: PartView[];
   routes: RouteView[];
-  environment: Array<{ key: string; value: string }>;
+  environment: Array<{ key: string; value: string; part: string }>;
   secrets: Array<{ name: string }>;
   backingServices: BackingBinding[];
   privateBindings: PrivateBinding[];

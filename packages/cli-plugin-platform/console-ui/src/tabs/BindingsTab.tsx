@@ -53,7 +53,7 @@ export const BindingsTab = observer(function BindingsTab(): JSX.Element {
             <Tbody>
               {app.backingServices.map((binding) => (
                 <Tr key={binding.name}>
-                  <Td dataLabel="Class">{binding.className}</Td>
+                  <Td dataLabel="Class">{binding.className || '—'}</Td>
                   <Td dataLabel="Service">{binding.service}</Td>
                   <Td dataLabel="Binding">{binding.name}</Td>
                   <Td dataLabel="Status">

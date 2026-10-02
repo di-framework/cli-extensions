@@ -46,7 +46,7 @@ function detail(overrides: Partial<ApplicationDetail> = {}): ApplicationDetail {
     routeCount: 1,
     parts: [{ name: 'mesh-site', kind: 'component', lifetime: 'on-demand' }],
     routes: [{ id: 'r1', host: 'mesh.local', path: '/', enabled: true }],
-    environment: [{ key: 'MODE', value: 'prod' }],
+    environment: [{ key: 'MODE', value: 'prod', part: 'mesh-site' }],
     secrets: [{ name: 'token' }],
     backingServices: [],
     privateBindings: [{ name: 'objects', contract: 'wasmcloud:blobstore', bound: true }],
@@ -129,6 +129,67 @@ describe('console store loading', () => {
     ]);
   });
 
+  test('a failed part marks the application failed and records it as danger', async () => {
+    serveTenant();
+    route('GET', '/api/applications', {
+      body: {
+        applications: [
+          {
+            name: 'mesh',
+            ready: false,
+            failed: true,
+            detail: 'mesh-collector failed: service did not properly execute',
+            services: 1,
+            components: 1,
+            routeCount: 1,
+          },
+        ],
+      },
+    });
+    route('GET', '/api/applications/mesh', {
+      body: {
+        application: detail({
+          ready: false,
+          failed: true,
+          parts: [
+            {
+              name: 'mesh-collector',
+              kind: 'service',
+              lifetime: 'long-lived',
+              failure: 'service did not properly execute',
+            },
+          ],
+        }),
+      },
+    });
+    const store = ConsoleStore.create();
+    await store.start();
+    expect(store.applications[0]?.failed).toBe(true);
+    const entry = store.activity.find((item) => item.text.startsWith('mesh:'));
+    expect(entry?.status).toBe('danger');
+    await store.openApplication('mesh');
+    expect(store.application?.failed).toBe(true);
+    expect(store.application?.parts[0]?.failure).toBe('service did not properly execute');
+    expect(store.application?.routes[0]?.url).toBeUndefined();
+    route('GET', '/api/applications/mesh', {
+      body: {
+        application: detail({
+          routes: [
+            {
+              id: 'r1',
+              host: 'mesh.local',
+              path: '/',
+              enabled: true,
+              url: 'http://mesh.local.warehouse.localhost:28180/',
+            },
+          ],
+        }),
+      },
+    });
+    await store.refreshAll();
+    expect(store.application?.routes[0]?.url).toBe('http://mesh.local.warehouse.localhost:28180/');
+  });
+
   test('a failed session leaves the store closed with the error', async () => {
     route('GET', '/api/session', { status: 401, body: { error: 'Sign in again.' } });
     const store = ConsoleStore.create();
@@ -188,6 +249,86 @@ describe('console store loading', () => {
     expect(store.activity).toHaveLength(ACTIVITY_LIMIT);
     store.clearActivity();
     expect(store.activity).toHaveLength(0);
+  });
+});
+
+describe('console store refresh', () => {
+  test('refresh re-reads the open application', async () => {
+    const pending = {
+      name: 'state',
+      service: 'cache',
+      className: 'keyvalue-redis',
+      ready: false,
+    };
+    serveTenant();
+    route('GET', '/api/applications/mesh', {
+      body: { application: detail({ backingServices: [pending] }) },
+    });
+    const store = ConsoleStore.create();
+    await store.start();
+    await store.openApplication('mesh');
+    const node = store.application;
+    expect(node?.backingServices[0]?.ready).toBe(false);
+    route('GET', '/api/applications/mesh', {
+      body: { application: detail({ backingServices: [{ ...pending, ready: true }] }) },
+    });
+    await store.refreshAll();
+    expect(store.application).toBe(node);
+    expect(store.application?.backingServices[0]?.ready).toBe(true);
+
+    // An application closed while its refresh is in flight stays closed.
+    const refreshing = store.refreshAll();
+    store.navigate('dashboard');
+    await refreshing;
+    expect(store.application).toBeUndefined();
+  });
+
+  test('the services list polls while a service is not ready', async () => {
+    const store = await started();
+    const reads = () => seen.filter((request) => request.path === '/api/backing-services').length;
+    const before = reads();
+    route('GET', '/api/backing-services', {
+      body: {
+        services: [
+          { name: 'cache', className: 'keyvalue-redis', type: 'keyvalue', ready: true },
+          { name: 'queue', className: 'messaging-nats', type: 'messaging', ready: true },
+          { name: 'db', className: 'postgres-dedicated', type: 'postgres', ready: false },
+        ],
+      },
+    });
+    store.startServicePolling(5);
+    while (store.services.find((service) => service.name === 'queue')?.ready !== true) {
+      await Bun.sleep(5);
+    }
+    expect(store.activity[0]?.text).toBe('Backing service queue is ready.');
+    route('GET', '/api/backing-services', {
+      body: {
+        services: [
+          { name: 'cache', className: 'keyvalue-redis', type: 'keyvalue', ready: true },
+          { name: 'queue', className: 'messaging-nats', type: 'messaging', ready: true },
+          { name: 'db', className: 'postgres-dedicated', type: 'postgres', ready: true },
+        ],
+      },
+    });
+    while (store.services.some((service) => !service.ready)) await Bun.sleep(5);
+    expect(store.activity[0]?.text).toBe('Backing service db is ready.');
+    const settled = reads();
+    expect(settled).toBeGreaterThan(before);
+    await Bun.sleep(30);
+    // Every service is ready, so the ticks no longer read.
+    expect(reads()).toBe(settled);
+    store.stopServicePolling();
+    store.stopServicePolling();
+  });
+
+  test('a poll skips while one is in flight and reports failures', async () => {
+    const store = await started();
+    const before = seen.length;
+    await Promise.all([store.pollServices(), store.pollServices()]);
+    expect(seen.length - before).toBe(1);
+    route('GET', '/api/backing-services', { status: 502, body: { error: 'Services failed.' } });
+    await store.pollServices();
+    expect(store.ui.error).toBe('Services failed.');
   });
 });
 
@@ -301,16 +442,25 @@ describe('console store changes', () => {
     const store = await started();
     await store.openApplication('mesh');
     route('PUT', '/api/applications/mesh/environment', ({ body }) => ({
-      body: { application: detail({ environment: [body as { key: string; value: string }] }) },
+      body: {
+        application: detail({
+          environment: [body as { key: string; value: string; part: string }],
+        }),
+      },
     }));
-    expect(await store.setEnvironment('LEVEL', 'debug')).toBe(true);
-    expect(store.application?.environment.map((entry) => entry.key)).toEqual(['LEVEL']);
+    expect(await store.setEnvironment('LEVEL', 'debug', 'mesh-site')).toBe(true);
+    expect(seen.at(-1)?.body).toEqual({ key: 'LEVEL', value: 'debug', part: 'mesh-site' });
+    expect(store.application?.environment.map((entry) => `${entry.part}/${entry.key}`)).toEqual([
+      'mesh-site/LEVEL',
+    ]);
+    expect(store.activity[0]?.text).toBe('Set LEVEL on mesh-site in mesh.');
 
-    route('DELETE', '/api/applications/mesh/environment/LEVEL', {
+    route('DELETE', '/api/applications/mesh/environment/mesh-site/LEVEL', {
       body: { application: detail({ environment: [] }) },
     });
-    expect(await store.deleteEnvironment('LEVEL')).toBe(true);
+    expect(await store.deleteEnvironment('LEVEL', 'mesh-site')).toBe(true);
     expect(store.application?.environment).toHaveLength(0);
+    expect(store.activity[0]?.text).toBe('Removed LEVEL from mesh-site in mesh.');
 
     route('POST', '/api/applications/mesh/secrets/token', { body: { name: 'token' } });
     expect(await store.reassignSecret('token', 's3cret')).toBe(true);
@@ -353,14 +503,14 @@ describe('console store changes', () => {
       status: 409,
       body: { error: 'MODE is managed by the platform.' },
     });
-    expect(await store.setEnvironment('MODE', 'dev')).toBe(false);
+    expect(await store.setEnvironment('MODE', 'dev', 'mesh-site')).toBe(false);
     expect(store.application?.environment[0]?.value).toBe('prod');
     expect(store.ui.error).toBe('MODE is managed by the platform.');
   });
 
   test('application changes need an open application', async () => {
     const store = await started();
-    expect(await store.setEnvironment('A', 'b')).toBe(false);
+    expect(await store.setEnvironment('A', 'b', 'mesh-site')).toBe(false);
     expect(await store.reassignSecret('token', 'value')).toBe(false);
   });
 

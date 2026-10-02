@@ -3,7 +3,22 @@ import type { JSX } from 'react';
 
 export { messageOf } from './api';
 
-export function ReadyLabel({ ready, compact }: { ready: boolean; compact?: boolean }): JSX.Element {
+export function ReadyLabel({
+  ready,
+  failed,
+  compact,
+}: {
+  ready: boolean;
+  failed?: boolean;
+  compact?: boolean;
+}): JSX.Element {
+  if (failed) {
+    return (
+      <Label status="danger" isCompact={compact}>
+        Failed
+      </Label>
+    );
+  }
   return (
     <Label status={ready ? 'success' : 'warning'} isCompact={compact}>
       {ready ? 'Ready' : 'Not ready'}

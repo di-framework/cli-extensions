@@ -9,10 +9,12 @@ import {
   planEnvironmentSet,
   planRouteUpdate,
   planSecretReassign,
+  routeUrl,
   summarizeApplications,
   tenantIdentity,
   toSummary,
   type WorkloadDocument,
+  withRouteUrls,
   workloadInTenantScope,
 } from '../src/console/catalog';
 import type { ConsoleCluster } from '../src/console/cluster';
@@ -314,7 +316,7 @@ describe('console catalog', () => {
     expect(edge?.components).toBe(1);
     expect(edge?.services).toBe(0);
     expect(edge?.ready).toBe(true);
-    expect(edge?.environment).toEqual([{ key: 'COLOR', value: 'blue' }]);
+    expect(edge?.environment).toEqual([{ key: 'COLOR', value: 'blue', part: 'http' }]);
     expect(edge?.secrets.map((entry) => entry.name)).toEqual([
       'API_TOKEN',
       'DATABASE_URL',
@@ -515,14 +517,479 @@ describe('console catalog', () => {
   });
 });
 
+function routeId(host: string, path = '/'): string {
+  return Buffer.from(`${host}\n${path}`).toString('base64url');
+}
+
+function site(extra: WorkloadDocument = {}): WorkloadDocument {
+  return managed('mesh-site', {
+    metadata: { annotations: { 'di-framework.dev/routes-off': '[]' } },
+    spec: {
+      template: {
+        spec: {
+          components: [{ name: 'mesh-site' }],
+          hostInterfaces: [
+            {
+              namespace: 'wasi',
+              package: 'http',
+              version: '0.3.0',
+              interfaces: ['handler'],
+              config: { host: 'mesh-site' },
+            },
+            { namespace: 'wasi', package: 'logging', interfaces: ['logging'] },
+          ],
+        },
+      },
+    },
+    ...extra,
+  });
+}
+
+describe('console route changes', () => {
+  it('removes the wasi:http interface with the last route and restores it', () => {
+    const live = site();
+    const off = planRouteUpdate([live], routeId('mesh-site'), false);
+    expect(off).toEqual({
+      workload: 'mesh-site',
+      ops: [
+        { op: 'remove', path: '/spec/template/spec/hostInterfaces/0' },
+        {
+          op: 'replace',
+          path: '/metadata/annotations/di-framework.dev~1routes-off',
+          value: JSON.stringify([{ host: 'mesh-site', path: '/' }]),
+        },
+        {
+          op: 'add',
+          path: '/metadata/annotations/di-framework.dev~1http-off',
+          value: JSON.stringify({
+            array: '/spec/template/spec/hostInterfaces',
+            entry: {
+              namespace: 'wasi',
+              package: 'http',
+              version: '0.3.0',
+              interfaces: ['handler'],
+            },
+          }),
+        },
+      ],
+    });
+    expect(JSON.stringify(off.ops)).not.toContain('"config":{}');
+
+    const paused = site({
+      metadata: {
+        annotations: {
+          'di-framework.dev/routes-off': JSON.stringify([{ host: 'mesh-site', path: '/' }]),
+          'di-framework.dev/http-off': JSON.stringify({
+            array: '/spec/template/spec/hostInterfaces',
+            entry: {
+              namespace: 'wasi',
+              package: 'http',
+              version: '0.3.0',
+              interfaces: ['handler'],
+            },
+          }),
+        },
+      },
+    });
+    const spec = paused.spec?.template?.spec;
+    if (spec) spec.hostInterfaces = spec.hostInterfaces?.slice(1);
+    expect(summarizeApplications([paused])[0]?.routes).toEqual([
+      { id: routeId('mesh-site'), host: 'mesh-site', path: '/', enabled: false },
+    ]);
+    expect(planRouteUpdate([paused], routeId('mesh-site'), true).ops).toEqual([
+      {
+        op: 'add',
+        path: '/spec/template/spec/hostInterfaces/-',
+        value: {
+          namespace: 'wasi',
+          package: 'http',
+          version: '0.3.0',
+          interfaces: ['handler'],
+          config: { host: 'mesh-site' },
+        },
+      },
+      { op: 'replace', path: '/metadata/annotations/di-framework.dev~1routes-off', value: '[]' },
+      { op: 'remove', path: '/metadata/annotations/di-framework.dev~1http-off' },
+    ]);
+  });
+
+  it('keeps a host on the interface while other routes remain', () => {
+    const aliased = site({
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                config: { host: 'one', 'host-aliases': 'two,three', localRoute: 'two/admin' },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(planRouteUpdate([aliased], routeId('one'), false).ops[0]).toEqual({
+      op: 'replace',
+      path: '/spec/template/spec/hostInterfaces/0/config',
+      value: { host: 'two', 'host-aliases': 'three', localRoute: 'two/admin' },
+    });
+    const single = site({
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                config: { host: 'one', 'host-aliases': 'two' },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(planRouteUpdate([single], routeId('one'), false).ops[0]?.value).toEqual({
+      host: 'two',
+    });
+    const paths = site({
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                config: { host: 'one', localRoute: 'one/admin' },
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(() => planRouteUpdate([paths], routeId('one'), false)).toThrow(
+      expect.objectContaining({ status: 409, code: 'ROUTE_REQUIRED' }),
+    );
+    expect(planRouteUpdate([paths], routeId('one', '/admin'), false).ops[0]?.value).toEqual({
+      host: 'one',
+    });
+  });
+
+  it('remembers component and service interfaces with their other settings', () => {
+    const component = managed('worker', {
+      spec: {
+        template: {
+          spec: {
+            components: [
+              {
+                name: 'worker',
+                hostInterfaces: [
+                  {
+                    namespace: 'wasi',
+                    package: 'http',
+                    interfaces: ['handler'],
+                    config: { host: 'worker', timeout: '5s' },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+    const off = planRouteUpdate([component], routeId('worker'), false);
+    expect(off.ops).toEqual([
+      { op: 'remove', path: '/spec/template/spec/components/0/hostInterfaces/0' },
+      {
+        op: 'add',
+        path: '/metadata/annotations',
+        value: {
+          'di-framework.dev/routes-off': JSON.stringify([{ host: 'worker', path: '/' }]),
+          'di-framework.dev/http-off': JSON.stringify({
+            array: '/spec/template/spec/components/0/hostInterfaces',
+            entry: {
+              namespace: 'wasi',
+              package: 'http',
+              interfaces: ['handler'],
+              config: { timeout: '5s' },
+            },
+          }),
+        },
+      },
+    ]);
+    const restored = managed('worker', {
+      metadata: {
+        annotations: {
+          'di-framework.dev/routes-off': JSON.stringify([{ host: 'worker', path: '/' }]),
+          'di-framework.dev/http-off': JSON.stringify({
+            array: '/spec/template/spec/components/0/hostInterfaces',
+            entry: { namespace: 'wasi', package: 'http', config: { timeout: '5s' } },
+          }),
+        },
+      },
+      spec: { template: { spec: { components: [{ name: 'worker' }] } } },
+    });
+    expect(planRouteUpdate([restored], routeId('worker'), true).ops[0]).toEqual({
+      op: 'add',
+      path: '/spec/template/spec/components/0/hostInterfaces',
+      value: [{ namespace: 'wasi', package: 'http', config: { timeout: '5s', host: 'worker' } }],
+    });
+
+    const service = (httpOff: unknown, spec: WorkloadDocument['spec']) =>
+      managed('daemon', {
+        metadata: {
+          annotations: {
+            'di-framework.dev/routes-off': JSON.stringify([{ host: 'daemon', path: '/' }]),
+            'di-framework.dev/http-off':
+              typeof httpOff === 'string' ? httpOff : JSON.stringify(httpOff),
+          },
+        },
+        spec,
+      });
+    const serviceSpec = {
+      template: {
+        spec: {
+          service: { name: 'daemon', hostInterfaces: [{ namespace: 'wasi', package: 'cli' }] },
+        },
+      },
+    };
+    expect(
+      planRouteUpdate(
+        [
+          service(
+            {
+              array: '/spec/template/spec/service/hostInterfaces',
+              entry: { namespace: 'wasi', package: 'http' },
+            },
+            serviceSpec,
+          ),
+        ],
+        routeId('daemon'),
+        true,
+      ).ops[0],
+    ).toEqual({
+      op: 'add',
+      path: '/spec/template/spec/service/hostInterfaces/-',
+      value: { namespace: 'wasi', package: 'http', config: { host: 'daemon' } },
+    });
+    const fallback = {
+      op: 'add' as const,
+      path: '/spec/template/spec/hostInterfaces',
+      value: [
+        {
+          namespace: 'wasi',
+          package: 'http',
+          version: '0.3.0',
+          interfaces: ['handler'],
+          config: { host: 'daemon' },
+        },
+      ],
+    };
+    for (const broken of [
+      '{',
+      '',
+      { array: '/metadata', entry: { namespace: 'wasi', package: 'http' } },
+      { array: '/spec/template/spec/hostInterfaces', entry: null },
+      { array: '/spec/template/spec/hostInterfaces', entry: [] },
+      { array: '/spec/template/spec/hostInterfaces', entry: { namespace: 'wasi', package: 'cli' } },
+      {
+        array: '/spec/template/spec/components/3/hostInterfaces',
+        entry: { namespace: 'wasi', package: 'http' },
+      },
+    ]) {
+      expect(
+        planRouteUpdate([service(broken, serviceSpec)], routeId('daemon'), true).ops[0],
+      ).toEqual(fallback);
+    }
+  });
+});
+
+describe('console environment parts', () => {
+  const site = managed('mesh-site', {
+    metadata: { labels: { 'di-framework.dev/workload': 'mesh' } },
+    spec: {
+      template: {
+        spec: {
+          components: [
+            { name: 'mesh-site', localResources: { environment: { config: { MODE: 'site' } } } },
+            { name: 'mesh-site' },
+          ],
+        },
+      },
+    },
+  });
+  const collector = managed('mesh-collector', {
+    metadata: { labels: { 'di-framework.dev/workload': 'mesh' } },
+    spec: {
+      template: {
+        spec: {
+          service: {
+            image: 'collector',
+            localResources: { environment: { config: { MODE: 'c' } } },
+          },
+          components: [{}],
+        },
+      },
+    },
+  });
+
+  it('lists each variable with its part, named like the parts', () => {
+    const [view] = summarizeApplications([site, collector]);
+    expect(view?.parts.map((part) => part.name)).toEqual([
+      'mesh-collector',
+      'component',
+      'mesh-site',
+      'mesh-site-2',
+    ]);
+    expect(view?.environment).toEqual([
+      { key: 'MODE', value: 'c', part: 'mesh-collector' },
+      { key: 'MODE', value: 'site', part: 'mesh-site' },
+    ]);
+  });
+
+  it('sets and removes a variable on the chosen part', () => {
+    expect(planEnvironmentSet([site, collector], 'TOPICS', 'a', 'mesh-site-2')).toEqual({
+      workload: 'mesh-site',
+      ops: [
+        {
+          op: 'add',
+          path: '/spec/template/spec/components/1/localResources',
+          value: { environment: { config: { TOPICS: 'a' } } },
+        },
+      ],
+    });
+    // Without a part a new variable goes to the first part, and an existing one stays where it is.
+    expect(planEnvironmentSet([site, collector], 'TOPICS', 'a').workload).toBe('mesh-collector');
+    expect(planEnvironmentSet([collector, site], 'MODE', 'b').ops[0]?.path).toBe(
+      '/spec/template/spec/service/localResources/environment/config/MODE',
+    );
+    expect(() => planEnvironmentSet([site], 'TOPICS', 'a', 'missing')).toThrow(
+      expect.objectContaining({ status: 404, code: 'PART_NOT_FOUND' }),
+    );
+    expect(planEnvironmentDelete([site, collector], 'MODE', 'mesh-site')).toEqual({
+      workload: 'mesh-site',
+      ops: [
+        {
+          op: 'remove',
+          path: '/spec/template/spec/components/0/localResources/environment/config/MODE',
+        },
+      ],
+    });
+    expect(() => planEnvironmentDelete([site, collector], 'MODE', 'mesh-site-2')).toThrow(
+      'No environment variable',
+    );
+    expect(() => planEnvironmentDelete([site], 'MODE', 'missing')).toThrow('No part');
+    expect(planEnvironmentDelete([managed('nameless'), site], 'MODE').workload).toBe('mesh-site');
+  });
+});
+
+describe('console host failures', () => {
+  const member = (name: string, replicaSet?: string) =>
+    managed(name, {
+      metadata: { labels: { 'di-framework.dev/workload': 'mesh' } },
+      spec: { template: { spec: { components: [{ name }] } } },
+      status: {
+        conditions: [{ type: 'Ready', status: 'True' }],
+        ...(replicaSet === undefined ? {} : { currentReplicaSet: { name: replicaSet } }),
+      },
+    });
+  const failure = (workload: string, message = 'service did not properly execute') => ({
+    workload,
+    time: '2026-10-01T19:19:39Z',
+    level: 'WARN' as const,
+    message,
+  });
+
+  it('marks the part whose current revision failed and the application with it', () => {
+    const [view] = summarizeApplications(
+      [member('mesh-collector', 'mesh-collector-ff55d9589'), member('mesh-site', 'mesh-site-64f')],
+      [],
+      new Map([
+        ['mesh-collector', failure('mesh-collector-ff55d9589-795c7b5cd6')],
+        ['mesh-site', failure('mesh-site-dd5fc4dc-558f5d4b4', 'no host header found')],
+      ]),
+    );
+    expect(view?.ready).toBe(false);
+    expect(view?.failed).toBe(true);
+    expect(view?.detail).toBe('mesh-collector failed: service did not properly execute');
+    expect(view?.parts).toEqual([
+      {
+        name: 'mesh-collector',
+        kind: 'component',
+        lifetime: 'on-demand',
+        failure: 'service did not properly execute',
+      },
+      { name: 'mesh-site', kind: 'component', lifetime: 'on-demand' },
+    ]);
+    if (view) expect(toSummary(view)).toMatchObject({ ready: false, failed: true });
+  });
+
+  it('ignores failures of older revisions and members without a replica set', () => {
+    const [view] = summarizeApplications(
+      [member('mesh-site', 'mesh-site-64f85bb94f'), member('mesh-collector')],
+      [],
+      new Map([
+        ['mesh-site', failure('mesh-site-dd5fc4dc-558f5d4b4')],
+        ['mesh-collector', failure('mesh-collector-ff55d9589-1')],
+      ]),
+    );
+    expect(view?.ready).toBe(true);
+    expect(view?.failed).toBeUndefined();
+    if (view) expect(toSummary(view).failed).toBeUndefined();
+    const [blank] = summarizeApplications(
+      [member('mesh-site', 'mesh-site-64f85bb94f')],
+      [],
+      new Map([['mesh-site', failure('mesh-site-64f85bb94f-1', '  ')]]),
+    );
+    expect(blank?.detail).toBe('mesh-site failed: The host could not start it.');
+    const [redacted] = summarizeApplications(
+      [member('mesh-site', 'mesh-site-64f85bb94f')],
+      [],
+      new Map([['mesh-site', failure('mesh-site-64f85bb94f-1', `token=${SECRET}`)]]),
+    );
+    expect(redacted?.detail).not.toContain(SECRET);
+  });
+});
+
+describe('console route links', () => {
+  const template = 'http://{host}.meshtastic.localhost:28180';
+
+  it('builds a gateway address for each enabled route', () => {
+    expect(routeUrl(template, 'mesh-site', '/')).toBe(
+      'http://mesh-site.meshtastic.localhost:28180/',
+    );
+    expect(routeUrl(template, 'api.v2', '/admin')).toBe(
+      'http://api.v2.meshtastic.localhost:28180/admin',
+    );
+    expect(routeUrl(`${template}/`, 'mesh-site', '/admin')).toBe(
+      'http://mesh-site.meshtastic.localhost:28180/admin',
+    );
+    expect(routeUrl('https://{host}.example.test', 'site', '/')).toBe('https://site.example.test/');
+    expect(routeUrl('http://gateway.localhost', 'site', '/')).toBeUndefined();
+    expect(routeUrl('javascript:{host}', 'site', '/')).toBeUndefined();
+    expect(routeUrl('http://user:pw@{host}.localhost', 'site', '/')).toBeUndefined();
+    expect(routeUrl('http://[{host}', 'site', '/')).toBeUndefined();
+    const live = { id: 'a', host: 'mesh-site', path: '/', enabled: true };
+    const paused = { id: 'b', host: 'paused', path: '/', enabled: false };
+    const routes = [live, paused];
+    expect(withRouteUrls(routes, template)).toEqual([
+      { ...live, url: 'http://mesh-site.meshtastic.localhost:28180/' },
+      paused,
+    ]);
+    expect(withRouteUrls(routes, undefined)).toEqual(routes);
+  });
+});
+
 describe('console command options', () => {
   it('binds loopback and requires a tenant credential', () => {
-    expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 8787 });
+    expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 0 });
+    expect(parseConsoleArgs(['--port', '0']).port).toBe(0);
     expect(parseConsoleArgs(['--host', 'localhost', '--port', '8791']).host).toBe('localhost');
     expect(parseConsoleArgs(['--host', '::1']).host).toBe('::1');
     expect(() => parseConsoleArgs(['--host', '0.0.0.0'])).toThrow(CommandFailure);
     expect(() => parseConsoleArgs(['--host', '10.1.1.8'])).toThrow('loopback');
-    expect(() => parseConsoleArgs(['--port', '0'])).toThrow(CommandFailure);
+    expect(() => parseConsoleArgs(['--port', '-1'])).toThrow(CommandFailure);
+    expect(() => parseConsoleArgs(['--port', '65536'])).toThrow(CommandFailure);
     const tenant = parseDeployManifest(
       '/workspace/di-framework.deploy.toml',
       `default-target = "local"\n[targets.local]\nplatform = "deploy/platform"\n[targets.warehouse]\nkubeconfig = "/tmp/kubeconfig"\nnamespace = "di-tenant-warehouse"\nhostgroup = "tenant-warehouse"\nregistry = "registry.example.com/warehouse"\n`,
@@ -610,7 +1077,14 @@ registry = "registry.example.com/team"
     const writable = true;
     let logs: string[] | undefined;
     let signals: { success: number; error: number; compute?: number[] } | undefined;
+    let routeTemplate: string | undefined;
     const cluster: ConsoleCluster = {
+      async readFailures() {
+        return new Map();
+      },
+      async readRouteTemplate() {
+        return routeTemplate;
+      },
       async listWorkloads() {
         return structuredClone(documents);
       },
@@ -651,8 +1125,10 @@ registry = "registry.example.com/team"
       },
     };
     const created: ServiceCreateInput[] = [];
+    let servicesFail = false;
     const services: ConsoleServices = {
       async list() {
+        if (servicesFail) throw new Error('service list failed');
         return [
           {
             name: 'orders',
@@ -757,8 +1233,33 @@ registry = "registry.example.com/team"
         secrets: Array<{ name: string }>;
         logs: { unpublished?: boolean };
         signals?: unknown;
+        backingServices: Array<{ name: string; service: string; className: string }>;
       };
+      expect(application.backingServices).toEqual([
+        expect.objectContaining({
+          name: 'orders-db',
+          service: 'orders',
+          className: 'postgres-dedicated',
+        }),
+      ]);
+      servicesFail = true;
+      const unclassed = await request(server.port, {
+        path: '/api/applications/greeter',
+        headers: { cookie: session },
+      });
+      servicesFail = false;
+      expect(JSON.parse(unclassed.body).application.backingServices[0].className).toBe('');
       expect(application.parts[0]).toMatchObject({ kind: 'component', lifetime: 'on-demand' });
+      expect(application.routes[0]).not.toHaveProperty('url');
+      routeTemplate = 'http://{host}.warehouse.localhost:28180';
+      const linked = await request(server.port, {
+        path: '/api/applications/greeter',
+        headers: { cookie: session },
+      });
+      routeTemplate = undefined;
+      expect(JSON.parse(linked.body).application.routes[0].url).toBe(
+        'http://greeter.warehouse.localhost:28180/',
+      );
       expect(application.logs).toEqual({ unpublished: true });
       expect(application.signals).toBeUndefined();
       expect(detail.body).not.toContain(SECRET);
@@ -811,6 +1312,43 @@ registry = "registry.example.com/team"
         body: JSON.stringify({ key: 'COLOR', value: 'green' }),
       });
       expect(env.status).toBe(200);
+      const onPart = await request(server.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: auth,
+        body: JSON.stringify({ key: 'SIZE', value: '2', part: 'http' }),
+      });
+      expect(onPart.status).toBe(200);
+      expect(patches.at(-1)).toEqual({
+        name: 'greeter',
+        ops: [
+          {
+            op: 'add',
+            path: '/spec/template/spec/components/0/localResources/environment/config/SIZE',
+            value: '2',
+          },
+        ],
+      });
+      const badPart = await request(server.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: auth,
+        body: JSON.stringify({ key: 'SIZE', value: '2', part: 3 }),
+      });
+      expect(badPart.status).toBe(400);
+      const unknownPart = await request(server.port, {
+        path: '/api/applications/greeter/environment',
+        method: 'PUT',
+        headers: auth,
+        body: JSON.stringify({ key: 'SIZE', value: '2', part: 'nope' }),
+      });
+      expect(unknownPart.status).toBe(404);
+      const removedFromPart = await request(server.port, {
+        path: '/api/applications/greeter/environment/http/COLOR',
+        method: 'DELETE',
+        headers: auth,
+      });
+      expect(removedFromPart.status).toBe(200);
       const removed = await request(server.port, {
         path: '/api/applications/greeter/environment/COLOR',
         method: 'DELETE',

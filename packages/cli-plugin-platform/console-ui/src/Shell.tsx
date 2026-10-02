@@ -13,6 +13,7 @@ import {
   NavItem,
   NavList,
   Page,
+  PageContext,
   PageSection,
   PageSidebar,
   PageSidebarBody,
@@ -25,7 +26,7 @@ import {
 } from '@patternfly/react-core';
 import { BarsIcon, SyncAltIcon } from '@patternfly/react-icons';
 import { observer } from 'mobx-react-lite';
-import type { JSX } from 'react';
+import { type JSX, useContext } from 'react';
 import { ApplicationList } from './ApplicationList';
 import { ApplicationPage } from './ApplicationPage';
 import { BackingServicesPage } from './BackingServicesPage';
@@ -33,6 +34,7 @@ import { Dashboard } from './Dashboard';
 import { ErrorAlert } from './ErrorAlert';
 import { PageHeader } from './PageHeader';
 import { useStore } from './StoreContext';
+import type { Section } from './types';
 
 export const Shell = observer(function Shell(): JSX.Element {
   return (
@@ -108,6 +110,12 @@ const ConsoleMasthead = observer(function ConsoleMasthead(): JSX.Element {
 const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
   const store = useStore();
   const { section } = store.ui;
+  const page = useContext(PageContext);
+  // On a narrow window the sidebar overlays the page; choosing a section closes it.
+  const choose = (next: Section) => {
+    store.navigate(next);
+    if (page.isMobile && page.isSidebarOpen) page.onSidebarToggle();
+  };
   return (
     <PageSidebar className="console-dark">
       <PageSidebarBody>
@@ -117,7 +125,7 @@ const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
               component="button"
               itemId="dashboard"
               isActive={section === 'dashboard'}
-              onClick={() => store.navigate('dashboard')}
+              onClick={() => choose('dashboard')}
             >
               Dashboard
             </NavItem>
@@ -125,7 +133,7 @@ const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
               component="button"
               itemId="applications"
               isActive={section === 'applications'}
-              onClick={() => store.navigate('applications')}
+              onClick={() => choose('applications')}
             >
               Applications
             </NavItem>
@@ -133,7 +141,7 @@ const ConsoleSidebar = observer(function ConsoleSidebar(): JSX.Element {
               component="button"
               itemId="backing-services"
               isActive={section === 'backing-services'}
-              onClick={() => store.navigate('backing-services')}
+              onClick={() => choose('backing-services')}
             >
               Backing services
             </NavItem>

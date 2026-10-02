@@ -8,4 +8,4 @@ export type {
   SessionNode,
   SignalsNode,
 } from './models';
-export { ACTIVITY_LIMIT, ConsoleStore, type ConsoleStoreInstance } from './root';
+export { ACTIVITY_LIMIT, ConsoleStore, type ConsoleStoreInstance, SERVICE_POLL_MS } from './root';

@@ -15,6 +15,8 @@ import {
 } from './models';
 
 export const ACTIVITY_LIMIT = 50;
+/** How often the Backing services page re-reads services while one is not ready. */
+export const SERVICE_POLL_MS = 3000;
 
 /**
  * The console's server state and navigation. Views read this tree and call its actions; only these
@@ -31,7 +33,11 @@ export const ConsoleStore = types
     activity: types.array(Activity),
     ui: types.optional(Ui, {}),
   })
-  .volatile(() => ({ nextActivityId: 1 }))
+  .volatile(() => ({
+    nextActivityId: 1,
+    servicePoll: undefined as ReturnType<typeof setInterval> | undefined,
+    servicePollBusy: false,
+  }))
   .views((self) => ({
     get writable(): boolean {
       return self.session?.writable === true;
@@ -77,7 +83,8 @@ export const ConsoleStore = types
       self.ui.setError(listed.error);
       if (listed.error) record('danger', listed.error);
       for (const app of listed.applications) {
-        if (!app.ready) record('warning', `${app.name}: ${app.detail ?? 'not ready'}`);
+        if (!app.ready)
+          record(app.failed ? 'danger' : 'warning', `${app.name}: ${app.detail ?? 'not ready'}`);
       }
     });
 
@@ -103,12 +110,22 @@ export const ConsoleStore = types
       }
     });
 
+    /** Re-reads the open application so its tabs match the cluster after a refresh. */
+    const refreshOpenApplication = flow(function* () {
+      const name = self.application?.name;
+      if (name === undefined) return;
+      const opened: Awaited<ReturnType<ConsoleClient['application']>> =
+        yield client.application(name);
+      if (self.application?.name === name) showApplication(opened.application);
+    });
+
     const refreshAll = flow(function* () {
       self.ui.refreshing = true;
       try {
         yield refreshApplications();
         yield refreshServices();
         yield refreshSignals();
+        yield refreshOpenApplication();
         self.ui.setError(undefined);
       } catch (error) {
         fail(error);
@@ -155,6 +172,32 @@ export const ConsoleStore = types
         if (self.ui.selectedApplication === name) showApplication(opened.application);
       } catch (error) {
         fail(error);
+      }
+    });
+
+    /**
+     * One poll of the services list. It reads only while a service is not ready, skips a tick while
+     * the previous read is in flight, and records each service that became ready.
+     */
+    const pollServices = flow(function* () {
+      if (self.servicePollBusy || self.services.every((service) => service.ready)) return;
+      self.servicePollBusy = true;
+      try {
+        const waiting = new Set(
+          self.services.filter((service) => !service.ready).map((service) => service.name),
+        );
+        const listed: Awaited<ReturnType<ConsoleClient['backingServices']>> =
+          yield client.backingServices();
+        applySnapshot(self.services, listed.services);
+        for (const service of listed.services) {
+          if (service.ready && waiting.has(service.name)) {
+            record('success', `Backing service ${service.name} is ready.`);
+          }
+        }
+      } catch (error) {
+        fail(error);
+      } finally {
+        self.servicePollBusy = false;
       }
     });
 
@@ -216,6 +259,7 @@ export const ConsoleStore = types
       openApplication,
       selectTab,
       refreshLogs,
+      pollServices,
       clearActivity() {
         self.activity.clear();
       },
@@ -225,16 +269,16 @@ export const ConsoleStore = types
           (name) => `${enabled ? 'Enabled' : 'Disabled'} route ${label} on ${name}.`,
         );
       },
-      setEnvironment(key: string, value: string) {
+      setEnvironment(key: string, value: string, part: string) {
         return changeApplication(
-          (name) => client.setEnvironment(name, key, value),
-          (name) => `Set ${key} on ${name}.`,
+          (name) => client.setEnvironment(name, key, value, part),
+          (name) => `Set ${key} on ${part} in ${name}.`,
         );
       },
-      deleteEnvironment(key: string) {
+      deleteEnvironment(key: string, part: string) {
         return changeApplication(
-          (name) => client.deleteEnvironment(name, key),
-          (name) => `Removed ${key} from ${name}.`,
+          (name) => client.deleteEnvironment(name, key, part),
+          (name) => `Removed ${key} from ${part} in ${name}.`,
         );
       },
       reassignSecret(secret: string, value: string) {
@@ -283,6 +327,20 @@ export const ConsoleStore = types
         );
       },
     };
+  })
+  .actions((self) => {
+    function stopServicePolling() {
+      if (self.servicePoll !== undefined) clearInterval(self.servicePoll);
+      self.servicePoll = undefined;
+    }
+
+    /** The Backing services page polls while it is open; leaving it stops the timer. */
+    function startServicePolling(interval = SERVICE_POLL_MS) {
+      stopServicePolling();
+      self.servicePoll = setInterval(() => void self.pollServices(), interval);
+    }
+
+    return { startServicePolling, stopServicePolling };
   });
 
 export type ConsoleStoreInstance = Instance<typeof ConsoleStore>;

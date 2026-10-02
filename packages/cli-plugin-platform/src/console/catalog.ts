@@ -1,5 +1,5 @@
 import { STORAGE_HOSTGROUP } from '../workload';
-import { ConsoleError, platformSentence } from './errors';
+import { ConsoleError, platformSentence, sanitizePublicText } from './errors';
 
 const RESOURCE_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -24,6 +24,17 @@ const PLATFORM_CONTRACTS = new Set([
   'wasmcloud:blobstore',
 ]);
 const ROUTES_OFF = 'di-framework.dev/routes-off';
+/** The wasi:http host interface that was removed when its last route was turned off. */
+const HTTP_OFF = 'di-framework.dev/http-off';
+const WORKLOAD_INTERFACES = '/spec/template/spec/hostInterfaces';
+const INTERFACE_ARRAY =
+  /^\/spec\/template\/spec\/(hostInterfaces|components\/\d+\/hostInterfaces|service\/hostInterfaces)$/;
+const DEFAULT_HTTP_INTERFACE: HostInterface = {
+  namespace: 'wasi',
+  package: 'http',
+  version: '0.3.0',
+  interfaces: ['handler'],
+};
 const NOT_READY = 'This application is not ready yet.';
 
 export type JsonPatchOp = {
@@ -36,16 +47,35 @@ export type PartView = {
   name: string;
   kind: 'service' | 'component';
   lifetime: 'long-lived' | 'on-demand';
+  /** Set when the host failed to start the part's current revision. */
+  failure?: string;
 };
+
+/**
+ * Newest host failure of one WorkloadDeployment, from the logs projection's `data.failures`.
+ * `workload` is the host workload name, `<currentReplicaSet name>-<suffix>`.
+ */
+export type HostFailure = {
+  workload: string;
+  time: string;
+  level: 'WARN' | 'ERROR';
+  message: string;
+};
+
+/** Host failures by WorkloadDeployment name. */
+export type HostFailures = ReadonlyMap<string, HostFailure>;
 
 export type RouteView = {
   id: string;
   host: string;
   path: string;
   enabled: boolean;
+  /** Gateway address of an enabled route, when the platform publishes a route URL template. */
+  url?: string;
 };
 
-export type EnvView = { key: string; value: string };
+/** One variable on one part; the same name can be set on several parts. */
+export type EnvView = { key: string; value: string; part: string };
 export type SecretView = { name: string };
 
 export type BackingBindingView = {
@@ -65,6 +95,8 @@ export type PrivateBindingView = {
 export type ApplicationSummary = {
   name: string;
   ready: boolean;
+  /** A part's current revision failed to start on the host. */
+  failed?: true;
   detail?: string;
   services: number;
   components: number;
@@ -122,6 +154,7 @@ export type WorkloadDocument = {
   };
   status?: {
     readyReplicas?: number;
+    currentReplicaSet?: { name?: string };
     replicas?: { ready?: number };
     conditions?: Array<{ type?: string; status?: string; reason?: string; message?: string }>;
   };
@@ -186,6 +219,7 @@ export function tenantIdentity(
 export function summarizeApplications(
   documents: readonly WorkloadDocument[],
   bindings: readonly BindingDocument[] = [],
+  failures: HostFailures = new Map(),
 ): ApplicationView[] {
   const groups = new Map<string, WorkloadDocument[]>();
   const labeled = new Map<string, WorkloadDocument[]>();
@@ -223,17 +257,24 @@ export function summarizeApplications(
     members.sort((left, right) =>
       (left.metadata?.name ?? '').localeCompare(right.metadata?.name ?? ''),
     );
-    const parts = dedupePartNames(members.flatMap((member) => partsFrom(member)));
+    const parts = dedupePartNames(
+      members.flatMap((member) => {
+        const failure = currentFailure(member, failures);
+        const found = partsFrom(member);
+        return failure === undefined ? found : found.map((entry) => ({ ...entry, failure }));
+      }),
+    );
     const routes = routesFrom(members);
     const environment = environmentFrom(members);
     const secrets = secretsFrom(members).map((secret) => ({ name: secret.name }));
     const memberNames = members
       .map((member) => member.metadata?.name)
       .filter((entry): entry is string => typeof entry === 'string');
-    const status = applicationStatus(members);
+    const status = applicationStatus(members, failures);
     applications.push({
       name,
       ready: status.ready,
+      ...(status.failed ? { failed: true as const } : {}),
       ...(status.detail ? { detail: status.detail } : {}),
       services: parts.filter((part) => part.kind === 'service').length,
       components: parts.filter((part) => part.kind === 'component').length,
@@ -253,6 +294,7 @@ export function toSummary(application: ApplicationView): ApplicationSummary {
   return {
     name: application.name,
     ready: application.ready,
+    ...(application.failed ? { failed: true as const } : {}),
     ...(application.detail ? { detail: application.detail } : {}),
     services: application.services,
     components: application.components,
@@ -260,6 +302,41 @@ export function toSummary(application: ApplicationView): ApplicationSummary {
   };
 }
 
+/**
+ * A route's gateway address from the tenant's `di-platform-routes` URL template, e.g.
+ * `http://{host}.meshtastic.localhost:28180`. Undefined when the result is not an http(s) URL.
+ */
+export function routeUrl(template: string, host: string, path: string): string | undefined {
+  if (!template.includes('{host}')) return undefined;
+  const base = template.replaceAll('{host}', host);
+  try {
+    const url = new URL(path === '/' ? base : `${base.replace(/\/$/, '')}${path}`);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
+    if (url.username !== '' || url.password !== '') return undefined;
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Adds gateway links to the enabled routes. */
+export function withRouteUrls(
+  routes: readonly RouteView[],
+  template: string | undefined,
+): RouteView[] {
+  if (template === undefined) return [...routes];
+  return routes.map((route) => {
+    const url = route.enabled ? routeUrl(template, route.host, route.path) : undefined;
+    return url === undefined ? route : { ...route, url };
+  });
+}
+
+/**
+ * wash rejects a wasi:http interface without `host` and keeps serving the old revision, so a route is
+ * never turned off by leaving that config empty. Turning off the primary host promotes the next alias.
+ * Turning off the last route removes the interface and remembers it in an annotation; turning a route
+ * on again restores it.
+ */
 export function planRouteUpdate(
   documents: readonly WorkloadDocument[],
   routeId: string,
@@ -270,39 +347,58 @@ export function planRouteUpdate(
     throw new ConsoleError(404, 'ROUTE_NOT_FOUND', 'No route with that address.');
   }
   if (located.enabled === enabled) return { workload: located.workload, ops: [] };
-  const next = enabled
-    ? addRoute(located.config, located.host, located.path)
-    : stripRoute(located.config, located.host, located.path);
   const ops: JsonPatchOp[] = [];
-  if (located.pointer === undefined) {
-    ops.push({
-      op: 'add',
-      path: '/spec/template/spec/hostInterfaces',
-      value: [
-        {
-          namespace: 'wasi',
-          package: 'http',
-          version: '0.3.0',
-          interfaces: ['handler'],
-          config: next,
-        },
-      ],
-    });
+  const annotations: Record<string, string | undefined> = {
+    [ROUTES_OFF]: rememberedValue(located.document, located.host, located.path, enabled),
+  };
+  if (enabled) {
+    const restored = located.slot === undefined ? removedInterface(located.document) : undefined;
+    if (located.slot !== undefined) {
+      ops.push(configOp(located.slot, addRoute(located.slot.config, located.host, located.path)));
+    } else {
+      const array = restored?.array ?? WORKLOAD_INTERFACES;
+      const entry = restored?.entry ?? DEFAULT_HTTP_INTERFACE;
+      const value = {
+        ...entry,
+        config: addRoute({ ...(entry.config ?? {}) }, located.host, located.path),
+      };
+      ops.push(
+        interfaceArray(located.document, array) === undefined
+          ? { op: 'add', path: array, value: [value] }
+          : { op: 'add', path: `${array}/-`, value },
+      );
+      annotations[HTTP_OFF] = undefined;
+    }
   } else {
-    ops.push({
-      op: located.hadConfig ? 'replace' : 'add',
-      path: `${located.pointer}/config`,
-      value: next,
-    });
+    const slot = located.slot as HttpSlot;
+    const next = promoteAlias(stripRoute(slot.config, located.host, located.path));
+    if (next.host !== undefined) {
+      ops.push(configOp(slot, next));
+    } else if (hasRouteKeys(next)) {
+      throw new ConsoleError(
+        409,
+        'ROUTE_REQUIRED',
+        'Turn off the other paths on this host first. wasmCloud needs a host for them.',
+      );
+    } else {
+      ops.push({ op: 'remove', path: slot.pointer });
+      const entry: HostInterface = { ...slot.entry };
+      delete entry.config;
+      if (Object.keys(next).length > 0) entry.config = next;
+      const removed: RemovedInterface = { array: slot.array, entry };
+      annotations[HTTP_OFF] = JSON.stringify(removed);
+    }
   }
-  ops.push(annotationOp(located.document, located.host, located.path, enabled));
+  ops.push(...annotationOps(located.document, annotations));
   return { workload: located.workload, ops };
 }
 
+/** Sets a variable on the named part, or where it is already set, or on the first part. */
 export function planEnvironmentSet(
   documents: readonly WorkloadDocument[],
   key: string,
   value: string,
+  part?: string,
 ): WorkloadChange {
   assertEnvKey(key);
   if (value.length === 0 || value.length > 4096) {
@@ -319,20 +415,29 @@ export function planEnvironmentSet(
       'Add that credential under Secrets. Environment values cannot contain passwords.',
     );
   }
-  const existing = findConfigKey(documents, key);
-  const target = existing ?? firstConfigurable(documents);
+  const locations = partLocations(documents);
+  const target =
+    part !== undefined
+      ? requirePart(locations, part)
+      : (locations.find((entry) => entry.config[key] !== undefined) ?? locations[0]);
   if (target === undefined) {
     throw new ConsoleError(400, 'NOT_CONFIGURABLE', 'This application has no configurable part.');
   }
   return { workload: target.workload, ops: configValueOps(target, key, value) };
 }
 
+/** Removes a variable from the named part, or from the first part that sets it. */
 export function planEnvironmentDelete(
   documents: readonly WorkloadDocument[],
   key: string,
+  part?: string,
 ): WorkloadChange {
   assertEnvKey(key);
-  const existing = findConfigKey(documents, key);
+  const locations = partLocations(documents);
+  const existing =
+    part !== undefined
+      ? requirePart(locations, part)
+      : locations.find((entry) => entry.config[key] !== undefined);
   if (existing === undefined || existing.config[key] === undefined) {
     throw new ConsoleError(404, 'ENV_NOT_FOUND', `No environment variable named ${key}.`);
   }
@@ -356,7 +461,7 @@ export function planSecretReassign(
     throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
   }
   if (match.kind === 'secret') return { secret: name };
-  const located = findConfigKey(documents, name);
+  const located = partLocations(documents).find((entry) => entry.config[name] !== undefined);
   if (located === undefined) {
     throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
   }
@@ -431,10 +536,21 @@ function dedupePartNames(parts: PartView[]): PartView[] {
   });
 }
 
-function applicationStatus(members: readonly WorkloadDocument[]): {
+function applicationStatus(
+  members: readonly WorkloadDocument[],
+  failures: HostFailures,
+): {
   ready: boolean;
+  failed?: true;
   detail?: string;
 } {
+  // A failed start outranks readiness: wash can report a workload Ready that never ran.
+  for (const member of members) {
+    const failure = currentFailure(member, failures);
+    if (failure !== undefined) {
+      return { ready: false, failed: true, detail: `${member.metadata?.name} failed: ${failure}` };
+    }
+  }
   for (const member of members) {
     const status = memberStatus(member);
     if (!status.ready) return status;
@@ -453,6 +569,19 @@ function memberStatus(document: WorkloadDocument): { ready: boolean; detail?: st
   return { ready: false, detail: platformSentence(condition?.message) ?? NOT_READY };
 }
 
+/**
+ * The failure message when the newest host failure belongs to the member's current revision. An
+ * older revision's failure no longer counts once a new replica set rolls out.
+ */
+function currentFailure(member: WorkloadDocument, failures: HostFailures): string | undefined {
+  const name = member.metadata?.name;
+  const replicaSet = member.status?.currentReplicaSet?.name;
+  if (name === undefined || replicaSet === undefined || replicaSet.length === 0) return undefined;
+  const failure = failures.get(name);
+  if (failure === undefined || !failure.workload.startsWith(`${replicaSet}-`)) return undefined;
+  return sanitizePublicText(failure.message, 200).trim() || 'The host could not start it.';
+}
+
 type RouteHit = {
   id: string;
   host: string;
@@ -460,10 +589,10 @@ type RouteHit = {
   enabled: boolean;
   workload: string;
   document: WorkloadDocument;
-  pointer?: string;
-  hadConfig: boolean;
-  config: Record<string, string>;
+  slot?: HttpSlot;
 };
+
+type RemovedInterface = { array: string; entry: HostInterface };
 
 function routesFrom(members: readonly WorkloadDocument[]): RouteView[] {
   const routes = new Map<string, RouteView>();
@@ -492,55 +621,100 @@ function locateRoute(
     for (const slot of httpSlots(document)) {
       for (const route of routesInConfig(slot.config)) {
         if (route.id !== routeId) continue;
-        return {
-          ...route,
-          enabled: true,
-          workload,
-          document,
-          pointer: slot.pointer,
-          hadConfig: slot.hadConfig,
-          config: slot.config,
-        };
+        return { ...route, enabled: true, workload, document, slot };
       }
     }
     for (const route of rememberedRoutes(document)) {
       if (route.id !== routeId) continue;
       const slot = httpSlots(document)[0];
-      return {
-        ...route,
-        enabled: false,
-        workload,
-        document,
-        ...(slot
-          ? { pointer: slot.pointer, hadConfig: slot.hadConfig, config: slot.config }
-          : { hadConfig: false, config: {} }),
-      };
+      return { ...route, enabled: false, workload, document, ...(slot ? { slot } : {}) };
     }
   }
   return undefined;
 }
 
-type HttpSlot = { pointer: string; hadConfig: boolean; config: Record<string, string> };
+type HttpSlot = {
+  /** JSON pointer of the interface entry. */
+  pointer: string;
+  /** JSON pointer of the array that holds it. */
+  array: string;
+  entry: HostInterface;
+  hadConfig: boolean;
+  config: Record<string, string>;
+};
 
 function httpSlots(document: WorkloadDocument): HttpSlot[] {
   const spec = document.spec?.template?.spec;
   const slots: HttpSlot[] = [];
-  const visit = (interfaces: HostInterface[] | undefined, pointer: string) => {
+  const visit = (interfaces: HostInterface[] | undefined, array: string) => {
     interfaces?.forEach((entry, index) => {
       if (entry.namespace !== 'wasi' || entry.package !== 'http') return;
       slots.push({
-        pointer: `${pointer}/${index}`,
+        pointer: `${array}/${index}`,
+        array,
+        entry,
         hadConfig: entry.config !== undefined,
         config: { ...(entry.config ?? {}) },
       });
     });
   };
-  visit(spec?.hostInterfaces, '/spec/template/spec/hostInterfaces');
+  visit(spec?.hostInterfaces, WORKLOAD_INTERFACES);
   spec?.components?.forEach((component, index) => {
     visit(component.hostInterfaces, `/spec/template/spec/components/${index}/hostInterfaces`);
   });
   visit(spec?.service?.hostInterfaces, '/spec/template/spec/service/hostInterfaces');
   return slots;
+}
+
+function configOp(slot: HttpSlot, config: Record<string, string>): JsonPatchOp {
+  return { op: slot.hadConfig ? 'replace' : 'add', path: `${slot.pointer}/config`, value: config };
+}
+
+/** wash needs a primary `host`; the first remaining alias takes over when the host is turned off. */
+function promoteAlias(config: Record<string, string>): Record<string, string> {
+  if (config.host !== undefined) return config;
+  const [first, ...rest] = splitComma(config['host-aliases']);
+  if (first === undefined) return config;
+  const next: Record<string, string> = { ...config, host: first };
+  if (rest.length === 0) delete next['host-aliases'];
+  else next['host-aliases'] = rest.join(',');
+  return next;
+}
+
+function hasRouteKeys(config: Record<string, string>): boolean {
+  return config.localRoute !== undefined;
+}
+
+/** The interface array a pointer names, or undefined when it (or its component) is absent. */
+function interfaceArray(document: WorkloadDocument, array: string): HostInterface[] | undefined {
+  const spec = document.spec?.template?.spec;
+  if (array === WORKLOAD_INTERFACES) return spec?.hostInterfaces;
+  if (array === '/spec/template/spec/service/hostInterfaces') return spec?.service?.hostInterfaces;
+  const index = Number(array.split('/')[5]);
+  return spec?.components?.[index]?.hostInterfaces;
+}
+
+function removedInterface(document: WorkloadDocument): RemovedInterface | undefined {
+  const raw = document.metadata?.annotations?.[HTTP_OFF];
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { array?: unknown; entry?: unknown };
+    const { array, entry } = parsed;
+    if (typeof array !== 'string' || !INTERFACE_ARRAY.test(array)) return undefined;
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+    const candidate = entry as HostInterface;
+    if (candidate.namespace !== 'wasi' || candidate.package !== 'http') return undefined;
+    // A component array whose component is gone cannot take the interface back.
+    if (array.includes('/components/') && !componentExists(document, array)) return undefined;
+    return { array, entry: candidate };
+  } catch {
+    return undefined;
+  }
+}
+
+function componentExists(document: WorkloadDocument, array: string): boolean {
+  const index = Number(array.split('/')[5]);
+  return document.spec?.template?.spec?.components?.[index] !== undefined;
 }
 
 function routesInConfig(config: Record<string, string>): Array<Omit<RouteView, 'enabled'>> {
@@ -623,12 +797,12 @@ function stripRoute(
   return next;
 }
 
-function annotationOp(
+function rememberedValue(
   document: WorkloadDocument,
   host: string,
   path: string,
   enabled: boolean,
-): JsonPatchOp {
+): string {
   const current = rememberedRoutes(document).map((route) => ({
     host: route.host,
     path: route.path,
@@ -638,34 +812,42 @@ function annotationOp(
     : current.some((route) => route.host === host && route.path === path)
       ? current
       : [...current, { host, path }];
-  const value = JSON.stringify(next);
+  return JSON.stringify(next);
+}
+
+/** Sets (string) or removes (undefined) annotations. */
+function annotationOps(
+  document: WorkloadDocument,
+  changes: Record<string, string | undefined>,
+): JsonPatchOp[] {
   const annotations = document.metadata?.annotations;
   if (annotations === undefined) {
-    return { op: 'add', path: '/metadata/annotations', value: { [ROUTES_OFF]: value } };
+    const value: Record<string, string> = {};
+    for (const [key, entry] of Object.entries(changes)) if (entry !== undefined) value[key] = entry;
+    return [{ op: 'add', path: '/metadata/annotations', value }];
   }
-  const existing = annotations[ROUTES_OFF];
-  return {
-    op: existing === undefined ? 'add' : 'replace',
-    path: `/metadata/annotations/${ROUTES_OFF.replaceAll('~', '~0').replaceAll('/', '~1')}`,
-    value,
-  };
+  const ops: JsonPatchOp[] = [];
+  for (const [key, value] of Object.entries(changes)) {
+    const path = `/metadata/annotations/${key.replaceAll('~', '~0').replaceAll('/', '~1')}`;
+    const exists = annotations[key] !== undefined;
+    if (value !== undefined) ops.push({ op: exists ? 'replace' : 'add', path, value });
+    else if (exists) ops.push({ op: 'remove', path });
+  }
+  return ops;
 }
 
 function environmentFrom(members: readonly WorkloadDocument[]): EnvView[] {
-  const values = new Map<string, string>();
-  for (const member of members) {
-    for (const config of configs(member)) {
-      for (const key of Object.keys(config).sort()) {
-        const value = config[key] ?? '';
-        if (HIDDEN_CONFIG.test(key) || isSensitiveConfigKey(key) || containsCredential(value))
-          continue;
-        values.set(key, value);
-      }
+  const entries: EnvView[] = [];
+  for (const located of partLocations(members)) {
+    for (const [key, value] of Object.entries(located.config)) {
+      if (HIDDEN_CONFIG.test(key) || isSensitiveConfigKey(key) || containsCredential(value))
+        continue;
+      entries.push({ key, value, part: located.name });
     }
   }
-  return [...values.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => ({ key, value }));
+  return entries.sort(
+    (left, right) => left.key.localeCompare(right.key) || left.part.localeCompare(right.part),
+  );
 }
 
 function secretsFrom(members: readonly WorkloadDocument[]): SecretSource[] {
@@ -720,12 +902,21 @@ function backingBindings(
     views.push({
       name,
       service,
-      className: binding.spec?.capability ?? '',
+      // The bound service's class comes from the BackingService; see withServiceClasses.
+      className: '',
       ready,
       ...(detail ? { detail } : {}),
     });
   }
   return views.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** Names each binding's class from the bound BackingService (service name to class name). */
+export function withServiceClasses(
+  bindings: readonly BackingBindingView[],
+  classes: ReadonlyMap<string, string>,
+): BackingBindingView[] {
+  return bindings.map((binding) => ({ ...binding, className: classes.get(binding.service) ?? '' }));
 }
 
 function privateBindings(members: readonly WorkloadDocument[]): PrivateBindingView[] {
@@ -785,28 +976,48 @@ function location(workload: string, part: WorkloadPart, pointer: string): Config
   };
 }
 
-function configs(document: WorkloadDocument): Record<string, string>[] {
-  return configLocations(document).map((entry) => entry.config);
-}
+type PartLocation = ConfigLocation & { name: string };
 
-function findConfigKey(
-  documents: readonly WorkloadDocument[],
-  key: string,
-): ConfigLocation | undefined {
-  for (const document of documents) {
-    for (const located of configLocations(document)) {
-      if (located.config[key] !== undefined) return located;
+/**
+ * Config locations named like the Overview parts: members by name, a member's service before its
+ * components, and repeated names numbered the same way.
+ */
+function partLocations(documents: readonly WorkloadDocument[]): PartLocation[] {
+  const members = [...documents].sort((left, right) =>
+    (left.metadata?.name ?? '').localeCompare(right.metadata?.name ?? ''),
+  );
+  const named: PartLocation[] = [];
+  for (const member of members) {
+    const workload = member.metadata?.name;
+    const spec = member.spec?.template?.spec;
+    if (workload === undefined) continue;
+    if (spec?.service !== undefined && typeof spec.service === 'object') {
+      named.push({
+        ...location(workload, spec.service, '/spec/template/spec/service'),
+        name: spec.service.name || workload,
+      });
     }
+    spec?.components?.forEach((component, index) => {
+      named.push({
+        ...location(workload, component, `/spec/template/spec/components/${index}`),
+        name: component.name || 'component',
+      });
+    });
   }
-  return undefined;
+  const seen = new Map<string, number>();
+  return named.map((entry) => {
+    const count = seen.get(entry.name) ?? 0;
+    seen.set(entry.name, count + 1);
+    return count === 0 ? entry : { ...entry, name: `${entry.name}-${count + 1}` };
+  });
 }
 
-function firstConfigurable(documents: readonly WorkloadDocument[]): ConfigLocation | undefined {
-  for (const document of documents) {
-    const located = configLocations(document)[0];
-    if (located !== undefined) return located;
+function requirePart(locations: readonly PartLocation[], part: string): PartLocation {
+  const found = locations.find((entry) => entry.name === part);
+  if (found === undefined) {
+    throw new ConsoleError(404, 'PART_NOT_FOUND', `No part named ${part}.`);
   }
-  return undefined;
+  return found;
 }
 
 function configValueOps(located: ConfigLocation, key: string, value: string): JsonPatchOp[] {

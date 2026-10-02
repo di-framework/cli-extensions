@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { Stream } from 'node:stream';
 import {
   familyFromHost,
   formatIpSocketAddress,
@@ -77,7 +78,8 @@ function emitSocketError(emitter: EventEmitter, error: unknown): void {
   emitter.emit('error', error);
 }
 
-export class Socket extends EventEmitter {
+// Node's Socket is a stream; the legacy Stream base gives it `pipe` (mqtt pipes the socket).
+export class Socket extends Stream {
   connecting = false;
   pending = true;
   destroyed = false;
