@@ -24,6 +24,17 @@ const PLATFORM_CONTRACTS = new Set([
   'wasmcloud:blobstore',
 ]);
 const ROUTES_OFF = 'di-framework.dev/routes-off';
+/** The wasi:http host interface that was removed when its last route was turned off. */
+const HTTP_OFF = 'di-framework.dev/http-off';
+const WORKLOAD_INTERFACES = '/spec/template/spec/hostInterfaces';
+const INTERFACE_ARRAY =
+  /^\/spec\/template\/spec\/(hostInterfaces|components\/\d+\/hostInterfaces|service\/hostInterfaces)$/;
+const DEFAULT_HTTP_INTERFACE: HostInterface = {
+  namespace: 'wasi',
+  package: 'http',
+  version: '0.3.0',
+  interfaces: ['handler'],
+};
 const NOT_READY = 'This application is not ready yet.';
 
 export type JsonPatchOp = {
@@ -260,6 +271,12 @@ export function toSummary(application: ApplicationView): ApplicationSummary {
   };
 }
 
+/**
+ * wash rejects a wasi:http interface without `host` and keeps serving the old revision, so a route is
+ * never turned off by leaving that config empty. Turning off the primary host promotes the next alias.
+ * Turning off the last route removes the interface and remembers it in an annotation; turning a route
+ * on again restores it.
+ */
 export function planRouteUpdate(
   documents: readonly WorkloadDocument[],
   routeId: string,
@@ -270,32 +287,49 @@ export function planRouteUpdate(
     throw new ConsoleError(404, 'ROUTE_NOT_FOUND', 'No route with that address.');
   }
   if (located.enabled === enabled) return { workload: located.workload, ops: [] };
-  const next = enabled
-    ? addRoute(located.config, located.host, located.path)
-    : stripRoute(located.config, located.host, located.path);
   const ops: JsonPatchOp[] = [];
-  if (located.pointer === undefined) {
-    ops.push({
-      op: 'add',
-      path: '/spec/template/spec/hostInterfaces',
-      value: [
-        {
-          namespace: 'wasi',
-          package: 'http',
-          version: '0.3.0',
-          interfaces: ['handler'],
-          config: next,
-        },
-      ],
-    });
+  const annotations: Record<string, string | undefined> = {
+    [ROUTES_OFF]: rememberedValue(located.document, located.host, located.path, enabled),
+  };
+  if (enabled) {
+    const restored = located.slot === undefined ? removedInterface(located.document) : undefined;
+    if (located.slot !== undefined) {
+      ops.push(configOp(located.slot, addRoute(located.slot.config, located.host, located.path)));
+    } else {
+      const array = restored?.array ?? WORKLOAD_INTERFACES;
+      const entry = restored?.entry ?? DEFAULT_HTTP_INTERFACE;
+      const value = {
+        ...entry,
+        config: addRoute({ ...(entry.config ?? {}) }, located.host, located.path),
+      };
+      ops.push(
+        interfaceArray(located.document, array) === undefined
+          ? { op: 'add', path: array, value: [value] }
+          : { op: 'add', path: `${array}/-`, value },
+      );
+      annotations[HTTP_OFF] = undefined;
+    }
   } else {
-    ops.push({
-      op: located.hadConfig ? 'replace' : 'add',
-      path: `${located.pointer}/config`,
-      value: next,
-    });
+    const slot = located.slot as HttpSlot;
+    const next = promoteAlias(stripRoute(slot.config, located.host, located.path));
+    if (next.host !== undefined) {
+      ops.push(configOp(slot, next));
+    } else if (hasRouteKeys(next)) {
+      throw new ConsoleError(
+        409,
+        'ROUTE_REQUIRED',
+        'Turn off the other paths on this host first. wasmCloud needs a host for them.',
+      );
+    } else {
+      ops.push({ op: 'remove', path: slot.pointer });
+      const entry: HostInterface = { ...slot.entry };
+      delete entry.config;
+      if (Object.keys(next).length > 0) entry.config = next;
+      const removed: RemovedInterface = { array: slot.array, entry };
+      annotations[HTTP_OFF] = JSON.stringify(removed);
+    }
   }
-  ops.push(annotationOp(located.document, located.host, located.path, enabled));
+  ops.push(...annotationOps(located.document, annotations));
   return { workload: located.workload, ops };
 }
 
@@ -460,10 +494,10 @@ type RouteHit = {
   enabled: boolean;
   workload: string;
   document: WorkloadDocument;
-  pointer?: string;
-  hadConfig: boolean;
-  config: Record<string, string>;
+  slot?: HttpSlot;
 };
+
+type RemovedInterface = { array: string; entry: HostInterface };
 
 function routesFrom(members: readonly WorkloadDocument[]): RouteView[] {
   const routes = new Map<string, RouteView>();
@@ -492,55 +526,100 @@ function locateRoute(
     for (const slot of httpSlots(document)) {
       for (const route of routesInConfig(slot.config)) {
         if (route.id !== routeId) continue;
-        return {
-          ...route,
-          enabled: true,
-          workload,
-          document,
-          pointer: slot.pointer,
-          hadConfig: slot.hadConfig,
-          config: slot.config,
-        };
+        return { ...route, enabled: true, workload, document, slot };
       }
     }
     for (const route of rememberedRoutes(document)) {
       if (route.id !== routeId) continue;
       const slot = httpSlots(document)[0];
-      return {
-        ...route,
-        enabled: false,
-        workload,
-        document,
-        ...(slot
-          ? { pointer: slot.pointer, hadConfig: slot.hadConfig, config: slot.config }
-          : { hadConfig: false, config: {} }),
-      };
+      return { ...route, enabled: false, workload, document, ...(slot ? { slot } : {}) };
     }
   }
   return undefined;
 }
 
-type HttpSlot = { pointer: string; hadConfig: boolean; config: Record<string, string> };
+type HttpSlot = {
+  /** JSON pointer of the interface entry. */
+  pointer: string;
+  /** JSON pointer of the array that holds it. */
+  array: string;
+  entry: HostInterface;
+  hadConfig: boolean;
+  config: Record<string, string>;
+};
 
 function httpSlots(document: WorkloadDocument): HttpSlot[] {
   const spec = document.spec?.template?.spec;
   const slots: HttpSlot[] = [];
-  const visit = (interfaces: HostInterface[] | undefined, pointer: string) => {
+  const visit = (interfaces: HostInterface[] | undefined, array: string) => {
     interfaces?.forEach((entry, index) => {
       if (entry.namespace !== 'wasi' || entry.package !== 'http') return;
       slots.push({
-        pointer: `${pointer}/${index}`,
+        pointer: `${array}/${index}`,
+        array,
+        entry,
         hadConfig: entry.config !== undefined,
         config: { ...(entry.config ?? {}) },
       });
     });
   };
-  visit(spec?.hostInterfaces, '/spec/template/spec/hostInterfaces');
+  visit(spec?.hostInterfaces, WORKLOAD_INTERFACES);
   spec?.components?.forEach((component, index) => {
     visit(component.hostInterfaces, `/spec/template/spec/components/${index}/hostInterfaces`);
   });
   visit(spec?.service?.hostInterfaces, '/spec/template/spec/service/hostInterfaces');
   return slots;
+}
+
+function configOp(slot: HttpSlot, config: Record<string, string>): JsonPatchOp {
+  return { op: slot.hadConfig ? 'replace' : 'add', path: `${slot.pointer}/config`, value: config };
+}
+
+/** wash needs a primary `host`; the first remaining alias takes over when the host is turned off. */
+function promoteAlias(config: Record<string, string>): Record<string, string> {
+  if (config.host !== undefined) return config;
+  const [first, ...rest] = splitComma(config['host-aliases']);
+  if (first === undefined) return config;
+  const next: Record<string, string> = { ...config, host: first };
+  if (rest.length === 0) delete next['host-aliases'];
+  else next['host-aliases'] = rest.join(',');
+  return next;
+}
+
+function hasRouteKeys(config: Record<string, string>): boolean {
+  return config.localRoute !== undefined;
+}
+
+/** The interface array a pointer names, or undefined when it (or its component) is absent. */
+function interfaceArray(document: WorkloadDocument, array: string): HostInterface[] | undefined {
+  const spec = document.spec?.template?.spec;
+  if (array === WORKLOAD_INTERFACES) return spec?.hostInterfaces;
+  if (array === '/spec/template/spec/service/hostInterfaces') return spec?.service?.hostInterfaces;
+  const index = Number(array.split('/')[5]);
+  return spec?.components?.[index]?.hostInterfaces;
+}
+
+function removedInterface(document: WorkloadDocument): RemovedInterface | undefined {
+  const raw = document.metadata?.annotations?.[HTTP_OFF];
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { array?: unknown; entry?: unknown };
+    const { array, entry } = parsed;
+    if (typeof array !== 'string' || !INTERFACE_ARRAY.test(array)) return undefined;
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+    const candidate = entry as HostInterface;
+    if (candidate.namespace !== 'wasi' || candidate.package !== 'http') return undefined;
+    // A component array whose component is gone cannot take the interface back.
+    if (array.includes('/components/') && !componentExists(document, array)) return undefined;
+    return { array, entry: candidate };
+  } catch {
+    return undefined;
+  }
+}
+
+function componentExists(document: WorkloadDocument, array: string): boolean {
+  const index = Number(array.split('/')[5]);
+  return document.spec?.template?.spec?.components?.[index] !== undefined;
 }
 
 function routesInConfig(config: Record<string, string>): Array<Omit<RouteView, 'enabled'>> {
@@ -623,12 +702,12 @@ function stripRoute(
   return next;
 }
 
-function annotationOp(
+function rememberedValue(
   document: WorkloadDocument,
   host: string,
   path: string,
   enabled: boolean,
-): JsonPatchOp {
+): string {
   const current = rememberedRoutes(document).map((route) => ({
     host: route.host,
     path: route.path,
@@ -638,17 +717,28 @@ function annotationOp(
     : current.some((route) => route.host === host && route.path === path)
       ? current
       : [...current, { host, path }];
-  const value = JSON.stringify(next);
+  return JSON.stringify(next);
+}
+
+/** Sets (string) or removes (undefined) annotations. */
+function annotationOps(
+  document: WorkloadDocument,
+  changes: Record<string, string | undefined>,
+): JsonPatchOp[] {
   const annotations = document.metadata?.annotations;
   if (annotations === undefined) {
-    return { op: 'add', path: '/metadata/annotations', value: { [ROUTES_OFF]: value } };
+    const value: Record<string, string> = {};
+    for (const [key, entry] of Object.entries(changes)) if (entry !== undefined) value[key] = entry;
+    return [{ op: 'add', path: '/metadata/annotations', value }];
   }
-  const existing = annotations[ROUTES_OFF];
-  return {
-    op: existing === undefined ? 'add' : 'replace',
-    path: `/metadata/annotations/${ROUTES_OFF.replaceAll('~', '~0').replaceAll('/', '~1')}`,
-    value,
-  };
+  const ops: JsonPatchOp[] = [];
+  for (const [key, value] of Object.entries(changes)) {
+    const path = `/metadata/annotations/${key.replaceAll('~', '~0').replaceAll('/', '~1')}`;
+    const exists = annotations[key] !== undefined;
+    if (value !== undefined) ops.push({ op: exists ? 'replace' : 'add', path, value });
+    else if (exists) ops.push({ op: 'remove', path });
+  }
+  return ops;
 }
 
 function environmentFrom(members: readonly WorkloadDocument[]): EnvView[] {
