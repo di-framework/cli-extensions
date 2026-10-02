@@ -210,6 +210,70 @@ describe('console branches', () => {
     });
   });
 
+  it('reads host failures from every logs projection', async () => {
+    const failure = (
+      workload: string,
+      time: string,
+      message = 'service did not properly execute',
+    ) => ({
+      workload,
+      time,
+      level: 'WARN',
+      message,
+    });
+    const projections = clusterFrom((args) => {
+      expect(args).toContain('di-framework.dev/projection=logs');
+      return {
+        stdout: JSON.stringify({
+          items: [
+            {
+              data: {
+                failures: JSON.stringify({
+                  'mesh-collector': failure(
+                    'mesh-collector-ff55d9589-795c7b5cd6',
+                    '2026-10-01T19:19:39Z',
+                  ),
+                  'mesh-site': failure('mesh-site-dd5fc4dc-558f5d4b4', '2026-10-01T18:56:38Z'),
+                  partial: { workload: 'x', time: 't', level: 'INFO', message: 'm' },
+                  empty: null,
+                }),
+              },
+            },
+            {
+              data: {
+                failures: JSON.stringify({
+                  'mesh-site': failure('mesh-site-64f85bb94f-1', '2026-10-01T19:00:00Z', 'newer'),
+                  'mesh-collector': failure('mesh-collector-old-1', '2026-10-01T18:00:00Z'),
+                }),
+              },
+            },
+            { data: { failures: '{' } },
+            { data: { failures: '[]' } },
+            { data: { failures: 3 } },
+            { data: {} },
+            null,
+          ],
+        }),
+      };
+    });
+    const read = await projections.cluster.readFailures(connection);
+    expect([...read.keys()].sort()).toEqual(['mesh-collector', 'mesh-site']);
+    expect(read.get('mesh-site')).toEqual({
+      workload: 'mesh-site-64f85bb94f-1',
+      time: '2026-10-01T19:00:00Z',
+      level: 'WARN',
+      message: 'newer',
+    });
+    expect(read.get('mesh-collector')?.workload).toBe('mesh-collector-ff55d9589-795c7b5cd6');
+
+    const denied = clusterFrom(() => ({ exitCode: 1, stderr: 'Error from server (Forbidden)' }));
+    expect((await denied.cluster.readFailures(connection)).size).toBe(0);
+    const failed = clusterFrom(() => ({ exitCode: 1, stdout: 'connection timed out' }));
+    await expect(failed.cluster.readFailures(connection)).rejects.toMatchObject({ status: 502 });
+    const malformed = clusterFrom(() => ({ stdout: '{' }));
+    await expect(malformed.cluster.readFailures(connection)).rejects.toMatchObject({ status: 502 });
+  });
+
   it('reads backing services through the service commands', async () => {
     const workspace = makeWorkspace({
       manifest: `[targets.development]\nkubeconfig = "\${kubeconfig}"\nnamespace = "wasmcloud"\nhostgroup = "tenant-development"\nregistry = "registry.example.com/team"\n`,
@@ -319,6 +383,9 @@ describe('console branches', () => {
               status: { readyReplicas: 1 },
             },
           ] as WorkloadDocument[];
+        },
+        async readFailures() {
+          throw new Error('projection list failed');
         },
         async listBindings() {
           return [];
@@ -797,6 +864,9 @@ function idleCluster(canWrite: ConsoleCluster['canWrite'] = async () => true): C
   return {
     async listWorkloads() {
       return [];
+    },
+    async readFailures() {
+      return new Map();
     },
     async listBindings() {
       return [];

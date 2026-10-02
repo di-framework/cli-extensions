@@ -1,5 +1,5 @@
 import { STORAGE_HOSTGROUP } from '../workload';
-import { ConsoleError, platformSentence } from './errors';
+import { ConsoleError, platformSentence, sanitizePublicText } from './errors';
 
 const RESOURCE_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -47,7 +47,23 @@ export type PartView = {
   name: string;
   kind: 'service' | 'component';
   lifetime: 'long-lived' | 'on-demand';
+  /** Set when the host failed to start the part's current revision. */
+  failure?: string;
 };
+
+/**
+ * Newest host failure of one WorkloadDeployment, from the logs projection's `data.failures`.
+ * `workload` is the host workload name, `<currentReplicaSet name>-<suffix>`.
+ */
+export type HostFailure = {
+  workload: string;
+  time: string;
+  level: 'WARN' | 'ERROR';
+  message: string;
+};
+
+/** Host failures by WorkloadDeployment name. */
+export type HostFailures = ReadonlyMap<string, HostFailure>;
 
 export type RouteView = {
   id: string;
@@ -77,6 +93,8 @@ export type PrivateBindingView = {
 export type ApplicationSummary = {
   name: string;
   ready: boolean;
+  /** A part's current revision failed to start on the host. */
+  failed?: true;
   detail?: string;
   services: number;
   components: number;
@@ -134,6 +152,7 @@ export type WorkloadDocument = {
   };
   status?: {
     readyReplicas?: number;
+    currentReplicaSet?: { name?: string };
     replicas?: { ready?: number };
     conditions?: Array<{ type?: string; status?: string; reason?: string; message?: string }>;
   };
@@ -198,6 +217,7 @@ export function tenantIdentity(
 export function summarizeApplications(
   documents: readonly WorkloadDocument[],
   bindings: readonly BindingDocument[] = [],
+  failures: HostFailures = new Map(),
 ): ApplicationView[] {
   const groups = new Map<string, WorkloadDocument[]>();
   const labeled = new Map<string, WorkloadDocument[]>();
@@ -235,17 +255,24 @@ export function summarizeApplications(
     members.sort((left, right) =>
       (left.metadata?.name ?? '').localeCompare(right.metadata?.name ?? ''),
     );
-    const parts = dedupePartNames(members.flatMap((member) => partsFrom(member)));
+    const parts = dedupePartNames(
+      members.flatMap((member) => {
+        const failure = currentFailure(member, failures);
+        const found = partsFrom(member);
+        return failure === undefined ? found : found.map((entry) => ({ ...entry, failure }));
+      }),
+    );
     const routes = routesFrom(members);
     const environment = environmentFrom(members);
     const secrets = secretsFrom(members).map((secret) => ({ name: secret.name }));
     const memberNames = members
       .map((member) => member.metadata?.name)
       .filter((entry): entry is string => typeof entry === 'string');
-    const status = applicationStatus(members);
+    const status = applicationStatus(members, failures);
     applications.push({
       name,
       ready: status.ready,
+      ...(status.failed ? { failed: true as const } : {}),
       ...(status.detail ? { detail: status.detail } : {}),
       services: parts.filter((part) => part.kind === 'service').length,
       components: parts.filter((part) => part.kind === 'component').length,
@@ -265,6 +292,7 @@ export function toSummary(application: ApplicationView): ApplicationSummary {
   return {
     name: application.name,
     ready: application.ready,
+    ...(application.failed ? { failed: true as const } : {}),
     ...(application.detail ? { detail: application.detail } : {}),
     services: application.services,
     components: application.components,
@@ -477,10 +505,21 @@ function dedupePartNames(parts: PartView[]): PartView[] {
   });
 }
 
-function applicationStatus(members: readonly WorkloadDocument[]): {
+function applicationStatus(
+  members: readonly WorkloadDocument[],
+  failures: HostFailures,
+): {
   ready: boolean;
+  failed?: true;
   detail?: string;
 } {
+  // A failed start outranks readiness: wash can report a workload Ready that never ran.
+  for (const member of members) {
+    const failure = currentFailure(member, failures);
+    if (failure !== undefined) {
+      return { ready: false, failed: true, detail: `${member.metadata?.name} failed: ${failure}` };
+    }
+  }
   for (const member of members) {
     const status = memberStatus(member);
     if (!status.ready) return status;
@@ -497,6 +536,19 @@ function memberStatus(document: WorkloadDocument): { ready: boolean; detail?: st
   const ready = condition?.status === 'True' || (desired > 0 && readyCount >= desired);
   if (ready) return { ready: true };
   return { ready: false, detail: platformSentence(condition?.message) ?? NOT_READY };
+}
+
+/**
+ * The failure message when the newest host failure belongs to the member's current revision. An
+ * older revision's failure no longer counts once a new replica set rolls out.
+ */
+function currentFailure(member: WorkloadDocument, failures: HostFailures): string | undefined {
+  const name = member.metadata?.name;
+  const replicaSet = member.status?.currentReplicaSet?.name;
+  if (name === undefined || replicaSet === undefined || replicaSet.length === 0) return undefined;
+  const failure = failures.get(name);
+  if (failure === undefined || !failure.workload.startsWith(`${replicaSet}-`)) return undefined;
+  return sanitizePublicText(failure.message, 200).trim() || 'The host could not start it.';
 }
 
 type RouteHit = {

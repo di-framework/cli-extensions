@@ -2,6 +2,8 @@ export type PartView = {
   name: string;
   kind: 'service' | 'component';
   lifetime: 'long-lived' | 'on-demand';
+  /** The host failed to start this part's current revision. */
+  failure?: string;
 };
 
 export type RouteView = {
@@ -14,6 +16,7 @@ export type RouteView = {
 export type ApplicationSummary = {
   name: string;
   ready: boolean;
+  failed?: boolean;
   detail?: string;
   services: number;
   components: number;

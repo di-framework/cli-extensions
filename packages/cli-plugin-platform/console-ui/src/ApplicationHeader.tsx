@@ -43,7 +43,7 @@ export const ApplicationHeader = observer(function ApplicationHeader(): JSX.Elem
         </Breadcrumb>
       }
       title={name}
-      status={app ? <ReadyLabel ready={app.ready} /> : undefined}
+      status={app ? <ReadyLabel ready={app.ready} failed={app.failed} /> : undefined}
       description={app?.detail}
       tabs={
         app ? (

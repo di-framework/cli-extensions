@@ -129,6 +129,49 @@ describe('console store loading', () => {
     ]);
   });
 
+  test('a failed part marks the application failed and records it as danger', async () => {
+    serveTenant();
+    route('GET', '/api/applications', {
+      body: {
+        applications: [
+          {
+            name: 'mesh',
+            ready: false,
+            failed: true,
+            detail: 'mesh-collector failed: service did not properly execute',
+            services: 1,
+            components: 1,
+            routeCount: 1,
+          },
+        ],
+      },
+    });
+    route('GET', '/api/applications/mesh', {
+      body: {
+        application: detail({
+          ready: false,
+          failed: true,
+          parts: [
+            {
+              name: 'mesh-collector',
+              kind: 'service',
+              lifetime: 'long-lived',
+              failure: 'service did not properly execute',
+            },
+          ],
+        }),
+      },
+    });
+    const store = ConsoleStore.create();
+    await store.start();
+    expect(store.applications[0]?.failed).toBe(true);
+    const entry = store.activity.find((item) => item.text.startsWith('mesh:'));
+    expect(entry?.status).toBe('danger');
+    await store.openApplication('mesh');
+    expect(store.application?.failed).toBe(true);
+    expect(store.application?.parts[0]?.failure).toBe('service did not properly execute');
+  });
+
   test('a failed session leaves the store closed with the error', async () => {
     route('GET', '/api/session', { status: 401, body: { error: 'Sign in again.' } });
     const store = ConsoleStore.create();

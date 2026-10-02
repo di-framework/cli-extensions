@@ -13,6 +13,8 @@ import { countPhrase } from '../shared';
 
 export const OverviewTab = observer(function OverviewTab(): JSX.Element {
   const app = useApplication();
+  // The status column appears only when the host reported a failed start.
+  const anyFailed = app.parts.some((part) => part.failure !== undefined);
   return (
     <div className="console-split">
       <section aria-labelledby="overview-parts">
@@ -28,6 +30,7 @@ export const OverviewTab = observer(function OverviewTab(): JSX.Element {
                 <Th>Name</Th>
                 <Th>Kind</Th>
                 <Th>Lifetime</Th>
+                {anyFailed ? <Th>Status</Th> : null}
               </Tr>
             </Thead>
             <Tbody>
@@ -42,6 +45,20 @@ export const OverviewTab = observer(function OverviewTab(): JSX.Element {
                   <Td dataLabel="Lifetime">
                     {part.lifetime === 'long-lived' ? 'Long-lived' : 'On-demand'}
                   </Td>
+                  {anyFailed ? (
+                    <Td dataLabel="Status">
+                      {part.failure ? (
+                        <>
+                          <Label status="danger" isCompact>
+                            Failed
+                          </Label>
+                          <div className="console-metric">{part.failure}</div>
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </Td>
+                  ) : null}
                 </Tr>
               ))}
             </Tbody>

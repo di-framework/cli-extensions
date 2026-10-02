@@ -18,6 +18,7 @@ const Part = types.model('Part', {
   name: types.string,
   kind: types.enumeration(['service', 'component']),
   lifetime: types.enumeration(['long-lived', 'on-demand']),
+  failure: types.maybe(types.string),
 });
 
 const Route = types.model('Route', {
@@ -65,6 +66,8 @@ export const Logs = types.model('Logs', {
 const summaryFields = {
   name: types.string,
   ready: types.boolean,
+  /** A part failed to start on the host; `detail` names it. */
+  failed: types.optional(types.boolean, false),
   detail: types.maybe(types.string),
   services: types.number,
   components: types.number,

@@ -83,7 +83,8 @@ export const ConsoleStore = types
       self.ui.setError(listed.error);
       if (listed.error) record('danger', listed.error);
       for (const app of listed.applications) {
-        if (!app.ready) record('warning', `${app.name}: ${app.detail ?? 'not ready'}`);
+        if (!app.ready)
+          record(app.failed ? 'danger' : 'warning', `${app.name}: ${app.detail ?? 'not ready'}`);
       }
     });
 

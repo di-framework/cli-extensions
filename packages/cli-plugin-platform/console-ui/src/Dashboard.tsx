@@ -208,7 +208,9 @@ function InventoryRow({
 }
 
 function StatusCard({ session, apps, services, onNavigate }: DashboardProps): JSX.Element {
+  const failedApps = apps.filter((app) => app.failed).length;
   const notReadyApps = apps.filter((app) => !app.ready).length;
+  const waitingApps = notReadyApps - failedApps;
   const notReadyServices = services.filter((service) => !service.ready).length;
   const routes = apps.reduce((sum, app) => sum + app.routeCount, 0);
   return (
@@ -217,14 +219,19 @@ function StatusCard({ session, apps, services, onNavigate }: DashboardProps): JS
       <CardBody>
         <Flex gap={{ default: 'gapLg' }} flexWrap={{ default: 'wrap' }}>
           <StatusItem
-            status={statusFor(apps.length, notReadyApps)}
+            status={failedApps > 0 ? 'danger' : statusFor(apps.length, notReadyApps)}
             label="Applications"
             detail={
               apps.length === 0
                 ? 'None deployed'
                 : notReadyApps === 0
                   ? 'All ready'
-                  : `${notReadyApps} not ready`
+                  : [
+                      failedApps > 0 ? `${failedApps} failed` : '',
+                      waitingApps > 0 ? `${waitingApps} not ready` : '',
+                    ]
+                      .filter((part) => part.length > 0)
+                      .join(' · ')
             }
             onClick={() => onNavigate('applications')}
           />
@@ -263,9 +270,14 @@ function StatusCard({ session, apps, services, onNavigate }: DashboardProps): JS
             </Label>
           ) : (
             <>
-              {notReadyApps > 0 ? (
+              {failedApps > 0 ? (
+                <Label status="danger" isCompact>
+                  {countPhrase(failedApps, 'application')} failed
+                </Label>
+              ) : null}
+              {waitingApps > 0 ? (
                 <Label status="warning" isCompact>
-                  {countPhrase(notReadyApps, 'application')}
+                  {countPhrase(waitingApps, 'application')}
                 </Label>
               ) : null}
               {notReadyServices > 0 ? (

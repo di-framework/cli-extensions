@@ -881,6 +881,74 @@ describe('console environment parts', () => {
   });
 });
 
+describe('console host failures', () => {
+  const member = (name: string, replicaSet?: string) =>
+    managed(name, {
+      metadata: { labels: { 'di-framework.dev/workload': 'mesh' } },
+      spec: { template: { spec: { components: [{ name }] } } },
+      status: {
+        conditions: [{ type: 'Ready', status: 'True' }],
+        ...(replicaSet === undefined ? {} : { currentReplicaSet: { name: replicaSet } }),
+      },
+    });
+  const failure = (workload: string, message = 'service did not properly execute') => ({
+    workload,
+    time: '2026-10-01T19:19:39Z',
+    level: 'WARN' as const,
+    message,
+  });
+
+  it('marks the part whose current revision failed and the application with it', () => {
+    const [view] = summarizeApplications(
+      [member('mesh-collector', 'mesh-collector-ff55d9589'), member('mesh-site', 'mesh-site-64f')],
+      [],
+      new Map([
+        ['mesh-collector', failure('mesh-collector-ff55d9589-795c7b5cd6')],
+        ['mesh-site', failure('mesh-site-dd5fc4dc-558f5d4b4', 'no host header found')],
+      ]),
+    );
+    expect(view?.ready).toBe(false);
+    expect(view?.failed).toBe(true);
+    expect(view?.detail).toBe('mesh-collector failed: service did not properly execute');
+    expect(view?.parts).toEqual([
+      {
+        name: 'mesh-collector',
+        kind: 'component',
+        lifetime: 'on-demand',
+        failure: 'service did not properly execute',
+      },
+      { name: 'mesh-site', kind: 'component', lifetime: 'on-demand' },
+    ]);
+    if (view) expect(toSummary(view)).toMatchObject({ ready: false, failed: true });
+  });
+
+  it('ignores failures of older revisions and members without a replica set', () => {
+    const [view] = summarizeApplications(
+      [member('mesh-site', 'mesh-site-64f85bb94f'), member('mesh-collector')],
+      [],
+      new Map([
+        ['mesh-site', failure('mesh-site-dd5fc4dc-558f5d4b4')],
+        ['mesh-collector', failure('mesh-collector-ff55d9589-1')],
+      ]),
+    );
+    expect(view?.ready).toBe(true);
+    expect(view?.failed).toBeUndefined();
+    if (view) expect(toSummary(view).failed).toBeUndefined();
+    const [blank] = summarizeApplications(
+      [member('mesh-site', 'mesh-site-64f85bb94f')],
+      [],
+      new Map([['mesh-site', failure('mesh-site-64f85bb94f-1', '  ')]]),
+    );
+    expect(blank?.detail).toBe('mesh-site failed: The host could not start it.');
+    const [redacted] = summarizeApplications(
+      [member('mesh-site', 'mesh-site-64f85bb94f')],
+      [],
+      new Map([['mesh-site', failure('mesh-site-64f85bb94f-1', `token=${SECRET}`)]]),
+    );
+    expect(redacted?.detail).not.toContain(SECRET);
+  });
+});
+
 describe('console command options', () => {
   it('binds loopback and requires a tenant credential', () => {
     expect(parseConsoleArgs([])).toEqual({ host: '127.0.0.1', port: 0 });
@@ -979,6 +1047,9 @@ registry = "registry.example.com/team"
     let logs: string[] | undefined;
     let signals: { success: number; error: number; compute?: number[] } | undefined;
     const cluster: ConsoleCluster = {
+      async readFailures() {
+        return new Map();
+      },
       async listWorkloads() {
         return structuredClone(documents);
       },
