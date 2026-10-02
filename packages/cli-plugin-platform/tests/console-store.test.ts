@@ -191,6 +191,86 @@ describe('console store loading', () => {
   });
 });
 
+describe('console store refresh', () => {
+  test('refresh re-reads the open application', async () => {
+    const pending = {
+      name: 'state',
+      service: 'cache',
+      className: 'keyvalue-redis',
+      ready: false,
+    };
+    serveTenant();
+    route('GET', '/api/applications/mesh', {
+      body: { application: detail({ backingServices: [pending] }) },
+    });
+    const store = ConsoleStore.create();
+    await store.start();
+    await store.openApplication('mesh');
+    const node = store.application;
+    expect(node?.backingServices[0]?.ready).toBe(false);
+    route('GET', '/api/applications/mesh', {
+      body: { application: detail({ backingServices: [{ ...pending, ready: true }] }) },
+    });
+    await store.refreshAll();
+    expect(store.application).toBe(node);
+    expect(store.application?.backingServices[0]?.ready).toBe(true);
+
+    // An application closed while its refresh is in flight stays closed.
+    const refreshing = store.refreshAll();
+    store.navigate('dashboard');
+    await refreshing;
+    expect(store.application).toBeUndefined();
+  });
+
+  test('the services list polls while a service is not ready', async () => {
+    const store = await started();
+    const reads = () => seen.filter((request) => request.path === '/api/backing-services').length;
+    const before = reads();
+    route('GET', '/api/backing-services', {
+      body: {
+        services: [
+          { name: 'cache', className: 'keyvalue-redis', type: 'keyvalue', ready: true },
+          { name: 'queue', className: 'messaging-nats', type: 'messaging', ready: true },
+          { name: 'db', className: 'postgres-dedicated', type: 'postgres', ready: false },
+        ],
+      },
+    });
+    store.startServicePolling(5);
+    while (store.services.find((service) => service.name === 'queue')?.ready !== true) {
+      await Bun.sleep(5);
+    }
+    expect(store.activity[0]?.text).toBe('Backing service queue is ready.');
+    route('GET', '/api/backing-services', {
+      body: {
+        services: [
+          { name: 'cache', className: 'keyvalue-redis', type: 'keyvalue', ready: true },
+          { name: 'queue', className: 'messaging-nats', type: 'messaging', ready: true },
+          { name: 'db', className: 'postgres-dedicated', type: 'postgres', ready: true },
+        ],
+      },
+    });
+    while (store.services.some((service) => !service.ready)) await Bun.sleep(5);
+    expect(store.activity[0]?.text).toBe('Backing service db is ready.');
+    const settled = reads();
+    expect(settled).toBeGreaterThan(before);
+    await Bun.sleep(30);
+    // Every service is ready, so the ticks no longer read.
+    expect(reads()).toBe(settled);
+    store.stopServicePolling();
+    store.stopServicePolling();
+  });
+
+  test('a poll skips while one is in flight and reports failures', async () => {
+    const store = await started();
+    const before = seen.length;
+    await Promise.all([store.pollServices(), store.pollServices()]);
+    expect(seen.length - before).toBe(1);
+    route('GET', '/api/backing-services', { status: 502, body: { error: 'Services failed.' } });
+    await store.pollServices();
+    expect(store.ui.error).toBe('Services failed.');
+  });
+});
+
 describe('console store navigation', () => {
   test('navigating clears the open application and loads services on demand', async () => {
     const store = await started();
