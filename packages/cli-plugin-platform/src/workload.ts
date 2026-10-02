@@ -32,6 +32,20 @@ export const HOST_STORAGE_ROOT = '/var/lib/di-framework/storage';
 export const STORAGE_HOSTGROUP = 'storage';
 /** Guest mount path for application SQLite storage. */
 export const DEFAULT_STORAGE_MOUNT = '/data';
+/**
+ * Tenant workloads ask the platform for storage instead of naming a host path. The
+ * controller creates a tenant-scoped directory per workload and injects the volume and
+ * the preopen; tenant credentials cannot set either.
+ */
+export const PERSISTENT_STORAGE_ANNOTATION = 'di-framework.dev/persistent-storage';
+/** Guest mount when it is not the default `/data`; the controller accepts only these two. */
+export const STORAGE_MOUNT_ANNOTATION = 'di-framework.dev/storage-mount';
+const PLATFORM_STORAGE_MOUNTS = [DEFAULT_STORAGE_MOUNT, `${DEFAULT_STORAGE_MOUNT}/actors`];
+
+/** A tenant target names its host group; its storage belongs to the platform. */
+export function usesPlatformStorage(connection: Pick<ClusterConnection, 'hostgroup'>): boolean {
+  return connection.hostgroup !== undefined;
+}
 /** Pinned CronJob invoker image that POSTs to the Wasm HTTP control API. */
 export const CRON_INVOKER_IMAGE = 'curlimages/curl:8.11.1';
 
@@ -155,6 +169,24 @@ export function renderWorkloadManifest(
     opts.storageVolume?.mountPath ??
     (hasActors ? `${DEFAULT_STORAGE_MOUNT}/actors` : DEFAULT_STORAGE_MOUNT);
   const hostPath = opts.storageVolume?.hostPath ?? hostStoragePath(storageDirectoryName(project));
+  const platformStorage = needsPersistentStorage && usesPlatformStorage(connection);
+  if (platformStorage && !PLATFORM_STORAGE_MOUNTS.includes(mountPath)) {
+    throw new CommandFailure(
+      'WASMCLOUD_STORAGE_MOUNT_UNSUPPORTED',
+      `Tenant storage mounts at ${PLATFORM_STORAGE_MOUNTS.join(' or ')}, not ${mountPath}`,
+      2,
+      { mountPath },
+    );
+  }
+  const annotations = platformStorage
+    ? [
+        '  annotations:',
+        `    ${PERSISTENT_STORAGE_ANNOTATION}: "true"`,
+        ...(mountPath === DEFAULT_STORAGE_MOUNT
+          ? []
+          : [`    ${STORAGE_MOUNT_ANNOTATION}: ${yamlQuote(mountPath)}`]),
+      ]
+    : [];
 
   const environment: Record<string, string> = { ...(opts.environment ?? {}) };
   if (needsPersistentStorage) {
@@ -233,7 +265,7 @@ spec:
     localResourcesLines.push('          localResources:');
   }
 
-  if (needsPersistentStorage) {
+  if (needsPersistentStorage && !platformStorage) {
     localResourcesLines.push('            volumeMounts:');
     localResourcesLines.push(`              - name: ${volumeName}`);
     localResourcesLines.push(`                mountPath: ${mountPath}`);
@@ -293,15 +325,15 @@ metadata:
   namespace: ${connection.namespace}
   labels:
 ${labels}
-spec:
+${annotations.length > 0 ? `${annotations.join('\n')}\n` : ''}spec:
   replicas: 1
 ${needsPersistentStorage ? '  deployPolicy: Recreate\n' : ''}  template:
     spec:
       environment: ${yamlQuote(connection.namespace)}
       hostSelector:
-        hostgroup: ${needsPersistentStorage ? (connection.storageHostgroup ?? STORAGE_HOSTGROUP) : (connection.hostgroup ?? 'default')}
+        hostgroup: ${needsPersistentStorage && !platformStorage ? (connection.storageHostgroup ?? STORAGE_HOSTGROUP) : (connection.hostgroup ?? 'default')}
 ${
-  needsPersistentStorage
+  needsPersistentStorage && !platformStorage
     ? `      volumes:
         - name: ${volumeName}
           hostPath:
@@ -508,6 +540,8 @@ async function assertStorageOwnership(
   flags: { hasActors: boolean; hasQueues: boolean; hasPersistentStorage?: boolean },
 ): Promise<void> {
   if (!flags.hasActors && !flags.hasQueues && !flags.hasPersistentStorage) return;
+  // The platform keys tenant storage by workload, so another app cannot reach this path.
+  if (usesPlatformStorage(connection)) return;
   const hostPath = hostStoragePath(storageDirectoryName(project));
   const result = await captureKubectl(
     deps,

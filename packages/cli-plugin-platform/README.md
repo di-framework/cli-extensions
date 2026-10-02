@@ -394,7 +394,6 @@ kubeconfig = "${ALICE_KUBECONFIG}"
 context = "alice"
 namespace = "tenant-alice"
 hostgroup = "alice"
-storage-hostgroup = "alice-storage"
 
 [targets.alice.registry]
 push = "https://registry.example.com/alice"
@@ -405,9 +404,18 @@ Run `di-framework platform deploy warehouse-take --target alice`. All Kubernetes
 including deletion and diagnostics, use that target's kubeconfig, context, and namespace.
 The generated WorkloadDeployment also sets `spec.template.spec.environment` to the target
 namespace, so host selection cannot silently fall back to another environment when the
-matching pool is unavailable. `hostgroup` defaults to `default`; `storage-hostgroup` defaults
-to `storage` for actors, queues, and persistent storage. These selectors refer to existing
-host pools; application deployment does not provision them.
+matching pool is unavailable. `hostgroup` defaults to `default`. These selectors refer to
+existing host pools; application deployment does not provision them.
+
+A target with a `hostgroup` is a tenant target, and its storage belongs to the platform.
+Actors, queues, workers, and `persistentStorage: true` deploy with the annotation
+`di-framework.dev/persistent-storage: "true"` (plus `di-framework.dev/storage-mount:
+"/data/actors"` for actors) and no volume, volume mount, or host path. The platform
+controller creates `<storageRoot>/di-tenants/<tenant uid>/workloads/<workload>`, shared by
+the members of one `di-framework.dev/workload` and private to the tenant, and injects the
+volume and the `/data` preopen. The guest still reads `DI_STORAGE_DIR`. `storage-hostgroup`
+applies only to targets without a `hostgroup`, which keep the host path under
+`/var/lib/di-framework/storage` on the `storage` pool.
 
 Generated managed platforms set `operator.allowSharedHosts: false`. Existing generated
 platforms and external clusters, including di-framework-kube, need their operator Helm
