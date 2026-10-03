@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/cli-plugin-ai",
-  "version": "6.0.6",
+  "version": "6.0.7",
   "description": "di-framework CLI extension for agent configuration and Agent Skills.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
