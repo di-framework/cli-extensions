@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  BlobPolyfill,
   bodyAsStream,
+  FilePolyfill,
+  FormDataPolyfill,
   HeadersPolyfill,
   installFetchRuntime,
   isAsyncIterable,
@@ -176,6 +179,21 @@ describe('fetch runtime polyfills', () => {
     expect(emptyVisits).toEqual([]);
   });
 
+  it('lists header names and values and keeps every Set-Cookie', () => {
+    const headers = new HeadersPolyfill();
+    headers.append('Set-Cookie', 'a=1');
+    headers.append('Accept', 'text/plain');
+    headers.append('Set-Cookie', 'b=2; HttpOnly');
+    headers.append('Accept', 'application/json');
+    expect(headers.getSetCookie()).toEqual(['a=1', 'b=2; HttpOnly']);
+    expect(headers.get('set-cookie')).toBe('a=1, b=2; HttpOnly');
+    expect([...headers.keys()]).toEqual(['accept', 'set-cookie', 'set-cookie']);
+    expect([...headers.values()]).toEqual(['text/plain, application/json', 'a=1', 'b=2; HttpOnly']);
+    expect(new HeadersPolyfill().getSetCookie()).toEqual([]);
+    expect([...new HeadersPolyfill().keys()]).toEqual([]);
+    expect([...new HeadersPolyfill().values()]).toEqual([]);
+  });
+
   it('copies requests and reads JSON bodies', async () => {
     const original = new RequestPolyfill('http://example/item', {
       method: 'POST',
@@ -216,10 +234,252 @@ describe('fetch runtime polyfills', () => {
     expect(await new ResponsePolyfill(42).text()).toBe('42');
     expect(await new ResponsePolyfill(null).arrayBuffer()).toEqual(new ArrayBuffer(0));
     expect(new ResponsePolyfill(null).body).toBeNull();
+    const echoed = new FormDataPolyfill();
+    echoed.append('field', 'value');
+    const formResponse = new ResponsePolyfill(echoed);
+    expect(formResponse.headers.get('content-type')?.startsWith('multipart/form-data;')).toBe(true);
+    expect((await formResponse.formData()).get('field')).toBe('value');
     const streamed = new ResponsePolyfill(new Uint8Array([9]));
     const collected: number[] = [];
     for await (const chunk of streamed.body ?? []) collected.push(...chunk);
     expect(collected).toEqual([9]);
+  });
+
+  it('reads multipart and urlencoded bodies with FormData', async () => {
+    const form = new FormDataPolyfill();
+    form.append('name', 'test-file');
+    form.append('file', new BlobPolyfill(['hello'], { type: 'text/plain' }), 'test.txt');
+    form.append('bin', new BlobPolyfill([new Uint8Array([0xff, 0xfe, 0x00])]), 'b.bin');
+    form.append('name', 'second');
+    expect(form.get('name')).toBe('test-file');
+    expect(form.getAll('name')).toEqual(['test-file', 'second']);
+    expect(form.has('missing')).toBe(false);
+    expect([...form.keys()]).toEqual(['name', 'file', 'bin', 'name']);
+    expect([...form].map(([name]) => name)).toEqual(['name', 'file', 'bin', 'name']);
+    const visited: string[] = [];
+    form.forEach((value, name, parent) => {
+      visited.push(`${name}:${typeof value === 'string' ? value : value.name}`);
+      expect(parent).toBe(form);
+    });
+    expect(visited).toEqual(['name:test-file', 'file:test.txt', 'bin:b.bin', 'name:second']);
+    form.set('name', 'only');
+    expect(form.getAll('name')).toEqual(['only']);
+    form.delete('bin');
+    expect(form.has('bin')).toBe(false);
+    expect([...new FormDataPolyfill(form).values()].map((value) => typeof value)).toEqual([
+      'string',
+      'object',
+    ]);
+
+    const posted = new FormDataPolyfill();
+    posted.append('operations', '{"query":"{ hello }"}');
+    posted.append('file', new BlobPolyfill(['hello'], { type: 'text/plain' }), 'test.txt');
+    const request = new RequestPolyfill('http://example/upload', { method: 'POST', body: posted });
+    expect(request.headers.get('content-type')?.startsWith('multipart/form-data; boundary=')).toBe(
+      true,
+    );
+    const parsed = await request.formData();
+    expect(parsed.get('operations')).toBe('{"query":"{ hello }"}');
+    const file = parsed.get('file');
+    expect(file).toBeInstanceOf(FilePolyfill);
+    expect((file as FilePolyfill).name).toBe('test.txt');
+    expect(await (file as FilePolyfill).text()).toBe('hello');
+
+    const manual = [
+      '--bound',
+      'Content-Disposition: form-data; name="operations"',
+      '',
+      '{"query":"{ hello }"}',
+      '--bound',
+      'Content-Disposition: form-data; name="file"; filename="test.txt"',
+      'Content-Type: text/plain',
+      '',
+      'hello',
+      '--bound--',
+      '',
+    ].join('\r\n');
+    const incoming = new RequestPolyfill('http://example/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'multipart/form-data; boundary="bound"' },
+      body: manual,
+    });
+    expect((await incoming.formData()).get('operations')).toBe('{"query":"{ hello }"}');
+    expect(await ((await incoming.formData()).get('file') as FilePolyfill).text()).toBe('hello');
+
+    const payload = new Uint8Array([0xff, 0xfe, 0x00, 0x61]);
+    const prefix = new TextEncoder().encode(
+      [
+        '--bound',
+        'Content-Disposition: form-data; name="bin"; filename="b.bin"',
+        'Content-Type: application/octet-stream',
+        '',
+        '',
+      ].join('\r\n'),
+    );
+    const suffix = new TextEncoder().encode('\r\n--bound--\r\n');
+    const binaryBody = new Uint8Array(prefix.length + payload.length + suffix.length);
+    binaryBody.set(prefix, 0);
+    binaryBody.set(payload, prefix.length);
+    binaryBody.set(suffix, prefix.length + payload.length);
+    const binary = await new RequestPolyfill('http://example/bin', {
+      method: 'POST',
+      headers: { 'content-type': 'multipart/form-data; boundary=bound' },
+      body: binaryBody,
+    }).formData();
+    const bin = binary.get('bin') as FilePolyfill;
+    expect(bin.name).toBe('b.bin');
+    expect([...new Uint8Array(await bin.arrayBuffer())]).toEqual([...payload]);
+
+    const urlencoded = new RequestPolyfill('http://example/form', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      body: 'scope=openid+profile&extra=1',
+    });
+    const fields = await urlencoded.formData();
+    expect(fields.get('scope')).toBe('openid profile');
+    expect(fields.get('extra')).toBe('1');
+
+    const malformed = new RequestPolyfill('http://example/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'multipart/form-data; boundary=something' },
+      body: 'bad boundary data',
+    });
+    await expect(malformed.formData()).rejects.toThrow(TypeError);
+    const json = new RequestPolyfill('http://example/json', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    await expect(json.formData()).rejects.toThrow(TypeError);
+    expect(() => form.append('file', {} as BlobPolyfill)).toThrow(TypeError);
+  });
+
+  it('picks another multipart boundary when the body contains the first token', async () => {
+    const marker = (attempt: number) => {
+      const boundary = `----diFormBoundary${attempt.toString(16).padStart(8, '0')}`;
+      return `--${boundary}`;
+    };
+    const posted = new FormDataPolyfill();
+    posted.append('field', marker(0));
+    const request = new RequestPolyfill('http://example/upload', { method: 'POST', body: posted });
+    expect(request.headers.get('content-type')).toContain('----diFormBoundary00000001');
+    expect((await request.formData()).get('field')).toBe(marker(0));
+
+    const hostile = new FormDataPolyfill();
+    hostile.append('field', Array.from({ length: 32 }, (_, attempt) => marker(attempt)).join(''));
+    expect(
+      () => new RequestPolyfill('http://example/upload', { method: 'POST', body: hostile }),
+    ).toThrow(TypeError);
+  });
+
+  it('replaces partial Web constructors and keeps complete ones', () => {
+    const global = globalThis as Record<string, unknown>;
+    expect(global.Headers).not.toBe(HeadersPolyfill);
+    expect(global.URLSearchParams).not.toBe(URLSearchParamsPolyfill);
+    expect(global.FormData).not.toBe(FormDataPolyfill);
+    const keys = ['URLSearchParams', 'Headers', 'FormData'] as const;
+    const originals = Object.fromEntries(keys.map((key) => [key, global[key]]));
+
+    class PartialURLSearchParams {
+      get(): null {
+        return null;
+      }
+    }
+    class PartialHeaders {
+      append(): void {}
+      set(): void {}
+      get(): null {
+        return null;
+      }
+      has(): boolean {
+        return false;
+      }
+      delete(): void {}
+      entries(): IterableIterator<[string, string]> {
+        return [][Symbol.iterator]();
+      }
+      forEach(): void {}
+      keys(): IterableIterator<string> {
+        return [][Symbol.iterator]();
+      }
+      values(): IterableIterator<string> {
+        return [][Symbol.iterator]();
+      }
+      [Symbol.iterator](): IterableIterator<[string, string]> {
+        return this.entries();
+      }
+    }
+    class PartialFormData {
+      append(): void {}
+    }
+    class CompleteURLSearchParams {
+      get(): null {
+        return null;
+      }
+      getAll(): string[] {
+        return [];
+      }
+      has(): boolean {
+        return false;
+      }
+      append(): void {}
+      set(): void {}
+      delete(): void {}
+      toString(): string {
+        return '';
+      }
+      entries(): IterableIterator<[string, string]> {
+        return [][Symbol.iterator]();
+      }
+      [Symbol.iterator](): IterableIterator<[string, string]> {
+        return this.entries();
+      }
+    }
+    class CompleteHeaders extends PartialHeaders {
+      getSetCookie(): string[] {
+        return [];
+      }
+    }
+    class CompleteFormData {
+      append(): void {}
+      get(): null {
+        return null;
+      }
+      getAll(): string[] {
+        return [];
+      }
+      has(): boolean {
+        return false;
+      }
+      set(): void {}
+      delete(): void {}
+      entries(): IterableIterator<[string, string]> {
+        return [][Symbol.iterator]();
+      }
+      [Symbol.iterator](): IterableIterator<[string, string]> {
+        return this.entries();
+      }
+    }
+
+    try {
+      global.URLSearchParams = PartialURLSearchParams;
+      global.Headers = PartialHeaders;
+      global.FormData = PartialFormData;
+      installFetchRuntime();
+      expect(global.URLSearchParams).toBe(URLSearchParamsPolyfill);
+      expect(global.Headers).toBe(HeadersPolyfill);
+      expect(global.FormData).toBe(FormDataPolyfill);
+
+      global.URLSearchParams = CompleteURLSearchParams;
+      global.Headers = CompleteHeaders;
+      global.FormData = CompleteFormData;
+      installFetchRuntime();
+      expect(global.URLSearchParams).toBe(CompleteURLSearchParams);
+      expect(global.Headers).toBe(CompleteHeaders);
+      expect(global.FormData).toBe(CompleteFormData);
+    } finally {
+      for (const key of keys) global[key] = originals[key];
+    }
   });
 
   it('installs polyfills onto missing or forced globals', () => {
@@ -232,6 +492,8 @@ describe('fetch runtime polyfills', () => {
       'Headers',
       'Request',
       'Response',
+      'FormData',
+      'File',
       'console',
     ] as const;
     const originals = Object.fromEntries(keys.map((key) => [key, global[key]]));
@@ -253,6 +515,8 @@ describe('fetch runtime polyfills', () => {
       expect(typeof (global.console as { error(): void }).error).toBe('function');
       installFetchRuntime(true);
       expect(global.Request).toBe(RequestPolyfill);
+      expect(global.FormData).toBe(FormDataPolyfill);
+      expect(global.File).toBe(FilePolyfill);
     } finally {
       for (const key of keys) global[key] = originals[key];
     }

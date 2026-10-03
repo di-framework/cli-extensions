@@ -3,9 +3,10 @@
  *
  * WASI 0.3 async HTTP (`wasi:http/handler#handle`) is the component interface,
  * not the WHATWG Fetch API. componentize-qjs embeds QuickJS, which has neither
- * `Request`/`Response` nor `URLSearchParams`. StarlingMonkey does provide
- * Fetch; install these polyfills only when those globals are missing so the
- * application contract (`new Response(...)`) stays unchanged.
+ * `Request`/`Response`, `URLSearchParams`, or `FormData`. StarlingMonkey does
+ * provide Fetch; install these polyfills when a global is missing or only
+ * partly implemented so the application contract (`new Response(...)`,
+ * `request.formData()`) stays unchanged.
  */
 
 export class TextEncoderPolyfill {
@@ -213,6 +214,36 @@ export class HeadersPolyfill {
     for (const [name, value] of this.entries()) callback(value, name, this);
   }
 
+  /**
+   * Fetch's sort-and-combine list: one combined value per name, except
+   * `set-cookie`, which stays one pair per value. `entries()` still yields
+   * each stored value so the HTTP adapter can forward multi-value headers.
+   */
+  *#combined(): IterableIterator<[string, string]> {
+    for (const name of [...this.#map.keys()].sort((left, right) => left.localeCompare(right))) {
+      const values = this.#map.get(name) ?? [];
+      if (values.length === 0) continue;
+      if (name === 'set-cookie') {
+        for (const value of values) yield [name, value];
+      } else {
+        yield [name, values.join(', ')];
+      }
+    }
+  }
+
+  *keys(): IterableIterator<string> {
+    for (const [name] of this.#combined()) yield name;
+  }
+
+  *values(): IterableIterator<string> {
+    for (const [, value] of this.#combined()) yield value;
+  }
+
+  /** Every `Set-Cookie` value, in order, without comma-joining. */
+  getSetCookie(): string[] {
+    return [...(this.#map.get('set-cookie') ?? [])];
+  }
+
   [Symbol.iterator](): IterableIterator<[string, string]> {
     return this.entries();
   }
@@ -280,14 +311,14 @@ export class RequestPolyfill {
       this.headers = new HeadersPolyfill(
         (init.headers as HeadersPolyfill | Record<string, string> | undefined) ?? input.headers,
       );
-      this.#body = init.body === undefined ? input.#body : toBodySource(init.body);
+      this.#body = init.body === undefined ? input.#body : bodyFromInit(init.body, this.headers);
     } else {
       this.method = String(init.method ?? 'GET').toUpperCase();
       this.url = String(input);
       this.headers = new HeadersPolyfill(
         init.headers as HeadersPolyfill | Record<string, string> | undefined,
       );
-      this.#body = toBodySource(init.body);
+      this.#body = bodyFromInit(init.body, this.headers);
     }
   }
 
@@ -313,6 +344,10 @@ export class RequestPolyfill {
   async json(): Promise<unknown> {
     return JSON.parse(await this.text());
   }
+
+  async formData(): Promise<FormDataPolyfill> {
+    return formDataFromBody(this.headers, await this.arrayBuffer());
+  }
 }
 
 export class ResponsePolyfill {
@@ -329,7 +364,7 @@ export class ResponsePolyfill {
       init.headers as HeadersPolyfill | Record<string, string> | undefined,
     );
     this.ok = this.status >= 200 && this.status < 300;
-    this.#body = toBodySource(body);
+    this.#body = bodyFromInit(body, this.headers);
   }
 
   static json(data: unknown, init: Record<string, unknown> = {}): ResponsePolyfill {
@@ -356,6 +391,10 @@ export class ResponsePolyfill {
 
   async json(): Promise<unknown> {
     return JSON.parse(await this.text());
+  }
+
+  async formData(): Promise<FormDataPolyfill> {
+    return formDataFromBody(this.headers, await this.arrayBuffer());
   }
 }
 
@@ -398,7 +437,35 @@ export class AbortControllerPolyfill {
   }
 }
 
-type BlobPart = string | ArrayBuffer | ArrayBufferView;
+type BlobPart = string | ArrayBuffer | ArrayBufferView | BlobPolyfill;
+
+const blobContents = new WeakMap<BlobPolyfill, Uint8Array>();
+
+function bytesOfPart(part: BlobPart): Uint8Array {
+  if (typeof part === 'string') return new TextEncoder().encode(part);
+  if (part instanceof BlobPolyfill) return readBlobBytes(part).slice();
+  if (part instanceof ArrayBuffer) return new Uint8Array(part);
+  if (ArrayBuffer.isView(part)) {
+    return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+  }
+  throw new TypeError('Blob parts must be strings, buffers, or Blob objects');
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.byteLength;
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function readBlobBytes(blob: BlobPolyfill): Uint8Array {
+  return blobContents.get(blob) ?? new Uint8Array();
+}
 
 /** QuickJS has no Blob. unenv's File extends it while Node streams load. */
 export class BlobPolyfill {
@@ -406,14 +473,315 @@ export class BlobPolyfill {
   readonly type: string;
 
   constructor(parts: BlobPart[] = [], options?: { type?: string }) {
-    let size = 0;
-    for (const part of parts) {
-      if (typeof part === 'string') size += new TextEncoder().encode(part).length;
-      else size += part.byteLength;
-    }
-    this.size = size;
+    const bytes = concatBytes(parts.map((part) => bytesOfPart(part)));
+    blobContents.set(this, bytes);
+    this.size = bytes.byteLength;
     this.type = options?.type ?? '';
   }
+
+  async arrayBuffer(): Promise<ArrayBuffer> {
+    return readBlobBytes(this).slice().buffer;
+  }
+
+  async text(): Promise<string> {
+    return new TextDecoderPolyfill().decode(readBlobBytes(this));
+  }
+}
+
+/** File entry returned by `FormData` for multipart parts that carry a filename. */
+export class FilePolyfill extends BlobPolyfill {
+  readonly name: string;
+  readonly lastModified: number;
+
+  constructor(parts: BlobPart[], name: string, options?: { type?: string; lastModified?: number }) {
+    super(parts, options);
+    this.name = String(name);
+    this.lastModified = options?.lastModified ?? Date.now();
+  }
+}
+
+type FormDataEntryValue = string | FilePolyfill;
+
+export class FormDataPolyfill {
+  #entries: Array<[string, FormDataEntryValue]> = [];
+
+  constructor(init?: FormDataPolyfill) {
+    if (init instanceof FormDataPolyfill) {
+      for (const [name, value] of init.entries()) {
+        if (typeof value === 'string') this.append(name, value);
+        else this.append(name, value, value.name);
+      }
+    }
+  }
+
+  append(name: string, value: string | BlobPolyfill, filename?: string): void {
+    this.#entries.push([String(name), formEntry(value, filename)]);
+  }
+
+  set(name: string, value: string | BlobPolyfill, filename?: string): void {
+    const entry = formEntry(value, filename);
+    const next: Array<[string, FormDataEntryValue]> = [];
+    let placed = false;
+    for (const pair of this.#entries) {
+      if (pair[0] !== name) next.push(pair);
+      else if (!placed) {
+        next.push([String(name), entry]);
+        placed = true;
+      }
+    }
+    if (!placed) next.push([String(name), entry]);
+    this.#entries = next;
+  }
+
+  get(name: string): FormDataEntryValue | null {
+    const found = this.#entries.find(([key]) => key === name);
+    return found ? found[1] : null;
+  }
+
+  getAll(name: string): FormDataEntryValue[] {
+    return this.#entries.filter(([key]) => key === name).map(([, value]) => value);
+  }
+
+  has(name: string): boolean {
+    return this.#entries.some(([key]) => key === name);
+  }
+
+  delete(name: string): void {
+    this.#entries = this.#entries.filter(([key]) => key !== name);
+  }
+
+  *entries(): IterableIterator<[string, FormDataEntryValue]> {
+    yield* this.#entries;
+  }
+
+  *keys(): IterableIterator<string> {
+    for (const [name] of this.#entries) yield name;
+  }
+
+  *values(): IterableIterator<FormDataEntryValue> {
+    for (const [, value] of this.#entries) yield value;
+  }
+
+  forEach(
+    callback: (value: FormDataEntryValue, name: string, parent: FormDataPolyfill) => void,
+  ): void {
+    const pairs = this.#entries;
+    for (let index = 0; index < pairs.length; index++) {
+      const pair = pairs[index] as [string, FormDataEntryValue];
+      callback(pair[1], pair[0], this);
+    }
+  }
+
+  [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]> {
+    return this.entries();
+  }
+}
+
+function formEntry(value: string | BlobPolyfill, filename?: string): FormDataEntryValue {
+  if (typeof value !== 'object' || value === null) return String(value);
+  if (!(value instanceof BlobPolyfill)) {
+    throw new TypeError('FormData file fields must be Blob or File objects');
+  }
+  if (value instanceof FilePolyfill && filename === undefined) return value;
+  return new FilePolyfill([readBlobBytes(value)], filename ?? 'blob', { type: value.type });
+}
+
+function isFormDataBody(body: unknown): body is FormDataPolyfill {
+  if (body instanceof FormDataPolyfill) return true;
+  const ctor = (globalThis as { FormData?: unknown }).FormData;
+  return typeof ctor === 'function' && body instanceof (ctor as new (...args: never[]) => object);
+}
+
+const MULTIPART_BOUNDARY_ATTEMPTS = 32;
+
+function multipartBoundary(attempt: number): string {
+  return `----diFormBoundary${attempt.toString(16).padStart(8, '0')}`;
+}
+
+function escapeDisposition(value: string): string {
+  return value.replaceAll('"', '%22').replaceAll('\r', '').replaceAll('\n', '');
+}
+
+function encodeMultipart(
+  entries: Iterable<[string, FormDataEntryValue]>,
+  boundary: string,
+): Uint8Array {
+  const encoder = new TextEncoderPolyfill();
+  const chunks: Uint8Array[] = [];
+  const push = (text: string) => chunks.push(encoder.encode(text));
+  for (const [name, value] of entries) {
+    const quotedName = escapeDisposition(name);
+    push(`--${boundary}\r\n`);
+    if (typeof value === 'string') {
+      push(`Content-Disposition: form-data; name="${quotedName}"\r\n\r\n${value}\r\n`);
+    } else if (value instanceof BlobPolyfill) {
+      const type = value.type === '' ? '' : `Content-Type: ${value.type}\r\n`;
+      const filename = escapeDisposition(value.name);
+      push(
+        `Content-Disposition: form-data; name="${quotedName}"; filename="${filename}"\r\n` +
+          `${type}\r\n`,
+      );
+      chunks.push(readBlobBytes(value));
+      push('\r\n');
+    } else {
+      throw new TypeError('FormData file fields must be Blob or File objects');
+    }
+  }
+  push(`--${boundary}--\r\n`);
+  return concatBytes(chunks);
+}
+
+function countOccurrences(haystack: Uint8Array, needle: Uint8Array): number {
+  let count = 0;
+  let from = 0;
+  while (from <= haystack.length - needle.length) {
+    const found = indexOfBytes(haystack, needle, from);
+    if (found < 0) break;
+    count += 1;
+    from = found + needle.length;
+  }
+  return count;
+}
+
+function encodeFormBody(body: FormDataPolyfill): { bytes: Uint8Array; contentType: string } {
+  const entries = [...body.entries()];
+  const encoder = new TextEncoderPolyfill();
+  for (let attempt = 0; attempt < MULTIPART_BOUNDARY_ATTEMPTS; attempt++) {
+    const boundary = multipartBoundary(attempt);
+    const bytes = encodeMultipart(entries, boundary);
+    // Opening delimiters plus the closing line are the only expected markers.
+    const markers = countOccurrences(bytes, encoder.encode(`--${boundary}`));
+    if (markers === entries.length + 1) {
+      return { bytes, contentType: `multipart/form-data; boundary=${boundary}` };
+    }
+  }
+  throw new TypeError('multipart boundary collides with form contents');
+}
+
+function bodyFromInit(body: unknown, headers: HeadersPolyfill): BodySource {
+  if (!isFormDataBody(body)) return toBodySource(body);
+  const encoded = encodeFormBody(body);
+  if (!headers.has('content-type')) headers.set('content-type', encoded.contentType);
+  return encoded.bytes;
+}
+
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from = 0): number {
+  if (needle.length === 0) return from;
+  const end = haystack.length - needle.length;
+  for (let i = from; i <= end; i++) {
+    let matched = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return i;
+  }
+  return -1;
+}
+
+function parseContentType(header: string | null): { type: string; boundary?: string } {
+  if (header == null || header === '') return { type: '' };
+  const [rawType, ...params] = header.split(';');
+  let boundary: string | undefined;
+  for (const param of params) {
+    const eq = param.indexOf('=');
+    if (eq === -1) continue;
+    if (param.slice(0, eq).trim().toLowerCase() !== 'boundary') continue;
+    let value = param.slice(eq + 1).trim();
+    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+      value = value.slice(1, -1);
+    }
+    boundary = value;
+  }
+  return { type: (rawType ?? '').trim().toLowerCase(), boundary };
+}
+
+function headerValue(block: string, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  for (const line of block.split('\r\n')) {
+    const colon = line.indexOf(':');
+    if (colon === -1) continue;
+    if (line.slice(0, colon).trim().toLowerCase() !== lower) continue;
+    return line.slice(colon + 1).trim();
+  }
+  return undefined;
+}
+
+function dispositionParam(value: string, param: string): string | undefined {
+  for (const part of value.split(';').slice(1)) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim().toLowerCase() !== param) continue;
+    let raw = part.slice(eq + 1).trim();
+    if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) raw = raw.slice(1, -1);
+    return raw.replaceAll('%22', '"');
+  }
+  return undefined;
+}
+
+function parseUrlEncoded(bytes: Uint8Array): FormDataPolyfill {
+  const form = new FormDataPolyfill();
+  const params = new URLSearchParamsPolyfill(new TextDecoderPolyfill().decode(bytes));
+  for (const [name, value] of params) form.append(name, value);
+  return form;
+}
+
+function parseMultipart(bytes: Uint8Array, boundary: string): FormDataPolyfill {
+  const encoder = new TextEncoderPolyfill();
+  const decoder = new TextDecoderPolyfill();
+  const dashBoundary = encoder.encode(`--${boundary}`);
+  const headerBreak = encoder.encode('\r\n\r\n');
+  const nextMarker = encoder.encode(`\r\n--${boundary}`);
+  const form = new FormDataPolyfill();
+  let position = indexOfBytes(bytes, dashBoundary);
+  if (position < 0) throw new TypeError('multipart/form-data body is missing its boundary');
+  position += dashBoundary.length;
+
+  while (position < bytes.length) {
+    if (bytes[position] === 45 && bytes[position + 1] === 45) break;
+    if (bytes[position] !== 13 || bytes[position + 1] !== 10) {
+      throw new TypeError('multipart/form-data body is malformed');
+    }
+    position += 2;
+    const headerEnd = indexOfBytes(bytes, headerBreak, position);
+    if (headerEnd < 0) throw new TypeError('multipart/form-data part is missing its headers');
+    const headerText = decoder.decode(bytes.subarray(position, headerEnd));
+    position = headerEnd + headerBreak.length;
+    const next = indexOfBytes(bytes, nextMarker, position);
+    if (next < 0) throw new TypeError('multipart/form-data part is truncated');
+    const partBody = bytes.subarray(position, next);
+    position = next + 2 + dashBoundary.length;
+
+    const disposition = headerValue(headerText, 'content-disposition');
+    if (disposition === undefined) continue;
+    const name = dispositionParam(disposition, 'name');
+    if (name === undefined) continue;
+    const filename = dispositionParam(disposition, 'filename');
+    if (filename === undefined) {
+      form.append(name, decoder.decode(partBody));
+    } else {
+      const type = headerValue(headerText, 'content-type') ?? '';
+      form.append(name, new BlobPolyfill([partBody], { type }), filename);
+    }
+  }
+  return form;
+}
+
+function formDataFromBody(headers: HeadersPolyfill, buffer: ArrayBuffer): FormDataPolyfill {
+  const parsed = parseContentType(headers.get('content-type'));
+  const bytes = new Uint8Array(buffer);
+  if (parsed.type === 'application/x-www-form-urlencoded') return parseUrlEncoded(bytes);
+  if (parsed.type === 'multipart/form-data') {
+    if (parsed.boundary === undefined || parsed.boundary === '') {
+      throw new TypeError('multipart/form-data body is missing a boundary');
+    }
+    return parseMultipart(bytes, parsed.boundary);
+  }
+  throw new TypeError(
+    'Content-Type is not multipart/form-data or application/x-www-form-urlencoded',
+  );
 }
 
 const noopConsole = {
@@ -424,18 +792,90 @@ const noopConsole = {
   debug() {},
 };
 
+const URL_SEARCH_PARAMS_METHODS = [
+  'get',
+  'getAll',
+  'has',
+  'append',
+  'set',
+  'delete',
+  'toString',
+  'entries',
+  Symbol.iterator,
+] as const;
+
+const HEADERS_METHODS = [
+  'append',
+  'set',
+  'get',
+  'has',
+  'delete',
+  'entries',
+  'forEach',
+  'keys',
+  'values',
+  'getSetCookie',
+  Symbol.iterator,
+] as const;
+
+const FORM_DATA_METHODS = [
+  'append',
+  'get',
+  'getAll',
+  'has',
+  'set',
+  'delete',
+  'entries',
+  Symbol.iterator,
+] as const;
+
+function hasRequiredMethods(value: unknown, methods: readonly (string | symbol)[]): boolean {
+  if (typeof value !== 'function') return false;
+  const prototype = (value as { prototype?: Record<string | symbol, unknown> | null }).prototype;
+  if (prototype != null && methods.every((method) => typeof prototype[method] === 'function')) {
+    return true;
+  }
+  try {
+    const instance = new (value as new () => Record<string | symbol, unknown>)();
+    return methods.every((method) => typeof instance[method] === 'function');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Install `implementation` when `name` is missing or lacks a method guests call.
+ * A partial constructor used to be kept, and the missing method then failed as
+ * an HTTP 500. A constructor that already has the methods is left alone.
+ */
+function installWebConstructor(
+  global: Record<string, unknown>,
+  name: string,
+  implementation: unknown,
+  methods: readonly (string | symbol)[],
+  force: boolean,
+): void {
+  if (force || !hasRequiredMethods(global[name], methods)) global[name] = implementation;
+}
+
 export function installFetchRuntime(force = false): void {
   const global = globalThis as Record<string, unknown>;
   if (force || typeof global.TextEncoder !== 'function') global.TextEncoder = TextEncoderPolyfill;
   if (force || typeof global.TextDecoder !== 'function') global.TextDecoder = TextDecoderPolyfill;
-  if (force || typeof global.URLSearchParams !== 'function') {
-    global.URLSearchParams = URLSearchParamsPolyfill;
-  }
+  installWebConstructor(
+    global,
+    'URLSearchParams',
+    URLSearchParamsPolyfill,
+    URL_SEARCH_PARAMS_METHODS,
+    force,
+  );
   if (force || typeof global.URL !== 'function') global.URL = URLPolyfill;
-  if (force || typeof global.Headers !== 'function') global.Headers = HeadersPolyfill;
+  installWebConstructor(global, 'Headers', HeadersPolyfill, HEADERS_METHODS, force);
   if (force || typeof global.Request !== 'function') global.Request = RequestPolyfill;
   if (force || typeof global.Response !== 'function') global.Response = ResponsePolyfill;
+  installWebConstructor(global, 'FormData', FormDataPolyfill, FORM_DATA_METHODS, force);
   if (force || typeof global.Blob !== 'function') global.Blob = BlobPolyfill;
+  if (force || typeof global.File !== 'function') global.File = FilePolyfill;
   if (force || typeof global.AbortSignal !== 'function') global.AbortSignal = AbortSignalPolyfill;
   if (force || typeof global.AbortController !== 'function') {
     global.AbortController = AbortControllerPolyfill;

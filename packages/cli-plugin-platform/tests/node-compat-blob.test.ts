@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import {
   AbortControllerPolyfill,
   BlobPolyfill,
+  FilePolyfill,
   installFetchRuntime,
 } from '../src/node-compat/fetch-runtime';
 
@@ -16,6 +17,8 @@ const installedGlobals = [
   'Request',
   'Response',
   'Blob',
+  'File',
+  'FormData',
   'AbortSignal',
   'AbortController',
   'self',
@@ -38,6 +41,20 @@ describe('guest Blob', () => {
     expect(blob.type).toBe('application/octet-stream');
     expect(new BlobPolyfill().size).toBe(0);
     expect(new BlobPolyfill([new ArrayBuffer(4)]).size).toBe(4);
+  });
+
+  it('copies Blob and File parts instead of dropping them', async () => {
+    const inner = new BlobPolyfill(['hello'], { type: 'text/plain' });
+    const wrapped = new BlobPolyfill([inner]);
+    expect(wrapped.size).toBe(5);
+    expect(await wrapped.text()).toBe('hello');
+    const file = new FilePolyfill([inner], 'x.txt', { type: 'text/plain' });
+    expect(file.name).toBe('x.txt');
+    expect(file.size).toBe(5);
+    expect(await file.text()).toBe('hello');
+    expect(await new BlobPolyfill([file]).text()).toBe('hello');
+    expect(() => new BlobPolyfill([{} as never])).toThrow(TypeError);
+    expect(() => new BlobPolyfill([new Blob(['hi'])])).toThrow(TypeError);
   });
 
   it('installs the polyfill when the guest has no Blob', () => {
