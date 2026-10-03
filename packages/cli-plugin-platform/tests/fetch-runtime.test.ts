@@ -80,6 +80,9 @@ describe('fetch runtime polyfills', () => {
   it('parses query strings from several init shapes', () => {
     const fromString = new URLSearchParamsPolyfill('?a=1&lonely&b=2');
     expect(fromString.get('a')).toBe('1');
+    expect(new URLSearchParamsPolyfill('scope=openid+profile+email').get('scope')).toBe(
+      'openid profile email',
+    );
     expect(fromString.get('lonely')).toBe('');
     expect(fromString.get('missing')).toBeNull();
     expect(fromString.toString()).toBe('a=1&lonely=&b=2');
@@ -101,6 +104,26 @@ describe('fetch runtime polyfills', () => {
     expect(new URLSearchParamsPolyfill('').toString()).toBe('');
     expect(new URLSearchParamsPolyfill({ a: '1' }).get('a')).toBe('1');
     expect(new URLSearchParamsPolyfill(fromString).get('b')).toBe('2');
+    const edited = new URLSearchParamsPolyfill('scope=openid&scope=profile&extra=1');
+    expect(edited.has('scope')).toBe(true);
+    expect(edited.has('missing')).toBe(false);
+    expect(edited.getAll('scope')).toEqual(['openid', 'profile']);
+    edited.append('scope', 'email');
+    edited.set('extra', '2');
+    edited.delete('missing');
+    expect(edited.toString()).toBe('scope=openid&scope=profile&extra=2&scope=email');
+    const url = new URLPolyfill('/oauth2/consent', 'http://relative.invalid');
+    url.searchParams.set('client_id', 'access');
+    url.searchParams.set('state', 'abc');
+    expect(`${url.pathname}${url.search}`).toBe('/oauth2/consent?client_id=access&state=abc');
+    expect(url.toString()).toBe(
+      'http://relative.invalid/oauth2/consent?client_id=access&state=abc',
+    );
+    url.searchParams.delete('state');
+    expect(url.search).toBe('?client_id=access');
+    url.searchParams.delete('client_id');
+    expect(url.search).toBe('');
+    expect(url.href).toBe('http://relative.invalid/oauth2/consent');
   });
 
   it('resolves absolute and relative URLs', () => {
