@@ -16,6 +16,8 @@ const installedGlobals = [
   'Request',
   'Response',
   'Blob',
+  'File',
+  'FormData',
   'AbortSignal',
   'AbortController',
   'self',
