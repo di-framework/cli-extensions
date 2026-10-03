@@ -561,7 +561,11 @@ export class FormDataPolyfill {
   forEach(
     callback: (value: FormDataEntryValue, name: string, parent: FormDataPolyfill) => void,
   ): void {
-    for (const [name, value] of this.#entries) callback(value, name, this);
+    const pairs = this.#entries;
+    for (let index = 0; index < pairs.length; index++) {
+      const pair = pairs[index] as [string, FormDataEntryValue];
+      callback(pair[1], pair[0], this);
+    }
   }
 
   [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]> {
