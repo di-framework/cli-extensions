@@ -255,6 +255,12 @@ describe('fetch runtime polyfills', () => {
     expect(form.getAll('name')).toEqual(['test-file', 'second']);
     expect(form.has('missing')).toBe(false);
     expect([...form.keys()]).toEqual(['name', 'file', 'bin', 'name']);
+    const visited: string[] = [];
+    form.forEach((value, name, parent) => {
+      visited.push(`${name}:${typeof value === 'string' ? value : value.name}`);
+      expect(parent).toBe(form);
+    });
+    expect(visited).toEqual(['name:test-file', 'file:test.txt', 'bin:b.bin', 'name:second']);
     form.set('name', 'only');
     expect(form.getAll('name')).toEqual(['only']);
     form.delete('bin');
