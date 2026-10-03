@@ -46,7 +46,7 @@ function assets(): string {
   writeFileSync(join(root, 'index.html'), '<!doctype html><title>DI Framework console</title>');
   writeFileSync(join(root, 'app.js'), 'globalThis.consoleReady = true;\n');
   writeFileSync(join(root, 'app.css'), 'body { margin: 0; }\n');
-  for (const extension of ['.svg', '.woff', '.woff2', '.ttf', '.map']) {
+  for (const extension of ['.svg', '.woff', '.woff2', '.ttf', '.map', '.png']) {
     writeFileSync(join(root, `asset${extension}`), 'asset');
   }
   mkdirSync(join(root, 'nested'), { recursive: true });
@@ -1492,6 +1492,9 @@ registry = "registry.example.com/team"
       expect(
         (await request(server.port, { path: '/assets/asset.ttf' })).headers['content-type'],
       ).toContain('font/ttf');
+      expect(
+        (await request(server.port, { path: '/assets/asset.png' })).headers['content-type'],
+      ).toContain('image/png');
       expect((await request(server.port, { path: '/assets/asset.map' })).status).toBe(200);
       expect((await request(server.port, { path: '/assets/a..b' })).status).toBe(404);
       expect(
