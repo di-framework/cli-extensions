@@ -220,7 +220,7 @@ export class HeadersPolyfill {
    * each stored value so the HTTP adapter can forward multi-value headers.
    */
   *#combined(): IterableIterator<[string, string]> {
-    for (const name of [...this.#map.keys()].sort()) {
+    for (const name of [...this.#map.keys()].sort((left, right) => left.localeCompare(right))) {
       const values = this.#map.get(name) ?? [];
       if (values.length === 0) continue;
       if (name === 'set-cookie') {
@@ -437,14 +437,18 @@ export class AbortControllerPolyfill {
   }
 }
 
-type BlobPart = string | ArrayBuffer | ArrayBufferView;
+type BlobPart = string | ArrayBuffer | ArrayBufferView | BlobPolyfill;
 
 const blobContents = new WeakMap<BlobPolyfill, Uint8Array>();
 
 function bytesOfPart(part: BlobPart): Uint8Array {
   if (typeof part === 'string') return new TextEncoder().encode(part);
+  if (part instanceof BlobPolyfill) return readBlobBytes(part).slice();
   if (part instanceof ArrayBuffer) return new Uint8Array(part);
-  return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+  if (ArrayBuffer.isView(part)) {
+    return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+  }
+  throw new TypeError('Blob parts must be strings, buffers, or Blob objects');
 }
 
 function concatBytes(chunks: Uint8Array[]): Uint8Array {
@@ -588,14 +592,10 @@ function isFormDataBody(body: unknown): body is FormDataPolyfill {
   return typeof ctor === 'function' && body instanceof (ctor as new (...args: never[]) => object);
 }
 
-function createBoundary(): string {
-  let token = '';
-  for (let i = 0; i < 16; i++) {
-    token += Math.floor(Math.random() * 256)
-      .toString(16)
-      .padStart(2, '0');
-  }
-  return `----diFormBoundary${token}`;
+const MULTIPART_BOUNDARY_ATTEMPTS = 32;
+
+function multipartBoundary(attempt: number): string {
+  return `----diFormBoundary${attempt.toString(16).padStart(8, '0')}`;
 }
 
 function escapeDisposition(value: string): string {
@@ -631,12 +631,31 @@ function encodeMultipart(
   return concatBytes(chunks);
 }
 
+function countOccurrences(haystack: Uint8Array, needle: Uint8Array): number {
+  let count = 0;
+  let from = 0;
+  while (from <= haystack.length - needle.length) {
+    const found = indexOfBytes(haystack, needle, from);
+    if (found < 0) break;
+    count += 1;
+    from = found + needle.length;
+  }
+  return count;
+}
+
 function encodeFormBody(body: FormDataPolyfill): { bytes: Uint8Array; contentType: string } {
-  const boundary = createBoundary();
-  return {
-    bytes: encodeMultipart(body.entries(), boundary),
-    contentType: `multipart/form-data; boundary=${boundary}`,
-  };
+  const entries = [...body.entries()];
+  const encoder = new TextEncoderPolyfill();
+  for (let attempt = 0; attempt < MULTIPART_BOUNDARY_ATTEMPTS; attempt++) {
+    const boundary = multipartBoundary(attempt);
+    const bytes = encodeMultipart(entries, boundary);
+    // Opening delimiters plus the closing line are the only expected markers.
+    const markers = countOccurrences(bytes, encoder.encode(`--${boundary}`));
+    if (markers === entries.length + 1) {
+      return { bytes, contentType: `multipart/form-data; boundary=${boundary}` };
+    }
+  }
+  throw new TypeError('multipart boundary collides with form contents');
 }
 
 function bodyFromInit(body: unknown, headers: HeadersPolyfill): BodySource {

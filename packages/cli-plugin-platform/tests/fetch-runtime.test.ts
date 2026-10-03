@@ -354,6 +354,24 @@ describe('fetch runtime polyfills', () => {
     expect(() => form.append('file', {} as BlobPolyfill)).toThrow(TypeError);
   });
 
+  it('picks another multipart boundary when the body contains the first token', async () => {
+    const marker = (attempt: number) => {
+      const boundary = `----diFormBoundary${attempt.toString(16).padStart(8, '0')}`;
+      return `--${boundary}`;
+    };
+    const posted = new FormDataPolyfill();
+    posted.append('field', marker(0));
+    const request = new RequestPolyfill('http://example/upload', { method: 'POST', body: posted });
+    expect(request.headers.get('content-type')).toContain('----diFormBoundary00000001');
+    expect((await request.formData()).get('field')).toBe(marker(0));
+
+    const hostile = new FormDataPolyfill();
+    hostile.append('field', Array.from({ length: 32 }, (_, attempt) => marker(attempt)).join(''));
+    expect(
+      () => new RequestPolyfill('http://example/upload', { method: 'POST', body: hostile }),
+    ).toThrow(TypeError);
+  });
+
   it('replaces partial Web constructors and keeps complete ones', () => {
     const global = globalThis as Record<string, unknown>;
     expect(global.Headers).not.toBe(HeadersPolyfill);
