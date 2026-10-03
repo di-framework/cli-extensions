@@ -32,6 +32,7 @@ export class TextDecoderPolyfill {
 
 export class URLSearchParamsPolyfill {
   #pairs: Array<[string, string]> = [];
+  #onChange?: () => void;
 
   constructor(init?: string | URLSearchParamsPolyfill | Record<string, string>) {
     if (typeof init === 'string') {
@@ -39,8 +40,9 @@ export class URLSearchParamsPolyfill {
       if (query !== '') {
         for (const part of query.split('&')) {
           const eq = part.indexOf('=');
-          const name = decodeURIComponent(eq === -1 ? part : part.slice(0, eq));
-          const value = decodeURIComponent(eq === -1 ? '' : part.slice(eq + 1));
+          const decode = (text: string) => decodeURIComponent(text.replaceAll('+', ' '));
+          const name = decode(eq === -1 ? part : part.slice(0, eq));
+          const value = decode(eq === -1 ? '' : part.slice(eq + 1));
           this.#pairs.push([name, value]);
         }
       }
@@ -51,9 +53,47 @@ export class URLSearchParamsPolyfill {
     }
   }
 
+  /** Lets `URL` refresh `search` and `href` after `set`, `append`, or `delete`. */
+  bind(onChange: () => void): void {
+    this.#onChange = onChange;
+  }
+
   get(name: string): string | null {
     const found = this.#pairs.find(([key]) => key === name);
     return found ? found[1] : null;
+  }
+
+  getAll(name: string): string[] {
+    return this.#pairs.filter(([key]) => key === name).map(([, value]) => value);
+  }
+
+  has(name: string): boolean {
+    return this.#pairs.some(([key]) => key === name);
+  }
+
+  append(name: string, value: string): void {
+    this.#pairs.push([name, String(value)]);
+    this.#onChange?.();
+  }
+
+  set(name: string, value: string): void {
+    const next: Array<[string, string]> = [];
+    let placed = false;
+    for (const pair of this.#pairs) {
+      if (pair[0] !== name) next.push(pair);
+      else if (!placed) {
+        next.push([name, String(value)]);
+        placed = true;
+      }
+    }
+    if (!placed) next.push([name, String(value)]);
+    this.#pairs = next;
+    this.#onChange?.();
+  }
+
+  delete(name: string): void {
+    this.#pairs = this.#pairs.filter(([key]) => key !== name);
+    this.#onChange?.();
   }
 
   *entries(): IterableIterator<[string, string]> {
@@ -99,6 +139,13 @@ export class URLPolyfill {
     this.origin = `${this.protocol}//${this.host}`;
     this.href = resolved;
     this.searchParams = new URLSearchParamsPolyfill(this.search);
+    this.searchParams.bind(() => this.#sync());
+  }
+
+  #sync(): void {
+    const query = this.searchParams.toString();
+    this.search = query === '' ? '' : `?${query}`;
+    this.href = `${this.origin}${this.pathname}${this.search}${this.hash}`;
   }
 
   toString(): string {
