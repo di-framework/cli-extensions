@@ -387,6 +387,39 @@ describe('http adapter', () => {
     ]);
   });
 
+  it('uses the wasi-http error-code future for consume-body', async () => {
+    const written: unknown[] = [];
+    const Future = Object.assign(
+      (type: unknown) => ({
+        readable: { kind: type },
+        writable: {
+          write(value: unknown) {
+            written.push({ type, value });
+          },
+        },
+      }),
+      {
+        RESULT_VOID_OTHER: 'wrong-type',
+        RESULT_VOID_WASI_HTTP_TYPES_0_3_0_ERROR_CODE: 'http-void',
+        RESULT_OPTION_OTHER_ERROR_CODE: 'trailers-type',
+      },
+    );
+    (globalThis as { wit?: unknown }).wit = { Future };
+    const captured: unknown[] = [];
+    wasiState.consumeBody = (_request, res) => {
+      captured.push(res);
+      return [readable(new TextEncoder().encode('payload'))];
+    };
+
+    await handler.handle(incoming({ method: { tag: 'post' }, path: '/body' }));
+
+    expect(captured).toEqual([{ kind: 'http-void' }]);
+    expect(written.map((entry) => (entry as { type: string }).type)).toEqual([
+      'http-void',
+      'trailers-type',
+    ]);
+  });
+
   it('routes cron and queue control requests through control handlers', async () => {
     queueState.backend = {
       async listQueues() {

@@ -60,6 +60,15 @@ function pickFutureType(factory: QjsFutureFactory, preferred: readonly string[])
   for (const name of preferred) {
     if (name in factory) return factory[name];
   }
+  // componentize-qjs names `future<result<_, error-code>>` after the imported
+  // interface, not the short RESULT_VOID_ERROR_CODE alias. The first factory
+  // key is a different future and traps in consume-body.
+  if (preferred.includes('RESULT_VOID_ERROR_CODE')) {
+    const httpVoid = Object.keys(factory).find(
+      (key) => key.startsWith('RESULT_VOID_WASI_HTTP_TYPES_') && key.endsWith('_ERROR_CODE'),
+    );
+    if (httpVoid !== undefined) return factory[httpVoid];
+  }
   const fallback = Object.keys(factory).find((key) => key !== 'types' && key !== 'from');
   return fallback === undefined ? undefined : factory[fallback];
 }
