@@ -8,11 +8,19 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
+import { basename, dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { type CliIo, CommandFailure, type CommandResult } from '@di-framework/cli-extension';
 import { discoverActors, renderActorsModule } from './actors';
 import { type BindingRecord, discoverBindings, requirementsFromBindings } from './bindings';
+import {
+  type ComponentProvider,
+  copyProviderWit,
+  discoverComponentProviders,
+  providerNamespaces,
+  providerRequirementsFromJavaScript,
+  providersToCompose,
+} from './components';
 import { discoverScheduledJobs, renderCronAdapterModule, renderCronInvokerModule } from './cron';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { renderGuestsModule } from './guests';
@@ -189,6 +197,47 @@ async function composeSqliteProvider(
       { application: project.applicationName },
     );
   }
+  await composeProvider(project, deps, io, {
+    label: 'di-framework:sqlite',
+    wasm: provider,
+    namedImports,
+    failureCode: 'WASMCLOUD_SQLITE_COMPOSE_FAILED',
+  });
+}
+
+async function composeComponentProvider(
+  project: WasmcloudProject,
+  deps: WasmcloudDeps,
+  io: CliIo,
+  provider: ComponentProvider,
+  namedImports = false,
+): Promise<void> {
+  if (!existsSync(provider.wasm)) {
+    throw new CommandFailure(
+      'WASMCLOUD_COMPONENT_PROVIDER_MISSING',
+      `Dependency ${provider.dependency} declares component ${provider.wasm}, which does not exist`,
+      3,
+      { application: project.applicationName, dependency: provider.dependency },
+    );
+  }
+  await composeProvider(project, deps, io, {
+    label: `${provider.package}@${provider.version} (${provider.dependency})`,
+    wasm: provider.wasm,
+    namedImports,
+    failureCode: 'WASMCLOUD_COMPONENT_COMPOSE_FAILED',
+  });
+}
+
+/**
+ * Plugs one provider component into the built guest: `wac plug`, or the
+ * componentize-qjs composer when the guest has named imports to preserve.
+ */
+async function composeProvider(
+  project: WasmcloudProject,
+  deps: WasmcloudDeps,
+  io: CliIo,
+  options: { label: string; wasm: string; namedImports: boolean; failureCode: string },
+): Promise<void> {
   const composed = `${project.outputPath}.composed`;
   const toolsBin = sqliteToolsBin();
   const envPath = [toolsBin, process.env.PATH ?? ''].filter(Boolean).join(':');
@@ -198,9 +247,9 @@ async function composeSqliteProvider(
       : toolsBin
         ? join(toolsBin, 'wac')
         : 'wac';
-  io.stdout.write('Composing di-framework:sqlite provider...\n');
-  const compiler = namedImports ? deps.componentizeQjsPath() : undefined;
-  if (namedImports && !compiler)
+  io.stdout.write(`Composing ${options.label} provider...\n`);
+  const compiler = options.namedImports ? deps.componentizeQjsPath() : undefined;
+  if (options.namedImports && !compiler)
     throw new CommandFailure(
       'WASMCLOUD_COMPILER_REQUIRED',
       'Managed PostgreSQL requires componentize-qjs 0.4.4-di.3 or newer',
@@ -209,14 +258,14 @@ async function composeSqliteProvider(
   const result = await deps.runCaptured(
     compiler ?? wac,
     compiler
-      ? ['compose', project.outputPath, '--definition', provider, '-o', composed]
-      : ['plug', '--plug', provider, project.outputPath, '-o', composed],
+      ? ['compose', project.outputPath, '--definition', options.wasm, '-o', composed]
+      : ['plug', '--plug', options.wasm, project.outputPath, '-o', composed],
     { cwd: project.projectRoot, env: { ...process.env, PATH: envPath } },
   );
   if (result.exitCode !== 0) {
     throw new CommandFailure(
-      'WASMCLOUD_SQLITE_COMPOSE_FAILED',
-      `SQLite composition failed: ${result.stderr || result.stdout}`,
+      options.failureCode,
+      `Composition of ${options.label} failed: ${result.stderr || result.stdout}`,
       3,
       { application: project.applicationName, exitCode: result.exitCode },
     );
@@ -301,12 +350,15 @@ export async function buildComponent(
     }
   }
 
+  const providers = discoverComponentProviders(project.projectRoot);
+
   rmSync(generatedDirectory, { recursive: true, force: true });
   mkdirSync(join(generatedWit, 'deps'), { recursive: true });
   mkdirSync(dirname(project.outputPath), { recursive: true });
   cpSync(join(deps.assetsDirectory(), 'wit', 'deps'), join(generatedWit, 'deps'), {
     recursive: true,
   });
+  copyProviderWit(providers, join(generatedWit, 'deps'));
 
   writeFileSync(
     join(generatedWit, 'world.wit'),
@@ -374,6 +426,7 @@ export async function buildComponent(
       projectRoot: project.projectRoot,
       // `"logs": false` wins over the caller: the guest keeps the noop console.
       guestLogging: project.logs === false ? false : options.guestLogging,
+      externalNamespaces: providerNamespaces(providers),
     });
   } catch (error) {
     throw new CommandFailure(
@@ -384,9 +437,11 @@ export async function buildComponent(
     );
   }
 
-  const runtimeRequirements = runtimeRequirementsFromJavaScript(
-    readFileSync(bundledJavaScript, 'utf8'),
-  );
+  const bundledSource = readFileSync(bundledJavaScript, 'utf8');
+  const runtimeRequirements = [
+    ...runtimeRequirementsFromJavaScript(bundledSource),
+    ...providerRequirementsFromJavaScript(bundledSource, providers),
+  ];
   const finalRequirements = [...requirements, ...runtimeRequirements];
   if (runtimeRequirements.length > 0) {
     writeFileSync(
@@ -406,20 +461,25 @@ export async function buildComponent(
     (requirement) =>
       requirement.package === 'di-framework:sqlite' && requirement.direction === 'import',
   );
+  const namedImports = finalRequirements.some((r) => r.namedImport);
   if (needsSqliteCompose) {
-    await composeSqliteProvider(
-      project,
-      deps,
-      io,
-      finalRequirements.some((r) => r.namedImport),
-    );
+    await composeSqliteProvider(project, deps, io, namedImports);
   }
+  const composedProviders = providersToCompose(providers, finalRequirements);
+  for (const provider of composedProviders) {
+    await composeComponentProvider(project, deps, io, provider, namedImports);
+  }
+  const composedPackages = new Set(composedProviders.map((provider) => provider.package));
 
   await inspectComponentImports(
     project,
     finalRequirements.filter(
       (requirement) =>
-        !(requirement.package === 'di-framework:sqlite' && requirement.direction === 'import'),
+        !(
+          requirement.direction === 'import' &&
+          (requirement.package === 'di-framework:sqlite' ||
+            composedPackages.has(requirement.package))
+        ),
     ),
     deps,
   );
@@ -433,6 +493,7 @@ export async function buildComponent(
     needsSqliteCompose
       ? join(deps.assetsDirectory(), 'sqlite', 'di-framework-sqlite.wasm')
       : undefined,
+    composedProviders.map((provider) => provider.wasm),
   );
   const artifactDigest = digestBytes(readFileSync(project.outputPath));
   const summary: BuildSummary = {
@@ -467,6 +528,7 @@ export function canonicalBuildDigest(
   lock: WitLock,
   profile: string = BUILD_PROFILE_NAME,
   sqliteProvider?: string,
+  composedProviders: readonly string[] = [],
 ): string {
   const hash = createHash('sha256');
   addDigestEntry(hash, 'profile', `${profile}\n${COMPONENT_MODEL}`);
@@ -479,6 +541,9 @@ export function canonicalBuildDigest(
   }
   if (sqliteProvider !== undefined) {
     addDigestEntry(hash, 'sqlite-provider', readFileSync(sqliteProvider));
+  }
+  for (const provider of composedProviders) {
+    addDigestEntry(hash, `component-provider/${basename(provider)}`, readFileSync(provider));
   }
   return hash.digest('hex');
 }

@@ -59,12 +59,20 @@ export type BundleOptions = {
   files?: Record<string, string>;
   env?: Record<string, string | undefined>;
   cwd?: string;
+  /** WIT namespaces of component providers whose specifiers must stay external. */
+  externalNamespaces?: readonly string[];
 };
 
 export type Bundler = (options: BundleOptions) => Promise<void>;
 
 /** Component imports are WIT specifiers, not npm packages. */
 export const COMPONENT_IMPORT_EXTERNAL = /^(wasi|wasmcloud|di-framework):/;
+
+/** `COMPONENT_IMPORT_EXTERNAL` widened with the namespaces of composed component providers. */
+export function componentImportExternal(namespaces: readonly string[] = []): RegExp {
+  const extra = namespaces.map((namespace) => namespace.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp(`^(wasi|wasmcloud|di-framework${extra.map((n) => `|${n}`).join('')}):`);
+}
 
 /** Every process, filesystem-adjacent, and toolchain boundary the commands touch. */
 export type WasmcloudDeps = {
@@ -358,11 +366,12 @@ export const DEFAULT_DEPS: WasmcloudDeps = {
     files,
     env,
     cwd,
+    externalNamespaces,
   }) => {
     const nodeEnv = wasmcloudNodeEnv();
     const bundle = await rolldown({
       input: 'virtual:di-framework-runtime-entry',
-      external: COMPONENT_IMPORT_EXTERNAL,
+      external: componentImportExternal(externalNamespaces),
       resolve: { alias: { ...nodeEnv.alias }, conditionNames: ['wasmcloud', 'import', 'default'] },
       plugins: [
         {

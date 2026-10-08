@@ -526,6 +526,107 @@ export class Counter {
   expect(invocations.some((entry) => entry.args.includes('plug'))).toBe(true);
 });
 
+it('composes a dependency that ships a component when the bundle imports its interfaces', async () => {
+  const root = makeProject(
+    { name: 'Hasher', entry: 'src/app.ts' },
+    { name: 'hasher', version: '1.0.0', dependencies: { '@scope/pqc': '0.2.10' } },
+  );
+  const pkg = join(root, 'node_modules', '@scope', 'pqc');
+  mkdirSync(join(pkg, 'component', 'wit'), { recursive: true });
+  writeFileSync(
+    join(pkg, 'package.json'),
+    JSON.stringify({
+      name: '@scope/pqc',
+      component: {
+        package: 'pqc-subtle:crypto@0.1.0',
+        wasm: 'component/pqc-subtle.wasm',
+        wit: 'component/wit',
+        interfaces: ['ml-kem', 'ml-dsa', 'argon2'],
+      },
+    }),
+  );
+  writeFileSync(join(pkg, 'component', 'pqc-subtle.wasm'), 'pqc-provider');
+  writeFileSync(
+    join(pkg, 'component', 'wit', 'world.wit'),
+    'package pqc-subtle:crypto@0.1.0;\n\ninterface types {}\ninterface argon2 {}\ninterface ml-kem {}\ninterface ml-dsa {}\n',
+  );
+  const assets = makeAssets();
+  const invocations: RunnerInvocation[] = [];
+  await buildComponent(
+    loadProject(root),
+    captureIo().io,
+    fakeDeps({
+      cwd: root,
+      assets,
+      invocations,
+      bundleContents: 'import { hash } from "pqc-subtle:crypto/argon2@0.1.0";\nexport default 1;\n',
+      componentOutput: () => `\0asm pqc-import`,
+      capturedStdout: {
+        wit: `world application {
+  export wasi:http/handler@0.3.0;
+  import pqc-subtle:crypto/argon2@0.1.0;
+}
+`,
+      },
+      captures: { wac: undefined },
+    }),
+  );
+  const world = readFileSync(join(root, '.di-framework', 'wit', 'world.wit'), 'utf8');
+  expect(world).toContain('import pqc-subtle:crypto/argon2@0.1.0;');
+  expect(world).not.toContain('ml-kem');
+  expect(
+    readFileSync(
+      join(root, '.di-framework', 'wit', 'deps', 'pqc-subtle-crypto', 'package.wit'),
+      'utf8',
+    ),
+  ).toContain('package pqc-subtle:crypto@0.1.0;');
+  const lock = JSON.parse(readFileSync(join(root, '.di-framework', 'wit.lock.json'), 'utf8'));
+  expect(lock.packages.map((entry: { id: string }) => entry.id)).toContain('pqc-subtle:crypto');
+  const plugs = invocations.filter((entry) => entry.args.includes('plug'));
+  expect(plugs).toHaveLength(1);
+  expect(plugs[0]?.args).toContain(join(pkg, 'component', 'pqc-subtle.wasm'));
+});
+
+it('fails when a composed dependency is missing its component binary', async () => {
+  const root = makeProject(
+    { name: 'Hasher', entry: 'src/app.ts' },
+    { name: 'hasher', version: '1.0.0', dependencies: { '@scope/pqc': '0.2.10' } },
+  );
+  const pkg = join(root, 'node_modules', '@scope', 'pqc');
+  mkdirSync(join(pkg, 'component', 'wit'), { recursive: true });
+  writeFileSync(
+    join(pkg, 'package.json'),
+    JSON.stringify({
+      name: '@scope/pqc',
+      component: {
+        package: 'pqc-subtle:crypto@0.1.0',
+        wasm: 'component/nope.wasm',
+        wit: 'component/wit',
+      },
+    }),
+  );
+  writeFileSync(
+    join(pkg, 'component', 'wit', 'world.wit'),
+    'package pqc-subtle:crypto@0.1.0;\n\ninterface argon2 {}\n',
+  );
+  await expect(
+    buildComponent(
+      loadProject(root),
+      captureIo().io,
+      fakeDeps({
+        cwd: root,
+        assets: makeAssets(),
+        bundleContents: 'import "pqc-subtle:crypto/argon2@0.1.0";\nexport default 1;\n',
+        componentOutput: () => `\0asm pqc-import`,
+        capturedStdout: {
+          wit: 'world application {\n  import pqc-subtle:crypto/argon2@0.1.0;\n}\n',
+        },
+        captures: { wac: undefined },
+      }),
+    ),
+  ).rejects.toMatchObject({ code: 'WASMCLOUD_COMPONENT_PROVIDER_MISSING' });
+});
+
 it('fails sqlite composition when the provider asset or wac plug step is missing', async () => {
   const root = makeProject();
   writeFileSync(
