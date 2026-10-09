@@ -168,9 +168,12 @@ export {
 } from './wit';
 export {
   applyWorkload,
+  type ControlSecretWrite,
   CRON_INVOKER_IMAGE,
+  controlSecretDocument,
   controlSecretResourceName,
   DEFAULT_STORAGE_MOUNT,
+  deleteControlSecret,
   deleteWorkload,
   HOST_STORAGE_ROOT,
   hostStoragePath,
@@ -178,6 +181,7 @@ export {
   renderWorkloadManifest,
   STORAGE_HOSTGROUP,
   type WorkloadManifestOptions,
+  writeControlSecret,
 } from './workload';
 
 export default defineExtension({

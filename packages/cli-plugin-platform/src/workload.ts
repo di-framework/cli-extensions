@@ -1,5 +1,6 @@
-import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type CliIo, CommandFailure } from '@di-framework/cli-extension';
 import { discoverActors } from './actors';
@@ -19,6 +20,7 @@ import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings
 import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
+import { toolFailed } from './support';
 import type { ClusterConnection } from './target';
 import {
   defaultProjectRequirements,
@@ -127,6 +129,11 @@ export interface WorkloadManifestOptions {
   };
   /** Secret name providing control-plane credentials (merged into WASI environment). */
   controlSecretName?: string;
+  /**
+   * Digest of the control token written on this deploy. Rendered as
+   * DI_CONTROL_TOKEN_REVISION so a rotated token changes the template and rolls the workload.
+   */
+  controlTokenRevision?: string;
   /** Explicit environment config values (string map for localResources.environment.config). */
   environment?: Record<string, string>;
 }
@@ -214,6 +221,9 @@ export function renderWorkloadManifest(
   const clusterHttpHost = `${name}.${connection.namespace}.svc.cluster.local`;
   const advertisedHttpHost = publicIngress ? project.applicationName : clusterHttpHost;
 
+  if (controlSecretName !== undefined && opts.controlTokenRevision !== undefined) {
+    environment.DI_CONTROL_TOKEN_REVISION = opts.controlTokenRevision;
+  }
   if (hasHttp) {
     environment.DI_CONTROL_REJECT_FORWARDED = '1';
     environment.DI_CONTROL_HTTP_HOST = [name, clusterHttpHost].join(',');
@@ -431,49 +441,110 @@ ${labels.replace(/^/gm, '        ')}
   return sections.join('\n---\n') + '\n';
 }
 
-async function ensureControlSecret(
+/** Control Secret written on deploy: its name and a digest that identifies the token. */
+export type ControlSecretWrite = { name: string; revision: string };
+
+/** The full control Secret the CLI owns; nothing in it is read back from the cluster. */
+export function controlSecretDocument(
+  workloadName: string,
+  namespace: string,
+  token: string,
+): Record<string, unknown> {
+  const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+  return {
+    apiVersion: 'v1',
+    kind: 'Secret',
+    metadata: {
+      name: controlSecretResourceName(workloadName),
+      namespace,
+      labels: {
+        'app.kubernetes.io/managed-by': MANAGED_BY_LABEL,
+        'app.kubernetes.io/name': workloadName,
+      },
+    },
+    type: 'Opaque',
+    data: {
+      DI_CONTROL_TOKEN: encode(token),
+      DI_CONTROL_IDENTITY: encode(workloadName),
+    },
+  };
+}
+
+function secretsPath(namespace: string, name?: string): string {
+  const collection = `/api/v1/namespaces/${encodeURIComponent(namespace)}/secrets`;
+  return name === undefined ? collection : `${collection}/${encodeURIComponent(name)}`;
+}
+
+/**
+ * Tenant developers may create, update and delete Secrets but never get, list, watch or
+ * patch them (platform#112). The control Secret is therefore written blind: POST the full
+ * document and, if it already exists, PUT the same document without a resourceVersion. A
+ * Secret allows such an unconditional update, so no read is needed to learn the version,
+ * and the Secret never disappears the way delete-then-create would make it. Both requests
+ * go through `--raw` because `kubectl replace -f` GETs the object first to fill in its
+ * resourceVersion. The token is regenerated on every deploy since the old one cannot be read.
+ */
+export async function writeControlSecret(
   project: WasmcloudProject,
   connection: ClusterConnection,
   deps: WasmcloudDeps,
-): Promise<string> {
-  const name = deploymentResourceName(project);
-  const secretName = controlSecretResourceName(name);
-  const existing = await captureKubectl(
-    deps,
-    connection,
-    ['get', 'secret', secretName],
-    project.projectRoot,
-  );
-  if (existing.exitCode !== 0) {
-    const token = randomBytes(32).toString('base64url');
-    await runKubectl(
+): Promise<ControlSecretWrite> {
+  const workloadName = deploymentResourceName(project);
+  const name = controlSecretResourceName(workloadName);
+  const token = randomBytes(32).toString('base64url');
+  const directory = mkdtempSync(join(tmpdir(), 'di-control-secret-'));
+  try {
+    const path = join(directory, 'secret.json');
+    writeFileSync(
+      path,
+      JSON.stringify(controlSecretDocument(workloadName, connection.namespace, token)),
+      { mode: 0o600 },
+    );
+    const created = await captureKubectl(
       deps,
       connection,
-      [
-        'create',
-        'secret',
-        'generic',
-        secretName,
-        `--from-literal=DI_CONTROL_TOKEN=${token}`,
-        `--from-literal=DI_CONTROL_IDENTITY=${name}`,
-      ],
+      ['create', '--raw', secretsPath(connection.namespace), '-f', path],
       project.projectRoot,
     );
+    if (created.exitCode !== 0) {
+      if (!/AlreadyExists|already exists/.test(created.stderr)) {
+        throw toolFailed('kubectl create', created.exitCode);
+      }
+      const replaced = await captureKubectl(
+        deps,
+        connection,
+        ['replace', '--raw', secretsPath(connection.namespace, name), '-f', path],
+        project.projectRoot,
+      );
+      if (replaced.exitCode !== 0) throw toolFailed('kubectl replace', replaced.exitCode);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
+  return { name, revision: createHash('sha256').update(token).digest('hex').slice(0, 16) };
+}
+
+/**
+ * Deletes the control Secret by name. A label-selected delete would LIST Secrets and the
+ * default `--wait=true` would GET it afterwards, both forbidden to tenant developers.
+ */
+export async function deleteControlSecret(
+  project: WasmcloudProject,
+  connection: ClusterConnection,
+  deps: WasmcloudDeps,
+): Promise<void> {
   await runKubectl(
     deps,
     connection,
     [
-      'label',
+      'delete',
       'secret',
-      secretName,
-      `app.kubernetes.io/managed-by=${MANAGED_BY_LABEL}`,
-      `app.kubernetes.io/name=${name}`,
-      '--overwrite',
+      controlSecretResourceName(deploymentResourceName(project)),
+      '--ignore-not-found',
+      '--wait=false',
     ],
     project.projectRoot,
   );
-  return secretName;
 }
 
 export async function applyWorkload(
@@ -522,16 +593,19 @@ export async function applyWorkload(
     hasQueues: queueHandlers.length > 0,
     hasPersistentStorage,
   });
-  const controlSecretName = needsHttp
-    ? await ensureControlSecret(project, connection, deps)
-    : undefined;
+  const controlSecret = needsHttp ? await writeControlSecret(project, connection, deps) : undefined;
   const manifest = renderWorkloadManifest(
     project,
     connection,
     image,
     requirements,
     bindings,
-    { hasActors, hasPersistentStorage, controlSecretName },
+    {
+      hasActors,
+      hasPersistentStorage,
+      controlSecretName: controlSecret?.name,
+      controlTokenRevision: controlSecret?.revision,
+    },
     cronJobs,
     queueHandlers,
   );
@@ -601,7 +675,7 @@ export async function deleteWorkload(
     connection,
     [
       'delete',
-      `${WORKLOAD_DEPLOYMENT_RESOURCE},service,cronjob,secret`,
+      `${WORKLOAD_DEPLOYMENT_RESOURCE},service,cronjob`,
       '-l',
       `app.kubernetes.io/name=${name}`,
       '--ignore-not-found',
@@ -610,6 +684,8 @@ export async function deleteWorkload(
     ],
     project.projectRoot,
   );
+  // After the workload and its cron invokers are gone, so nothing still mounts the token.
+  await deleteControlSecret(project, connection, deps);
   await cleanupManagedBindings(project, connection, new Set(), deps);
   await removeWorkloadEgress(project, connection, deps);
 }

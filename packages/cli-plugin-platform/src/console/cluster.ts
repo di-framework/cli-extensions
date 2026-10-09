@@ -94,20 +94,39 @@ export function createKubectlConsoleCluster(
         'The application could not be updated.',
       );
     },
+    // Tenant developers can update Secrets but not read or patch them (platform#112), so the
+    // credential is written as a whole Secret with an unconditional PUT. A Secret is not
+    // created by an update, so a missing one still answers NotFound.
     async reassignSecret(connection, name, value) {
       const directory = mkdtempSync(join(tmpdir(), 'di-console-secret-'));
       try {
-        const path = join(directory, 'patch.json');
-        writeFileSync(path, JSON.stringify({ stringData: { credential: value } }), { mode: 0o600 });
+        const path = join(directory, 'secret.json');
+        const document = {
+          apiVersion: 'v1',
+          kind: 'Secret',
+          metadata: { name, namespace: connection.namespace },
+          type: 'Opaque',
+          data: { credential: Buffer.from(value, 'utf8').toString('base64') },
+        };
+        writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
+        const uri = `/api/v1/namespaces/${encodeURIComponent(connection.namespace)}/secrets/${encodeURIComponent(name)}`;
         const result = await captureKubectl(
           deps,
           connection,
-          ['patch', 'secret', name, '--type=merge', `--patch-file=${path}`],
+          ['replace', '--raw', uri, '-f', path],
           deps.cwd(),
         );
         if (result.exitCode !== 0 && /not ?found/i.test(result.stderr)) {
           log(sanitizePublicText(result.stderr));
           throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
+        }
+        if (result.exitCode !== 0 && /forbidden/i.test(result.stderr)) {
+          log(sanitizePublicText(result.stderr));
+          throw new ConsoleError(
+            403,
+            'WRITES_FORBIDDEN',
+            'This credential cannot change the application.',
+          );
         }
         if (result.exitCode !== 0) {
           log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));

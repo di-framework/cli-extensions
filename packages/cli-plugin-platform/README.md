@@ -295,6 +295,22 @@ di-framework platform cluster destroy --yes
 
 Application `destroy` never runs `pulumi destroy`.
 
+### Control Secret
+
+An application that serves HTTP, cron, queues or actors gets a Secret
+`<deployment>-control` holding `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. Tenant
+developers may create, update and delete Secrets but not read, list, watch or patch them,
+so the CLI never reads it back:
+
+- `deploy` writes a new random token every time: it creates the Secret and, if it already
+  exists, replaces the whole Secret with an unconditional update. Keys added to it by hand
+  are dropped. The WorkloadDeployment carries `DI_CONTROL_TOKEN_REVISION` (a digest of the
+  token), so every deploy rolls the workload onto the new token together with its cron
+  invokers.
+- `destroy` deletes the Secret by name, after the WorkloadDeployment, Service and CronJobs.
+- The console's credential reassignment replaces the named Secret with one holding only
+  `credential`; other keys, labels and annotations on it are not kept.
+
 The generated local target publishes through its loopback registry NodePort and puts the equivalent
 in-cluster registry address in the WorkloadDeployment. Both references use the same repository and
 stable canonical-input tag. An `http://` push URL or `insecure = true` adds ORAS `--plain-http` only
