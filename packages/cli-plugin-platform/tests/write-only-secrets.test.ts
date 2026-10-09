@@ -26,14 +26,35 @@ type StoredSecret = {
 
 const FORBIDDEN_SECRET_VERBS = new Set(['get', 'list', 'watch', 'patch']);
 
+/** Denial messages of the platform's `tenant-secret-update` admission policy (platform PR #114). */
+const MANAGED_DENIAL = 'tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets';
+const KEYS_DENIAL = 'tenant users may update a Secret only if it keeps every existing data key';
+const BACKEND_CONFIG_DENIAL =
+  'di-tenant-stock, di-platform-routes, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller';
+
+/** How the API server words a ValidatingAdmissionPolicy denial (reason Forbidden, 403). */
+function admissionDenial(name: string, policy: string, message: string): string {
+  return `secrets "${name}" is forbidden: ValidatingAdmissionPolicy 'wasmcloud-${policy}' with binding 'wasmcloud-${policy}' denied request: ${message}`;
+}
+
+/** Mirrors the `tenant-secret-update` CEL rules for a `di-user-*` caller. */
+function updateDenial(name: string, old: StoredSecret, next: StoredSecret): string | undefined {
+  if (name.startsWith('di-binding-') || name.startsWith('di-bs-')) return MANAGED_DENIAL;
+  const kept = new Set(Object.keys(next.data ?? {}));
+  if (Object.keys(old.data ?? {}).some((key) => !kept.has(key))) return KEYS_DENIAL;
+  return undefined;
+}
+
 function writeOnlySecretsApi(namespace = 'wasmcloud') {
   const requests: ApiRequest[] = [];
   const secrets = new Map<string, StoredSecret>();
   const collection = `/api/v1/namespaces/${namespace}/secrets`;
 
+  let denied = '';
   const request = (verb: string, name?: string, body?: StoredSecret) => {
     const path = name === undefined ? collection : `${collection}/${name}`;
     let status = 200;
+    denied = '';
     if (FORBIDDEN_SECRET_VERBS.has(verb)) status = 403;
     else if (verb === 'create' && body !== undefined) {
       if (secrets.has(body.metadata.name)) status = 409;
@@ -43,8 +64,13 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
       }
     } else if (verb === 'update' && name !== undefined && body !== undefined) {
       // Secrets are not created by an update.
-      if (!secrets.has(name)) status = 404;
-      else secrets.set(name, body);
+      const existing = secrets.get(name);
+      const denial = existing === undefined ? undefined : updateDenial(name, existing, body);
+      if (existing === undefined) status = 404;
+      else if (denial !== undefined) {
+        status = 403;
+        denied = admissionDenial(name, 'tenant-secret-update', denial);
+      } else secrets.set(name, body);
     } else if (verb === 'delete' && name !== undefined) {
       if (!secrets.delete(name)) status = 404;
     }
@@ -53,6 +79,8 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
   };
 
   const failure = (status: number, name = '') => {
+    if (denied !== '')
+      return { exitCode: 1, stdout: '', stderr: `Error from server (Forbidden): ${denied}` };
     const reason =
       status === 403
         ? 'Forbidden): secrets is forbidden: User "developer" cannot get resource "secrets"'
@@ -307,6 +335,76 @@ describe('write-only Secrets (platform#112)', () => {
       denied.reassignSecret(CONNECTION, 'db-password', 'next-value'),
     ).rejects.toMatchObject({ status: 403, code: 'WRITES_FORBIDDEN' });
   });
+
+  it('reassigns only a single-credential Secret and maps a key-dropping denial to 409', async () => {
+    const api = writeOnlySecretsApi();
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    api.secrets.set('db-password', {
+      metadata: { name: 'db-password' },
+      data: { credential: encode('old') },
+    });
+    api.secrets.set('db-login', {
+      metadata: { name: 'db-login' },
+      data: { credential: encode('old'), username: encode('app') },
+    });
+    api.secrets.set('api-key', {
+      metadata: { name: 'api-key' },
+      data: { password: encode('old') },
+    });
+    const cluster = createKubectlConsoleCluster(depsWithApi('/tmp', api));
+
+    await cluster.reassignSecret(CONNECTION, 'db-password', 'next-value');
+    expect(decoded(api.secrets.get('db-password'), 'credential')).toBe('next-value');
+    for (const name of ['db-login', 'api-key']) {
+      await expect(cluster.reassignSecret(CONNECTION, name, 'next-value')).rejects.toMatchObject({
+        status: 409,
+        code: 'SECRET_NOT_SINGLE_KEY',
+      });
+    }
+    // The denied replaces left both Secrets as they were.
+    expect(decoded(api.secrets.get('db-login'), 'username')).toBe('app');
+    expect(decoded(api.secrets.get('api-key'), 'password')).toBe('old');
+    expect(api.requests.map((entry) => `${entry.verb} ${entry.status}`)).toEqual([
+      'update 200',
+      'update 403',
+      'update 403',
+    ]);
+  });
+
+  it('refuses a platform-managed Secret locally, before any request', async () => {
+    const api = writeOnlySecretsApi();
+    const invocations: RunnerInvocation[] = [];
+    const cluster = createKubectlConsoleCluster(depsWithApi('/tmp', api, invocations));
+    for (const name of [
+      'di-binding-orders',
+      'di-bs-orders',
+      'di-tenant-stock',
+      'di-platform-routes',
+    ]) {
+      await expect(cluster.reassignSecret(CONNECTION, name, 'next-value')).rejects.toMatchObject({
+        status: 403,
+        code: 'SECRET_MANAGED',
+      });
+    }
+    expect(invocations).toEqual([]);
+    expect(api.requests).toEqual([]);
+  });
+
+  it('maps a managed-name admission denial to 403 when the API server refuses it', async () => {
+    for (const message of [MANAGED_DENIAL, BACKEND_CONFIG_DENIAL]) {
+      const cluster = createKubectlConsoleCluster({
+        ...fakeDeps({ cwd: '/tmp' }),
+        runCaptured: async () => ({
+          exitCode: 1,
+          stdout: '',
+          stderr: `Error from server (Forbidden): ${admissionDenial('orders-creds', 'tenant-secret-update', message)}`,
+        }),
+      });
+      await expect(
+        cluster.reassignSecret(CONNECTION, 'orders-creds', 'next-value'),
+      ).rejects.toMatchObject({ status: 403, code: 'SECRET_MANAGED' });
+    }
+  });
 });
 
 /**
@@ -372,8 +470,19 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
           return Response.json(body, { status: 201 });
         }
         if (incoming.method === 'PUT' && name !== undefined) {
-          if (!secrets.has(name)) return status(404, 'NotFound', `secrets "${name}" not found`);
+          const existing = secrets.get(name) as StoredSecret | undefined;
+          if (existing === undefined) {
+            return status(404, 'NotFound', `secrets "${name}" not found`);
+          }
           const body = (await incoming.json()) as StoredSecret;
+          // A name the platform manages that this CLI does not know of yet still reaches the
+          // policy; it stands in for the server-side managed-name rule.
+          const denial = name.startsWith('future-managed-')
+            ? MANAGED_DENIAL
+            : updateDenial(name, existing, body);
+          if (denial !== undefined) {
+            return status(403, 'Forbidden', admissionDenial(name, 'tenant-secret-update', denial));
+          }
           secrets.set(name, body);
           return Response.json(body);
         }
@@ -438,6 +547,22 @@ current-context: fake
       status: 404,
     });
     const collection = '/api/v1/namespaces/wasmcloud/secrets';
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    secrets.set('db-login', {
+      metadata: { name: 'db-login' },
+      data: { credential: encode('old'), username: encode('app') },
+    });
+    secrets.set('future-managed-creds', { metadata: { name: 'future-managed-creds' } });
+    await expect(cluster.reassignSecret(connection, 'db-login', 'value')).rejects.toMatchObject({
+      status: 409,
+      code: 'SECRET_NOT_SINGLE_KEY',
+    });
+    await expect(
+      cluster.reassignSecret(connection, 'future-managed-creds', 'value'),
+    ).rejects.toMatchObject({ status: 403, code: 'SECRET_MANAGED' });
+    await expect(cluster.reassignSecret(connection, 'di-bs-orders', 'value')).rejects.toMatchObject(
+      { status: 403, code: 'SECRET_MANAGED' },
+    );
     expect(requests).toEqual([
       `POST ${collection}`,
       `POST ${collection}`,
@@ -445,6 +570,8 @@ current-context: fake
       `DELETE ${collection}/greeter-control`,
       `DELETE ${collection}/greeter-control`,
       `PUT ${collection}/absent`,
+      `PUT ${collection}/db-login`,
+      `PUT ${collection}/future-managed-creds`,
     ]);
   }, 30_000);
 });

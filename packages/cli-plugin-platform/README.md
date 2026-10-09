@@ -309,7 +309,12 @@ so the CLI never reads it back:
   invokers.
 - `destroy` deletes the Secret by name, after the WorkloadDeployment, Service and CronJobs.
 - The console's credential reassignment replaces the named Secret with one holding only
-  `credential`; other keys, labels and annotations on it are not kept.
+  `credential`; labels and annotations on it are not kept. It works only on a Secret whose
+  single key is `credential`: the console cannot read the Secret, so the platform's
+  `tenant-secret-update` admission policy refuses a replace that drops a key, and the
+  console answers 409. Platform-managed Secrets (`di-binding-*`, `di-bs-*`,
+  `di-tenant-stock`, `di-platform-routes`) are refused with 403 before any request, and an
+  admission denial for a managed name also answers 403.
 
 The generated local target publishes through its loopback registry NodePort and puts the equivalent
 in-cluster registry address in the WorkloadDeployment. Both references use the same repository and
