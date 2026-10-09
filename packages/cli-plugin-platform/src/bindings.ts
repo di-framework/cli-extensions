@@ -41,8 +41,10 @@ export type BindingRecord = {
   config?: Record<string, string>;
 };
 
+const BINDING_DECORATOR_NAMES = new Set(['PlatformBinding', 'WasmCloudBinding']);
+
 function importedDecoratorNames(source: ts.SourceFile): Set<string> {
-  const names = new Set(['WasmCloudBinding']);
+  const names = new Set(BINDING_DECORATOR_NAMES);
   for (const statement of source.statements) {
     if (!ts.isImportDeclaration(statement) || statement.importClause == null) continue;
     const module = stringLiteral(statement.moduleSpecifier);
@@ -51,7 +53,7 @@ function importedDecoratorNames(source: ts.SourceFile): Set<string> {
     if (named === undefined || !ts.isNamedImports(named)) continue;
     for (const element of named.elements) {
       const imported = (element.propertyName ?? element.name).text;
-      if (imported === 'WasmCloudBinding') names.add(element.name.text);
+      if (BINDING_DECORATOR_NAMES.has(imported)) names.add(element.name.text);
     }
   }
   return names;
@@ -265,7 +267,7 @@ export function parseBindingsFile(
       if (name === undefined) {
         bindingsFailure(
           'WASMCLOUD_BINDING_INVALID_NAME',
-          `${statement.name.text} @WasmCloudBinding name must be a string literal`,
+          `${statement.name.text} @PlatformBinding name must be a string literal`,
           { className: statement.name.text },
         );
       }
@@ -274,7 +276,7 @@ export function parseBindingsFile(
       if (optionsArg !== undefined && parsed === undefined) {
         bindingsFailure(
           'WASMCLOUD_BINDING_INVALID_OPTIONS',
-          `${statement.name.text} @WasmCloudBinding options must be an object literal of string values`,
+          `${statement.name.text} @PlatformBinding options must be an object literal of string values`,
           { className: statement.name.text },
         );
       }
@@ -310,7 +312,7 @@ export function parseBindingsFile(
         if (secretProblem !== undefined) {
           bindingsFailure(
             'WASMCLOUD_BINDING_PLAINTEXT_SECRET',
-            `${statement.name.text} @WasmCloudBinding: ${secretProblem}`,
+            `${statement.name.text} @PlatformBinding: ${secretProblem}`,
             { className: statement.name.text, name: bindingName },
           );
         }
@@ -319,7 +321,7 @@ export function parseBindingsFile(
     if (bindingName === undefined) {
       bindingsFailure(
         'WASMCLOUD_BINDING_INVALID_NAME',
-        `${statement.name.text} must be decorated with @WasmCloudBinding('name')`,
+        `${statement.name.text} must be decorated with @PlatformBinding('name')`,
         { className: statement.name.text },
       );
     }
