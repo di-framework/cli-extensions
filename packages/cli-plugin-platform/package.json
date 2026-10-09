@@ -41,7 +41,7 @@
   "dependencies": {
     "@bytecodealliance/jco": "1.33.0",
     "@di-framework/cli-extension": "^5",
-    "@di-framework/componentize-qjs": "0.4.4-di.3",
+    "@di-framework/componentize-qjs": "0.4.4-di.4",
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",

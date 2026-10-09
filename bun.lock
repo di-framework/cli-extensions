@@ -15,7 +15,7 @@
     },
     "packages/cli-plugin-ai": {
       "name": "@di-framework/cli-plugin-ai",
-      "version": "6.0.3",
+      "version": "6.1.0",
       "dependencies": {
         "@di-framework/ai-utils": "^6",
         "@di-framework/cli-extension": "^6",
@@ -26,14 +26,14 @@
     },
     "packages/cli-plugin-platform": {
       "name": "@di-framework/cli-plugin-platform",
-      "version": "6.0.3",
+      "version": "6.1.0",
       "dependencies": {
         "@babel/core": "7.29.7",
         "@babel/plugin-transform-async-to-generator": "7.29.7",
         "@bytecodealliance/jco": "1.33.0",
         "@di-framework/actors": "^5",
         "@di-framework/cli-extension": "^5",
-        "@di-framework/componentize-qjs": "0.4.4-di.3",
+        "@di-framework/componentize-qjs": "0.4.4-di.4",
         "@di-framework/platform": "^6",
         "@noble/ciphers": "2.4.0",
         "@noble/curves": "2.4.0",
@@ -208,7 +208,7 @@
 
     "@di-framework/codegen": ["@di-framework/codegen@6.0.1", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-UfA6Zjyq0T7rNqttNUv8iBgXWQaPk6t3vBcG1PLCbGqbDw1kSyo6diSCG13g5hUuBQyEMahg2dgVn/dZRxj5Vg=="],
 
-    "@di-framework/componentize-qjs": ["@di-framework/componentize-qjs@0.4.4-di.3", "", { "optionalDependencies": { "componentize-qjs-darwin-arm64": "npm:@di-framework/componentize-qjs@0.4.4-di.3-darwin-arm64", "componentize-qjs-darwin-x64": "npm:@di-framework/componentize-qjs@0.4.4-di.3-darwin-x64", "componentize-qjs-linux-arm64": "npm:@di-framework/componentize-qjs@0.4.4-di.3-linux-arm64", "componentize-qjs-linux-x64": "npm:@di-framework/componentize-qjs@0.4.4-di.3-linux-x64", "componentize-qjs-win32-x64": "npm:@di-framework/componentize-qjs@0.4.4-di.3-win32-x64" }, "bin": { "componentize-qjs": "bin/componentize-qjs.cjs" } }, "sha512-lT56Ho4ACmJHEKRFXEnyUPIr66hQyhs1ygSj1/1/GvYqSINpLOvnE4PNobvSaC/flfLVxp4uIb7A3kDI38bk1g=="],
+    "@di-framework/componentize-qjs": ["@di-framework/componentize-qjs@0.4.4-di.4", "", { "optionalDependencies": { "componentize-qjs-darwin-arm64": "npm:@di-framework/componentize-qjs@0.4.4-di.4-darwin-arm64", "componentize-qjs-darwin-x64": "npm:@di-framework/componentize-qjs@0.4.4-di.4-darwin-x64", "componentize-qjs-linux-arm64": "npm:@di-framework/componentize-qjs@0.4.4-di.4-linux-arm64", "componentize-qjs-linux-x64": "npm:@di-framework/componentize-qjs@0.4.4-di.4-linux-x64", "componentize-qjs-win32-x64": "npm:@di-framework/componentize-qjs@0.4.4-di.4-win32-x64" }, "bin": { "componentize-qjs": "bin/componentize-qjs.cjs" } }, "sha512-rwoJQR9tzNylHKj63lI812hfUsec5HhaIubWhA3z2QhYFd0R8XdGBfTN247uNWze4vZINjkW5BSR4hVTlTWDzw=="],
 
     "@di-framework/config": ["@di-framework/config@5.3.7", "", { "peerDependencies": { "@di-framework/core": "^5", "smol-toml": "^1.3.0", "typescript": "^5", "yaml": "^2.6.0", "zod": "^3.22.0" }, "optionalPeers": ["smol-toml", "yaml", "zod"] }, "sha512-70WnpowVdRj2KkWvyIfh8SJ5lZVRATtx3lpnArlhj+v0JSNH0/RulUE187kqnjYtKfkmAUc67iQOdIoLg7FyNQ=="],
 
@@ -686,15 +686,15 @@
 
     "componentize-qjs": ["componentize-qjs@0.4.5", "", { "optionalDependencies": { "@andreiltd/componentize-qjs-binding-darwin-arm64": "0.4.5", "@andreiltd/componentize-qjs-binding-darwin-x64": "0.4.5", "@andreiltd/componentize-qjs-binding-linux-arm64-gnu": "0.4.5", "@andreiltd/componentize-qjs-binding-linux-arm64-musl": "0.4.5", "@andreiltd/componentize-qjs-binding-linux-x64-gnu": "0.4.5", "@andreiltd/componentize-qjs-binding-linux-x64-musl": "0.4.5", "@andreiltd/componentize-qjs-binding-win32-arm64-msvc": "0.4.5", "@andreiltd/componentize-qjs-binding-win32-x64-msvc": "0.4.5" }, "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-/Brt+/Ps7DQ1mYuUsDISTQTFSaZfCSoRHkHnh9Dm5WHCO6arc/vzVdD8TXssfyNex2Iv3UR8NHdahsqABPDh0w=="],
 
-    "componentize-qjs-darwin-arm64": ["@di-framework/componentize-qjs@0.4.4-di.3-darwin-arm64", "", { "os": "darwin", "cpu": "arm64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-dN2P9iJYJXPRk2K1Vlo1kha4blSwD1YSEuwtLxqgQgp/LgqwkzK/1d+u2bg7Ac/zx4tUnKqAN18fQUG2sk7N2g=="],
+    "componentize-qjs-darwin-arm64": ["@di-framework/componentize-qjs@0.4.4-di.4-darwin-arm64", "", { "os": "darwin", "cpu": "arm64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-siPouqYDqb0aw3iPlQvMxAsQp+iRUklPciHEUO8aA26dfI50un4jXyA9TYeRBR2hDNZSk431q8PVf+FLc+XvxA=="],
 
-    "componentize-qjs-darwin-x64": ["@di-framework/componentize-qjs@0.4.4-di.3-darwin-x64", "", { "os": "darwin", "cpu": "x64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-JAx/FQ1Q+0DBhh9NET3NPcbauSTwkXoTnjk6eHLf4PY/G5ONCZNFG7qEf/aAPkjXXwmpIiQ4FBiRJOJCz7/ysA=="],
+    "componentize-qjs-darwin-x64": ["@di-framework/componentize-qjs@0.4.4-di.4-darwin-x64", "", { "os": "darwin", "cpu": "x64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-RiYX4hLc3hGNO2dbFokb0R+H3jj5aFR4UCdlDvpcMzzXNfxRaWLKq2eHtpAIXRQk+EOFlN8UJmkB4wmsybUtqw=="],
 
-    "componentize-qjs-linux-arm64": ["@di-framework/componentize-qjs@0.4.4-di.3-linux-arm64", "", { "os": "linux", "cpu": "arm64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-vMY4tcus7oF2P3QoE4nu0oVt3cuEXEEmGph+6uQa7OhpmTcOgEE0QVJGOxHrJ8oPj7tSlxDWIKLkpdsyTWxYsw=="],
+    "componentize-qjs-linux-arm64": ["@di-framework/componentize-qjs@0.4.4-di.4-linux-arm64", "", { "os": "linux", "cpu": "arm64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-JvtE0u0duvMJmdUr80W6vy+m0kOwSYydBhAra6EQ4FpNKvjYz2uWCg1gjT7pup68IjTweLaVIlYCglQ76PznVg=="],
 
-    "componentize-qjs-linux-x64": ["@di-framework/componentize-qjs@0.4.4-di.3-linux-x64", "", { "os": "linux", "cpu": "x64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-MwTqXbYdv2zezNpIHDOGiTo6MhvDvbXHFKSnC+Y6mh4BrXUcVrMRZ5sSuYMwwVz5aHdE1V9zyyARE3fafywNFA=="],
+    "componentize-qjs-linux-x64": ["@di-framework/componentize-qjs@0.4.4-di.4-linux-x64", "", { "os": "linux", "cpu": "x64", "bin": { "componentize-qjs": "bin/componentize-qjs" } }, "sha512-911FOu4G6ilLrS02lvdFTAyEC1q2umUoCF7nU7p3nFDktoFR0DR44b1DPSF369XezYu4J/492ECXLSAezFVS+g=="],
 
-    "componentize-qjs-win32-x64": ["@di-framework/componentize-qjs@0.4.4-di.3-win32-x64", "", { "os": "win32", "cpu": "x64", "bin": { "componentize-qjs": "bin/componentize-qjs.exe" } }, "sha512-O2f8+zQRbdp0UvS8uqT86MB/ZkhJQGSCutPuOFWplZKvkCdk9uplHwxWrj3ydqeWLtuTmpCu4lU+bKSe/t5tYw=="],
+    "componentize-qjs-win32-x64": ["@di-framework/componentize-qjs@0.4.4-di.4-win32-x64", "", { "os": "win32", "cpu": "x64", "bin": { "componentize-qjs": "bin/componentize-qjs.exe" } }, "sha512-uOgMOkZJCzUlo9Q9sTLiQ7CV0kSsYwGXxa7wHvGvBom2SFWAeN+puZGf543F154Wm4AwsAKFT35Dek72GOYy3A=="],
 
     "content-disposition": ["content-disposition@1.1.0", "", {}, "sha512-5jRCH9Z/+DRP7rkvY83B+yGIGX96OYdJmzngqnw2SBSxqCFPd0w2km3s5iawpGX8krnwSGmF0FW5Nhr0Hfai3g=="],
 
