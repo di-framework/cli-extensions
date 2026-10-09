@@ -31,7 +31,8 @@ A component project is marked by `di-framework.config.json`:
 
 Named wasmCloud host-interface bindings live in `src/bindings.ts` (override with `"bindings"`).
 Each exported class extending a `@di-framework/bindings` base and decorated with
-`@WasmCloudBinding('name')` is discovered statically and added to the WIT requirement graph.
+`@PlatformBinding('name')` is discovered statically and added to the WIT requirement graph.
+`@WasmCloudBinding('name')` remains a deprecated alias of the same decorator.
 The binding name selects its configuration overlay and normally becomes `hostInterfaces[].name`.
 For `wasmcloud:postgres`, `wasmcloud:keyvalue`, `wasmcloud:blobstore`,
 `wasmcloud:messaging`, and `wasmcloud:secrets`, host declarations omit the name to

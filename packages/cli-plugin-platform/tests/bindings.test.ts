@@ -20,6 +20,16 @@ function writeBindings(root: string, source: string, file = 'src/bindings.ts'): 
   return path;
 }
 
+function expectBindingMessage(run: () => unknown, code: string, message: string): void {
+  try {
+    run();
+  } catch (error) {
+    expect(error).toMatchObject({ code, exitCode: 2, message });
+    return;
+  }
+  throw new Error(`Expected a ${code} failure`);
+}
+
 describe('parseBindingsFile', () => {
   it('discovers named postgres and two key-value classes', () => {
     const root = makeProject();
@@ -132,6 +142,129 @@ export class Cache extends Kv {}
         config: { backend: 'in-memory' },
       }),
     ]);
+  });
+
+  it('accepts PlatformBinding and WasmCloudBinding, including aliased imports', () => {
+    const root = makeProject();
+    const path = writeBindings(
+      root,
+      `import { KeyValue, Postgres, PlatformBinding, WasmCloudBinding } from '@di-framework/bindings';
+
+@PlatformBinding('user-database')
+export class UserDatabase extends Postgres {}
+
+@WasmCloudBinding('sessions')
+export class Sessions extends KeyValue {}
+`,
+    );
+    expect(parseBindingsFile(path, CATALOG, 'orders').map((record) => record.name)).toEqual([
+      'user-database',
+      'sessions',
+    ]);
+
+    const platformAlias = writeBindings(
+      root,
+      `import { Postgres as Db, PlatformBinding as Bind } from '@di-framework/bindings';
+@Bind('users')
+export class Users extends Db {}
+`,
+      'src/platform-alias.ts',
+    );
+    expect(parseBindingsFile(platformAlias, CATALOG, 'app')[0]).toMatchObject({
+      name: 'users',
+      kind: 'Postgres',
+    });
+
+    const wasmAlias = writeBindings(
+      root,
+      `import { KeyValue as Kv, WasmCloudBinding as Bind } from '@di-framework/bindings';
+@Bind('cache')
+export class Cache extends Kv {}
+`,
+      'src/wasm-alias.ts',
+    );
+    expect(parseBindingsFile(wasmAlias, CATALOG, 'app')[0]).toMatchObject({
+      name: 'cache',
+      kind: 'KeyValue',
+    });
+
+    const namespaced = writeBindings(
+      root,
+      `import { Postgres } from '@di-framework/bindings';
+@lib.PlatformBinding('users')
+export class Users extends Postgres {}
+`,
+      'src/namespaced-platform.ts',
+    );
+    expect(parseBindingsFile(namespaced, CATALOG, 'app')[0]?.name).toBe('users');
+  });
+
+  it('names @PlatformBinding in decorator errors', () => {
+    const root = makeProject();
+    expectBindingMessage(
+      () =>
+        parseBindingsFile(
+          writeBindings(
+            root,
+            `import { Postgres, PlatformBinding } from '@di-framework/bindings';
+const name = 'users';
+@PlatformBinding(name)
+export class Users extends Postgres {}
+`,
+          ),
+          CATALOG,
+          'app',
+        ),
+      'WASMCLOUD_BINDING_INVALID_NAME',
+      'Users @PlatformBinding name must be a string literal',
+    );
+    expectBindingMessage(
+      () =>
+        parseBindingsFile(
+          writeBindings(
+            root,
+            `import { Postgres, PlatformBinding } from '@di-framework/bindings';
+@PlatformBinding('users', computed)
+export class Users extends Postgres {}
+`,
+          ),
+          CATALOG,
+          'app',
+        ),
+      'WASMCLOUD_BINDING_INVALID_OPTIONS',
+      'Users @PlatformBinding options must be an object literal of string values',
+    );
+    expectBindingMessage(
+      () =>
+        parseBindingsFile(
+          writeBindings(
+            root,
+            `import { Postgres, PlatformBinding } from '@di-framework/bindings';
+@PlatformBinding('users', { config: { password: 'hunter2' } })
+export class Users extends Postgres {}
+`,
+          ),
+          CATALOG,
+          'app',
+        ),
+      'WASMCLOUD_BINDING_PLAINTEXT_SECRET',
+      'Users @PlatformBinding: config key "password" must not carry a secret value; use secretFrom',
+    );
+    expectBindingMessage(
+      () =>
+        parseBindingsFile(
+          writeBindings(
+            root,
+            `import { Postgres } from '@di-framework/bindings';
+export class Users extends Postgres {}
+`,
+          ),
+          CATALOG,
+          'app',
+        ),
+      'WASMCLOUD_BINDING_INVALID_NAME',
+      "Users must be decorated with @PlatformBinding('name')",
+    );
   });
 
   it('ignores computed decorator callees', () => {
