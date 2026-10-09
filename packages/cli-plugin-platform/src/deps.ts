@@ -209,7 +209,7 @@ export function componentizeQjsPlatformPackageName(): string {
 export function componentizeQjsPlatformPackageVersion(
   platform = process.platform,
   arch = process.arch,
-  wrapperVersion = '0.4.4-di.3',
+  wrapperVersion = '0.4.4-di.4',
 ): string {
   return `${wrapperVersion}-${platform}-${arch}`;
 }
