@@ -308,9 +308,17 @@ so the CLI never reads it back:
   refuses any update that drops a key), and deploy stops with "the control Secret
   `<deployment>-control` has keys this CLI didn't write"; delete it with
   `kubectl delete secret <deployment>-control` and redeploy. Other failed writes show
-  kubectl's reason, scrubbed of the token. The WorkloadDeployment carries `DI_CONTROL_TOKEN_REVISION` (a digest of the
-  token), so every deploy rolls the workload onto the new token together with its cron
-  invokers.
+  kubectl's reason, scrubbed of the token.
+- The token rotates at that Secret write, before `kubectl apply`. The WorkloadDeployment
+  carries `DI_CONTROL_TOKEN_REVISION` (a digest of the token), so the deploy rolls the
+  workload onto the new token, but not at the same moment as its cron invokers: a CronJob
+  pod reads the Secret when it starts, so the invokers switch first and can get 401 from
+  the workload until its rollout is ready (the Job's retries normally absorb this).
+- A deploy that fails after the Secret write (a failed `apply`, a rejected
+  WorkloadDeployment, a rollout that never becomes ready, or an interrupted deploy) leaves
+  the running workload on the old token while the invokers use the new one, so cron
+  invocations keep failing until the next successful deploy. A failed deploy's error then
+  ends with "the control token was rotated; re-run deploy to roll the workload onto it".
 - `destroy` deletes the Secret by name, after the WorkloadDeployment, Service and CronJobs.
 - The console's credential reassignment replaces the named Secret with one holding only
   `credential`; labels and annotations on it are not kept. It works only on a Secret whose

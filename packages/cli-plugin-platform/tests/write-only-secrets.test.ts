@@ -9,7 +9,11 @@ import type { WasmcloudDeps } from '../src/deps';
 import { runWasmcloudDestroy } from '../src/destroy';
 import { loadProject } from '../src/project';
 import type { ClusterConnection } from '../src/target';
-import { deleteControlSecret, writeControlSecret } from '../src/workload';
+import {
+  CONTROL_TOKEN_ROTATED_NOTICE,
+  deleteControlSecret,
+  writeControlSecret,
+} from '../src/workload';
 import { captureIo, fakeDeps, makeWorkspace, type RunnerInvocation } from './helpers';
 
 /**
@@ -153,8 +157,9 @@ function depsWithApi(
   cwd: string,
   api: ReturnType<typeof writeOnlySecretsApi>,
   invocations: RunnerInvocation[] = [],
+  options: Omit<Parameters<typeof fakeDeps>[0], 'cwd' | 'invocations'> = {},
 ): WasmcloudDeps {
-  const base = fakeDeps({ cwd, invocations });
+  const base = fakeDeps({ ...options, cwd, invocations });
   return {
     ...base,
     runner: async (command, args, options) => {
@@ -362,6 +367,51 @@ describe('write-only Secrets (platform#112)', () => {
       'create 409',
       'update 403',
     ]);
+  });
+
+  it('says the token was rotated when the deploy fails after the control Secret write', async () => {
+    const { greeter } = makeWorkspace();
+    const api = writeOnlySecretsApi();
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    api.secrets.set('greeter-control', {
+      metadata: { name: 'greeter-control' },
+      data: { DI_CONTROL_TOKEN: encode('running'), DI_CONTROL_IDENTITY: encode('greeter') },
+    });
+    const applyFails = depsWithApi(greeter, api, [], { exitCodes: { 'kubectl apply': 1 } });
+    await expect(
+      runWasmcloudDeploy(['--target', 'development'], captureIo().io, applyFails),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_TOOL_FAILED',
+      message: `kubectl apply failed with exit code 1; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+      exitCode: 3,
+      details: { command: 'kubectl apply', exitCode: 1, controlTokenRotated: true },
+    });
+    // The write happened: cron invokers now read a token the running workload does not have.
+    expect(decoded(api.secrets.get('greeter-control'), 'DI_CONTROL_TOKEN')).not.toBe('running');
+
+    const neverReady = depsWithApi(greeter, api, [], { capturedStdout: { 'kubectl get': '{}' } });
+    await expect(
+      runWasmcloudDeploy(['--target', 'development'], captureIo().io, neverReady),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
+      message: `WorkloadDeployment greeter in wasmcloud did not become ready; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+      details: { name: 'greeter', controlTokenRotated: true },
+    });
+  });
+
+  it('leaves errors that are not command failures as they are', async () => {
+    const { greeter } = makeWorkspace();
+    const api = writeOnlySecretsApi();
+    const deps = depsWithApi(greeter, api);
+    const interrupted = new Error('interrupted');
+    const runner = deps.runner;
+    deps.runner = async (command, args, options) => {
+      if (command === 'kubectl' && args.includes('apply')) throw interrupted;
+      return runner(command, args, options);
+    };
+    await expect(
+      runWasmcloudDeploy(['--target', 'development'], captureIo().io, deps),
+    ).rejects.toBe(interrupted);
   });
 
   it('reassigns a console credential with a full update and never a patch', async () => {

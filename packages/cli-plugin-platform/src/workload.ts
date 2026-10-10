@@ -2,7 +2,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { type CliIo, CommandFailure } from '@di-framework/cli-extension';
+import {
+  type CliIo,
+  CommandFailure,
+  isCommandFailure,
+  type JsonValue,
+} from '@di-framework/cli-extension';
 import { discoverActors } from './actors';
 import { type BindingRecord, discoverBindings, requirementsFromBindings } from './bindings';
 import { sanitizePublicText } from './console/errors';
@@ -442,6 +447,10 @@ ${labels.replace(/^/gm, '        ')}
   return sections.join('\n---\n') + '\n';
 }
 
+/** Appended to a deploy failure that happened after the control Secret was rewritten. */
+export const CONTROL_TOKEN_ROTATED_NOTICE =
+  'the control token was rotated; re-run deploy to roll the workload onto it';
+
 /** Control Secret written on deploy: its name and a digest that identifies the token. */
 export type ControlSecretWrite = { name: string; revision: string };
 
@@ -634,32 +643,56 @@ export async function applyWorkload(
     hasPersistentStorage,
   });
   const controlSecret = needsHttp ? await writeControlSecret(project, connection, deps) : undefined;
-  const manifest = renderWorkloadManifest(
-    project,
-    connection,
-    image,
-    requirements,
-    bindings,
-    {
-      hasActors,
-      hasPersistentStorage,
-      controlSecretName: controlSecret?.name,
-      controlTokenRevision: controlSecret?.revision,
-    },
-    cronJobs,
-    queueHandlers,
-  );
-  const path = generatedManifestPath(project);
-  mkdirSync(join(project.projectRoot, '.di-framework', 'deploy'), { recursive: true });
-  writeFileSync(path, manifest);
-  const name = deploymentResourceName(project);
-  io.stdout.write(`Applying WorkloadDeployment ${name} in ${connection.namespace}...\n`);
-  await runKubectl(deps, connection, ['apply', '-f', path], project.projectRoot);
-  await waitForReady(project, connection, deps, io);
+  // From here on the cron invokers already use the new token, which the running workload
+  // rejects until it rolls out with this manifest.
+  let path: string;
+  try {
+    const manifest = renderWorkloadManifest(
+      project,
+      connection,
+      image,
+      requirements,
+      bindings,
+      {
+        hasActors,
+        hasPersistentStorage,
+        controlSecretName: controlSecret?.name,
+        controlTokenRevision: controlSecret?.revision,
+      },
+      cronJobs,
+      queueHandlers,
+    );
+    path = generatedManifestPath(project);
+    mkdirSync(join(project.projectRoot, '.di-framework', 'deploy'), { recursive: true });
+    writeFileSync(path, manifest);
+    const name = deploymentResourceName(project);
+    io.stdout.write(`Applying WorkloadDeployment ${name} in ${connection.namespace}...\n`);
+    await runKubectl(deps, connection, ['apply', '-f', path], project.projectRoot);
+    await waitForReady(project, connection, deps, io);
+  } catch (error) {
+    throw controlSecret === undefined ? error : withRotatedTokenNotice(error);
+  }
   await cleanupManagedBindings(project, connection, associations, deps);
   if (egress === undefined) await removeWorkloadEgress(project, connection, deps);
   else await reportEgressStatus(project, connection, io, deps);
   return path;
+}
+
+/**
+ * A deploy that fails after the control Secret was written leaves the running workload on the
+ * old token while its cron invokers (which read the Secret when they start) carry the new one,
+ * so every cron invocation is refused until a deploy succeeds. Say so in the failure.
+ */
+function withRotatedTokenNotice(error: unknown): unknown {
+  if (!isCommandFailure(error)) return error;
+  // Every failure on this path (kubectl, readiness) carries an object of details.
+  const details = error.details as Record<string, JsonValue> | undefined;
+  return new CommandFailure(
+    error.code,
+    `${error.message}; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+    error.exitCode,
+    { ...details, controlTokenRotated: true },
+  );
 }
 
 async function assertStorageOwnership(
