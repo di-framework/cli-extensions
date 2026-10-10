@@ -320,6 +320,9 @@ so the CLI never reads it back:
   invocations keep failing until the next successful deploy. A failed deploy's error then
   ends with "the control token was rotated; re-run deploy to roll the workload onto it".
 - `destroy` deletes the Secret by name, after the WorkloadDeployment, Service and CronJobs.
+  It deletes only `<deployment>-control`: Secrets are no longer part of its label-selected
+  delete (that would list them), so a Secret you labelled
+  `app.kubernetes.io/name=<deployment>` yourself stays; delete it by name.
 - The console's credential reassignment replaces the named Secret with one holding only
   `credential`; labels and annotations on it are not kept. It works only on a Secret whose
   single key is `credential`: the console cannot read the Secret, so the platform's
