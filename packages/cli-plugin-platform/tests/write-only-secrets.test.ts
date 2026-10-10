@@ -281,10 +281,20 @@ describe('write-only Secrets (platform#112)', () => {
       return deps;
     };
     await expect(
-      writeControlSecret(project, CONNECTION, respond(1, 'Error from server (Forbidden)')),
+      writeControlSecret(
+        project,
+        CONNECTION,
+        respond(1, 'Error from server (Forbidden): secrets is forbidden: exceeded quota\n'),
+      ),
     ).rejects.toMatchObject({
       code: 'WASMCLOUD_TOOL_FAILED',
+      message:
+        'kubectl create failed with exit code 1: Error from server (Forbidden): secrets is forbidden: exceeded quota',
       details: { command: 'kubectl create' },
+    });
+    await expect(writeControlSecret(project, CONNECTION, respond(7, ''))).rejects.toMatchObject({
+      message: 'kubectl create failed with exit code 7',
+      details: { command: 'kubectl create', exitCode: 7, stderr: '' },
     });
 
     const deps = fakeDeps({ cwd: greeter });
@@ -294,8 +304,64 @@ describe('write-only Secrets (platform#112)', () => {
         : { exitCode: 1, stdout: '', stderr: 'Error from server (Invalid): type is immutable' };
     await expect(writeControlSecret(project, CONNECTION, deps)).rejects.toMatchObject({
       code: 'WASMCLOUD_TOOL_FAILED',
+      message:
+        'kubectl replace failed with exit code 1: Error from server (Invalid): type is immutable',
       details: { command: 'kubectl replace' },
     });
+  });
+
+  it('never shows the token when a failure echoes the request body', async () => {
+    const { greeter } = makeWorkspace();
+    const project = loadProject(greeter);
+    let body = '';
+    const deps = fakeDeps({ cwd: greeter });
+    deps.runCaptured = async (_command, args) => {
+      body = readFileSync(args[args.indexOf('-f') + 1] ?? '', 'utf8');
+      return { exitCode: 1, stdout: '', stderr: `Error from server (BadRequest): ${body}` };
+    };
+    const failure = await writeControlSecret(project, CONNECTION, deps).then(
+      () => undefined,
+      (error: unknown) => error as { message: string; details: { stderr: string } },
+    );
+    const sent = JSON.parse(body) as StoredSecret;
+    const encoded = sent.data?.DI_CONTROL_TOKEN ?? '';
+    const token = Buffer.from(encoded, 'base64').toString('utf8');
+    expect(token.length).toBeGreaterThan(0);
+    for (const text of [failure?.message ?? '', failure?.details.stderr ?? '']) {
+      expect(text).toContain('Error from server (BadRequest)');
+      expect(text).not.toContain(token);
+      expect(text).not.toContain(encoded);
+    }
+  });
+
+  it('tells the user to delete a control Secret that has keys the CLI did not write', async () => {
+    const { greeter } = makeWorkspace();
+    const project = loadProject(greeter);
+    const api = writeOnlySecretsApi();
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    api.secrets.set('greeter-control', {
+      metadata: { name: 'greeter-control' },
+      data: {
+        DI_CONTROL_TOKEN: encode('old'),
+        DI_CONTROL_IDENTITY: encode('greeter'),
+        EXTRA: encode('hand-added'),
+      },
+    });
+    await expect(
+      writeControlSecret(project, CONNECTION, depsWithApi(greeter, api)),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+      message:
+        "The control Secret greeter-control has keys this CLI didn't write; delete it with " +
+        '`kubectl delete secret greeter-control --namespace wasmcloud` and redeploy',
+      details: { name: 'greeter-control', command: 'kubectl replace' },
+    });
+    // The denied replace left the Secret as it was.
+    expect(decoded(api.secrets.get('greeter-control'), 'EXTRA')).toBe('hand-added');
+    expect(api.requests.map((entry) => `${entry.verb} ${entry.status}`)).toEqual([
+      'create 409',
+      'update 403',
+    ]);
   });
 
   it('reassigns a console credential with a full update and never a patch', async () => {

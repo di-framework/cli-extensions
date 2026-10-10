@@ -5,6 +5,7 @@ import type { WasmcloudDeps } from '../deps';
 import { EGRESS_BINDING_NAME, egressResourceName } from '../egress';
 import { captureKubectl } from '../kubernetes';
 import { associationName } from '../managed-bindings';
+import { MANAGED_SECRET_DENIALS, SECRET_UPDATE_KEYS_MESSAGE } from '../secret-admission';
 import type { ClusterConnection } from '../target';
 import { MANAGED_BY_LABEL, WORKLOAD_DEPLOYMENT_RESOURCE } from '../workload';
 import type { BindingDocument, HostFailure, JsonPatchOp, WorkloadDocument } from './catalog';
@@ -30,18 +31,8 @@ export function isPlatformManagedSecretName(name: string): boolean {
   );
 }
 
-/**
- * Denial messages of the platform's `tenant-secret-update` ValidatingAdmissionPolicy
- * (`SECRET_UPDATE_KEYS_MESSAGE` / `SECRET_UPDATE_MANAGED_MESSAGE`, di-framework/platform#112,
- * PR #114) and of the older `backend-config` policy, which a managed name can trip first.
- * Matched by substring: kubectl prefixes them with the policy and binding names.
- */
-export const SECRET_UPDATE_KEYS_MESSAGE =
-  'tenant users may update a Secret only if it keeps every existing data key';
-export const MANAGED_SECRET_DENIALS = [
-  'tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets',
-  'di-tenant-stock, di-platform-routes, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller',
-] as const;
+// Denial messages of the platform's Secret admission policies; see `../secret-admission`.
+export { MANAGED_SECRET_DENIALS, SECRET_UPDATE_KEYS_MESSAGE } from '../secret-admission';
 
 export type SignalView = {
   success: number;

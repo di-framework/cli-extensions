@@ -303,8 +303,12 @@ developers may create, update and delete Secrets but not read, list, watch or pa
 so the CLI never reads it back:
 
 - `deploy` writes a new random token every time: it creates the Secret and, if it already
-  exists, replaces the whole Secret with an unconditional update. Keys added to it by hand
-  are dropped. The WorkloadDeployment carries `DI_CONTROL_TOKEN_REVISION` (a digest of the
+  exists, replaces the whole Secret with an unconditional update. If keys were added to it
+  by hand, the platform's `tenant-secret-update` admission policy denies that update (it
+  refuses any update that drops a key), and deploy stops with "the control Secret
+  `<deployment>-control` has keys this CLI didn't write"; delete it with
+  `kubectl delete secret <deployment>-control` and redeploy. Other failed writes show
+  kubectl's reason, scrubbed of the token. The WorkloadDeployment carries `DI_CONTROL_TOKEN_REVISION` (a digest of the
   token), so every deploy rolls the workload onto the new token together with its cron
   invokers.
 - `destroy` deletes the Secret by name, after the WorkloadDeployment, Service and CronJobs.

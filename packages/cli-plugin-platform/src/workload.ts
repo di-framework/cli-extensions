@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { type CliIo, CommandFailure } from '@di-framework/cli-extension';
 import { discoverActors } from './actors';
 import { type BindingRecord, discoverBindings, requirementsFromBindings } from './bindings';
+import { sanitizePublicText } from './console/errors';
 import { type DiscoveredCronJob, discoverScheduledJobs } from './cron';
 import type { WasmcloudDeps } from './deps';
 import {
@@ -20,7 +21,7 @@ import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings
 import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
-import { toolFailed } from './support';
+import { kubectlStatusReason, SECRET_UPDATE_KEYS_MESSAGE } from './secret-admission';
 import type { ClusterConnection } from './target';
 import {
   defaultProjectRequirements,
@@ -507,8 +508,8 @@ export async function writeControlSecret(
       project.projectRoot,
     );
     if (created.exitCode !== 0) {
-      if (!/AlreadyExists|already exists/.test(created.stderr)) {
-        throw toolFailed('kubectl create', created.exitCode);
+      if (kubectlStatusReason(created.stderr) !== 'AlreadyExists') {
+        throw controlSecretWriteFailed('kubectl create', name, connection, created, token);
       }
       const replaced = await captureKubectl(
         deps,
@@ -516,12 +517,51 @@ export async function writeControlSecret(
         ['replace', '--raw', secretsPath(connection.namespace, name), '-f', path],
         project.projectRoot,
       );
-      if (replaced.exitCode !== 0) throw toolFailed('kubectl replace', replaced.exitCode);
+      if (replaced.exitCode !== 0) {
+        throw controlSecretWriteFailed('kubectl replace', name, connection, replaced, token);
+      }
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
   return { name, revision: createHash('sha256').update(token).digest('hex').slice(0, 16) };
+}
+
+/**
+ * A failed control Secret write, with kubectl's reason. Kubernetes errors for these requests
+ * name the object, not its data, but the stderr is still scrubbed of the token (raw and
+ * base64) and of credential-shaped text before it is shown, in case a response echoes the body.
+ */
+function controlSecretWriteFailed(
+  command: string,
+  name: string,
+  connection: ClusterConnection,
+  result: { exitCode: number; stderr: string },
+  token: string,
+): CommandFailure {
+  const stderr = sanitizePublicText(
+    [token, Buffer.from(token, 'utf8').toString('base64')]
+      .reduce((text, secret) => text.split(secret).join('[redacted]'), result.stderr)
+      .trim(),
+  );
+  if (stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
+    // The platform's `tenant-secret-update` policy refuses a replace that drops a key, so a
+    // control Secret someone added keys to can no longer be rotated in place.
+    return new CommandFailure(
+      'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+      `The control Secret ${name} has keys this CLI didn't write; delete it with ` +
+        `\`kubectl delete secret ${name} --namespace ${connection.namespace}\` and redeploy`,
+      2,
+      { name, namespace: connection.namespace, command, exitCode: result.exitCode, stderr },
+    );
+  }
+  const reason = stderr.length > 0 ? `: ${stderr}` : '';
+  return new CommandFailure(
+    'WASMCLOUD_TOOL_FAILED',
+    `${command} failed with exit code ${result.exitCode}${reason}`,
+    3,
+    { command, exitCode: result.exitCode, stderr },
+  );
 }
 
 /**
