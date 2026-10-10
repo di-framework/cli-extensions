@@ -295,6 +295,43 @@ di-framework platform cluster destroy --yes
 
 Application `destroy` never runs `pulumi destroy`.
 
+### Control Secret
+
+An application that serves HTTP, cron, queues or actors gets a Secret
+`<deployment>-control` holding `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. Tenant
+developers may create, update and delete Secrets but not read, list, watch or patch them,
+so the CLI never reads it back:
+
+- `deploy` writes a new random token every time: it creates the Secret and, if it already
+  exists, replaces the whole Secret with an unconditional update. If keys were added to it
+  by hand, the platform's `tenant-secret-update` admission policy denies that update (it
+  refuses any update that drops a key), and deploy stops with "the control Secret
+  `<deployment>-control` has keys this CLI didn't write"; delete it with
+  `kubectl delete secret <deployment>-control` and redeploy. Other failed writes show
+  kubectl's reason, scrubbed of the token.
+- The token rotates at that Secret write, before `kubectl apply`. The WorkloadDeployment
+  carries `DI_CONTROL_TOKEN_REVISION` (a digest of the token), so the deploy rolls the
+  workload onto the new token, but not at the same moment as its cron invokers: a CronJob
+  pod reads the Secret when it starts, so the invokers switch first and can get 401 from
+  the workload until its rollout is ready (the Job's retries normally absorb this).
+- A deploy that fails after the Secret write (a failed `apply`, a rejected
+  WorkloadDeployment, a rollout that never becomes ready, or an interrupted deploy) leaves
+  the running workload on the old token while the invokers use the new one, so cron
+  invocations keep failing until the next successful deploy. A failed deploy's error then
+  ends with "the control token was rotated; re-run deploy to roll the workload onto it".
+- `destroy` deletes the Secret by name, after the WorkloadDeployment, Service and CronJobs.
+  It deletes only `<deployment>-control`: Secrets are no longer part of its label-selected
+  delete (that would list them), so a Secret you labelled
+  `app.kubernetes.io/name=<deployment>` yourself stays; delete it by name.
+- The console's credential reassignment replaces the named Secret with one holding only
+  `credential`; labels and annotations on it are not kept. It works only on a Secret whose
+  single key is `credential`: the console cannot read the Secret, so the platform's
+  `tenant-secret-update` admission policy refuses a replace that drops a key, and the
+  console answers 409. So does a Secret whose type is not `Opaque`, since the API server
+  refuses to change a Secret's type. Platform-managed Secrets (`di-binding-*`, `di-bs-*`,
+  `di-tenant-stock`, `di-platform-routes`) are refused with 403 before any request, and an
+  admission denial for a managed name also answers 403.
+
 The generated local target publishes through its loopback registry NodePort and puts the equivalent
 in-cluster registry address in the WorkloadDeployment. Both references use the same repository and
 stable canonical-input tag. An `http://` push URL or `insecure = true` adds ORAS `--plain-http` only

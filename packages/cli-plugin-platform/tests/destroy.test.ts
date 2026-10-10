@@ -16,16 +16,27 @@ describe('runWasmcloudDestroy', () => {
     expect(invocations.every((invocation) => invocation.command !== 'pulumi')).toBe(true);
     expect(invocations.some((invocation) => invocation.args[0] === 'destroy')).toBe(false);
     const kubectl = invocations.filter((invocation) => invocation.command === 'kubectl');
-    expect(kubectl).toHaveLength(2);
+    expect(kubectl).toHaveLength(3);
     expect(kubectl[0]?.args).toEqual(
       expect.arrayContaining([
         'delete',
-        `${WORKLOAD_DEPLOYMENT_RESOURCE},service,cronjob,secret`,
+        `${WORKLOAD_DEPLOYMENT_RESOURCE},service,cronjob`,
         '-l',
         'app.kubernetes.io/name=greeter',
         '--ignore-not-found',
       ]),
     );
+    // Secrets are deleted by name: a label selector would LIST them, which tenants cannot.
+    expect(kubectl[1]?.args).toEqual(
+      expect.arrayContaining([
+        'delete',
+        'secret',
+        'greeter-control',
+        '--ignore-not-found',
+        '--wait=false',
+      ]),
+    );
+    expect(kubectl[1]?.args).not.toContain('-l');
     expect(kubectl[0]?.args).not.toContain('service/greeter');
     expect(result.data).toMatchObject({
       application: 'greeter',
@@ -46,7 +57,7 @@ describe('runWasmcloudDestroy', () => {
     );
     expect(invocations[0]?.args).toEqual(
       expect.arrayContaining([
-        `${WORKLOAD_DEPLOYMENT_RESOURCE},service,cronjob,secret`,
+        `${WORKLOAD_DEPLOYMENT_RESOURCE},service,cronjob`,
         '-l',
         'app.kubernetes.io/name=echo',
       ]),

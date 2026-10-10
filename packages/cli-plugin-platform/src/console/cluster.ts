@@ -5,6 +5,11 @@ import type { WasmcloudDeps } from '../deps';
 import { EGRESS_BINDING_NAME, egressResourceName } from '../egress';
 import { captureKubectl } from '../kubernetes';
 import { associationName } from '../managed-bindings';
+import {
+  kubectlStatusReason,
+  MANAGED_SECRET_DENIALS,
+  SECRET_UPDATE_KEYS_MESSAGE,
+} from '../secret-admission';
 import type { ClusterConnection } from '../target';
 import { MANAGED_BY_LABEL, WORKLOAD_DEPLOYMENT_RESOURCE } from '../workload';
 import type { BindingDocument, HostFailure, JsonPatchOp, WorkloadDocument } from './catalog';
@@ -13,6 +18,25 @@ import { ConsoleError, sanitizePublicText } from './errors';
 const BINDING_RESOURCE = 'servicebindings.platform.di-framework.dev';
 /** Published by the platform controller in each tenant namespace (contract C-ROUTES). */
 const ROUTES_CONFIG_MAP = 'di-platform-routes';
+
+/**
+ * Secret names the platform controller owns. Mirrors `isManagedSecretName` (`di-binding-*`,
+ * `di-bs-*`) and the Secret names of the `backend-config` admission policy (`di-tenant-stock`,
+ * `di-platform-routes`), both in di-framework/platform `platform/platform/src/tenancy/admission.ts`.
+ */
+const MANAGED_SECRET_PREFIXES = ['di-binding-', 'di-bs-'] as const;
+const MANAGED_SECRET_NAMES = new Set(['di-tenant-stock', ROUTES_CONFIG_MAP]);
+
+/** True for a Secret the platform manages; a tenant user may not replace it. */
+export function isPlatformManagedSecretName(name: string): boolean {
+  return (
+    MANAGED_SECRET_NAMES.has(name) ||
+    MANAGED_SECRET_PREFIXES.some((prefix) => name.startsWith(prefix))
+  );
+}
+
+// Denial messages of the platform's Secret admission policies; see `../secret-admission`.
+export { MANAGED_SECRET_DENIALS, SECRET_UPDATE_KEYS_MESSAGE } from '../secret-admission';
 
 export type SignalView = {
   success: number;
@@ -94,20 +118,82 @@ export function createKubectlConsoleCluster(
         'The application could not be updated.',
       );
     },
+    // Tenant developers can update Secrets but not read or patch them (platform#112), so the
+    // credential is written as a whole Secret with an unconditional PUT. A Secret is not
+    // created by an update, so a missing one still answers NotFound. The console cannot see
+    // the Secret's keys, so the platform's `tenant-secret-update` admission policy refuses a
+    // replace that would drop any (409) or that targets a platform-managed name (403), and the
+    // API server refuses one that would change a non-Opaque Secret's type (409). Errors are
+    // classified by their Status reason, never by the free text that carries the name.
     async reassignSecret(connection, name, value) {
+      if (isPlatformManagedSecretName(name)) {
+        throw new ConsoleError(
+          403,
+          'SECRET_MANAGED',
+          `${name} is managed by the platform and cannot be reassigned.`,
+        );
+      }
       const directory = mkdtempSync(join(tmpdir(), 'di-console-secret-'));
       try {
-        const path = join(directory, 'patch.json');
-        writeFileSync(path, JSON.stringify({ stringData: { credential: value } }), { mode: 0o600 });
+        const path = join(directory, 'secret.json');
+        const document = {
+          apiVersion: 'v1',
+          kind: 'Secret',
+          metadata: { name, namespace: connection.namespace },
+          type: 'Opaque',
+          data: { credential: Buffer.from(value, 'utf8').toString('base64') },
+        };
+        writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
+        const uri = `/api/v1/namespaces/${encodeURIComponent(connection.namespace)}/secrets/${encodeURIComponent(name)}`;
         const result = await captureKubectl(
           deps,
           connection,
-          ['patch', 'secret', name, '--type=merge', `--patch-file=${path}`],
+          ['replace', '--raw', uri, '-f', path],
           deps.cwd(),
         );
-        if (result.exitCode !== 0 && /not ?found/i.test(result.stderr)) {
+        const reason = result.exitCode === 0 ? undefined : kubectlStatusReason(result.stderr);
+        if (reason === 'NotFound') {
           log(sanitizePublicText(result.stderr));
           throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
+        }
+        if (result.exitCode !== 0 && result.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
+          log(sanitizePublicText(result.stderr));
+          throw new ConsoleError(
+            409,
+            'SECRET_NOT_SINGLE_KEY',
+            `${name} holds values other than a single credential, so it cannot be reassigned here.`,
+          );
+        }
+        if (
+          result.exitCode !== 0 &&
+          MANAGED_SECRET_DENIALS.some((message) => result.stderr.includes(message))
+        ) {
+          log(sanitizePublicText(result.stderr));
+          throw new ConsoleError(
+            403,
+            'SECRET_MANAGED',
+            `${name} is managed by the platform and cannot be reassigned.`,
+          );
+        }
+        // A Secret's type is immutable, so a non-Opaque Secret cannot take the Opaque document.
+        if (
+          reason === 'Invalid' &&
+          /\btype: Invalid value:.*field is immutable/.test(result.stderr)
+        ) {
+          log(sanitizePublicText(result.stderr));
+          throw new ConsoleError(
+            409,
+            'SECRET_TYPE_MISMATCH',
+            `${name} is not a plain (Opaque) Secret and its type cannot change, so it cannot be reassigned here.`,
+          );
+        }
+        if (reason === 'Forbidden') {
+          log(sanitizePublicText(result.stderr));
+          throw new ConsoleError(
+            403,
+            'WRITES_FORBIDDEN',
+            'This credential cannot change the application.',
+          );
         }
         if (result.exitCode !== 0) {
           log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));

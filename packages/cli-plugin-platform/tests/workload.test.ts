@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadProject } from '../src/project';
@@ -654,30 +654,39 @@ export class Worker {
           invocation.args.includes(WORKLOAD_DEPLOYMENT_RESOURCE),
       ),
     ).toBe(true);
+    const created = invocations.find(
+      (invocation) => invocation.command === 'kubectl' && invocation.args.includes('create'),
+    );
+    expect(created?.args).toEqual(
+      expect.arrayContaining(['create', '--raw', '/api/v1/namespaces/wasmcloud/secrets', '-f']),
+    );
     expect(
       invocations.some(
         (invocation) =>
           invocation.command === 'kubectl' &&
-          invocation.args.includes('create') &&
-          invocation.args.includes('secret') &&
-          invocation.args.includes('greeter-control'),
+          (invocation.args.includes('label') || invocation.args.includes('patch')),
       ),
-    ).toBe(true);
-    expect(
-      invocations.some(
-        (invocation) =>
-          invocation.command === 'kubectl' &&
-          invocation.args.includes('label') &&
-          invocation.args.includes('secret') &&
-          invocation.args.includes('greeter-control'),
-      ),
-    ).toBe(true);
+    ).toBe(false);
+    expect(readFileSync(path, 'utf8')).toMatch(/DI_CONTROL_TOKEN_REVISION: "[0-9a-f]{16}"/);
   });
 
-  it('reuses an existing control secret instead of recreating it', async () => {
+  it('replaces an existing control secret with a full update instead of reading it', async () => {
     const { greeter } = makeWorkspace();
     const project = loadProject(greeter);
     const invocations: RunnerInvocation[] = [];
+    const deps = fakeDeps({ cwd: greeter, invocations });
+    const runCaptured = deps.runCaptured;
+    deps.runCaptured = async (command, args, options) => {
+      if (command === 'kubectl' && args.includes('create') && args.includes('--raw')) {
+        await runCaptured(command, args, options);
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: 'Error from server (AlreadyExists): secrets "greeter-control" already exists',
+        };
+      }
+      return runCaptured(command, args, options);
+    };
     await applyWorkload(
       project,
       {
@@ -688,20 +697,25 @@ export class Worker {
       },
       'registry.example.com/team/greeter:sha256-abc',
       captureIo().io,
-      fakeDeps({ cwd: greeter, invocations, exitCodes: { 'kubectl get secret': 0 } }),
+      deps,
     );
-    expect(
-      invocations.some(
-        (invocation) => invocation.command === 'kubectl' && invocation.args.includes('create'),
-      ),
-    ).toBe(false);
+    const replaced = invocations.find(
+      (invocation) => invocation.command === 'kubectl' && invocation.args.includes('replace'),
+    );
+    expect(replaced?.args).toEqual(
+      expect.arrayContaining([
+        'replace',
+        '--raw',
+        '/api/v1/namespaces/wasmcloud/secrets/greeter-control',
+      ]),
+    );
     expect(
       invocations.some(
         (invocation) =>
           invocation.command === 'kubectl' &&
-          invocation.args.includes('label') &&
-          invocation.args.includes('greeter-control'),
+          invocation.args.includes('get') &&
+          invocation.args.includes('secret'),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
