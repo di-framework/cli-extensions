@@ -5,7 +5,11 @@ import type { WasmcloudDeps } from '../deps';
 import { EGRESS_BINDING_NAME, egressResourceName } from '../egress';
 import { captureKubectl } from '../kubernetes';
 import { associationName } from '../managed-bindings';
-import { MANAGED_SECRET_DENIALS, SECRET_UPDATE_KEYS_MESSAGE } from '../secret-admission';
+import {
+  kubectlStatusReason,
+  MANAGED_SECRET_DENIALS,
+  SECRET_UPDATE_KEYS_MESSAGE,
+} from '../secret-admission';
 import type { ClusterConnection } from '../target';
 import { MANAGED_BY_LABEL, WORKLOAD_DEPLOYMENT_RESOURCE } from '../workload';
 import type { BindingDocument, HostFailure, JsonPatchOp, WorkloadDocument } from './catalog';
@@ -118,7 +122,9 @@ export function createKubectlConsoleCluster(
     // credential is written as a whole Secret with an unconditional PUT. A Secret is not
     // created by an update, so a missing one still answers NotFound. The console cannot see
     // the Secret's keys, so the platform's `tenant-secret-update` admission policy refuses a
-    // replace that would drop any (409) or that targets a platform-managed name (403).
+    // replace that would drop any (409) or that targets a platform-managed name (403), and the
+    // API server refuses one that would change a non-Opaque Secret's type (409). Errors are
+    // classified by their Status reason, never by the free text that carries the name.
     async reassignSecret(connection, name, value) {
       if (isPlatformManagedSecretName(name)) {
         throw new ConsoleError(
@@ -145,7 +151,8 @@ export function createKubectlConsoleCluster(
           ['replace', '--raw', uri, '-f', path],
           deps.cwd(),
         );
-        if (result.exitCode !== 0 && /not ?found/i.test(result.stderr)) {
+        const reason = result.exitCode === 0 ? undefined : kubectlStatusReason(result.stderr);
+        if (reason === 'NotFound') {
           log(sanitizePublicText(result.stderr));
           throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
         }
@@ -168,7 +175,19 @@ export function createKubectlConsoleCluster(
             `${name} is managed by the platform and cannot be reassigned.`,
           );
         }
-        if (result.exitCode !== 0 && /forbidden/i.test(result.stderr)) {
+        // A Secret's type is immutable, so a non-Opaque Secret cannot take the Opaque document.
+        if (
+          reason === 'Invalid' &&
+          /\btype: Invalid value:.*field is immutable/.test(result.stderr)
+        ) {
+          log(sanitizePublicText(result.stderr));
+          throw new ConsoleError(
+            409,
+            'SECRET_TYPE_MISMATCH',
+            `${name} is not a plain (Opaque) Secret and its type cannot change, so it cannot be reassigned here.`,
+          );
+        }
+        if (reason === 'Forbidden') {
           log(sanitizePublicText(result.stderr));
           throw new ConsoleError(
             403,

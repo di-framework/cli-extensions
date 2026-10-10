@@ -41,6 +41,11 @@ function admissionDenial(name: string, policy: string, message: string): string 
   return `secrets "${name}" is forbidden: ValidatingAdmissionPolicy 'wasmcloud-${policy}' with binding 'wasmcloud-${policy}' denied request: ${message}`;
 }
 
+/** How the API server refuses an update that changes a Secret's type (422 Invalid). */
+function typeImmutable(name: string): string {
+  return `Secret "${name}" is invalid: type: Invalid value: "Opaque": field is immutable`;
+}
+
 /** Mirrors the `tenant-secret-update` CEL rules for a `di-user-*` caller. */
 function updateDenial(name: string, old: StoredSecret, next: StoredSecret): string | undefined {
   if (name.startsWith('di-binding-') || name.startsWith('di-bs-')) return MANAGED_DENIAL;
@@ -71,6 +76,7 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
       const existing = secrets.get(name);
       const denial = existing === undefined ? undefined : updateDenial(name, existing, body);
       if (existing === undefined) status = 404;
+      else if ((existing.type ?? 'Opaque') !== (body.type ?? 'Opaque')) status = 422;
       else if (denial !== undefined) {
         status = 403;
         denied = admissionDenial(name, 'tenant-secret-update', denial);
@@ -85,6 +91,12 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
   const failure = (status: number, name = '') => {
     if (denied !== '')
       return { exitCode: 1, stdout: '', stderr: `Error from server (Forbidden): ${denied}` };
+    if (status === 422)
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `The ${typeImmutable(name)}`,
+      };
     const reason =
       status === 403
         ? 'Forbidden): secrets is forbidden: User "developer" cannot get resource "secrets"'
@@ -306,11 +318,10 @@ describe('write-only Secrets (platform#112)', () => {
     deps.runCaptured = async (_command, args) =>
       args.includes('create')
         ? { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' }
-        : { exitCode: 1, stdout: '', stderr: 'Error from server (Invalid): type is immutable' };
+        : { exitCode: 1, stdout: '', stderr: typeImmutable('greeter-control') };
     await expect(writeControlSecret(project, CONNECTION, deps)).rejects.toMatchObject({
       code: 'WASMCLOUD_TOOL_FAILED',
-      message:
-        'kubectl replace failed with exit code 1: Error from server (Invalid): type is immutable',
+      message: `kubectl replace failed with exit code 1: ${typeImmutable('greeter-control')}`,
       details: { command: 'kubectl replace' },
     });
   });
@@ -487,6 +498,75 @@ describe('write-only Secrets (platform#112)', () => {
     ]);
   });
 
+  it('classifies failures by Status reason, not by a name that reads like one', async () => {
+    const api = writeOnlySecretsApi();
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    api.secrets.set('notfound-creds', {
+      metadata: { name: 'notfound-creds' },
+      data: { credential: encode('old'), username: encode('app') },
+    });
+    const cluster = createKubectlConsoleCluster(depsWithApi('/tmp', api));
+    // A Forbidden admission denial whose text contains "notfound" is not a 404.
+    await expect(
+      cluster.reassignSecret(CONNECTION, 'notfound-creds', 'next-value'),
+    ).rejects.toMatchObject({ status: 409, code: 'SECRET_NOT_SINGLE_KEY' });
+
+    const answering = (stderr: string) =>
+      createKubectlConsoleCluster({
+        ...fakeDeps({ cwd: '/tmp' }),
+        runCaptured: async () => ({ exitCode: 1, stdout: '', stderr }),
+      });
+    await expect(
+      answering(
+        'Error from server (Forbidden): secrets "notfound-creds" is forbidden: User "developer" cannot update resource "secrets"',
+      ).reassignSecret(CONNECTION, 'notfound-creds', 'next-value'),
+    ).rejects.toMatchObject({ status: 403, code: 'WRITES_FORBIDDEN' });
+    await expect(
+      answering(
+        'Error from server (InternalError): Internal error occurred: secret "forbidden-notfound" was not stored',
+      ).reassignSecret(CONNECTION, 'forbidden-notfound', 'next-value'),
+    ).rejects.toMatchObject({ status: 502, code: 'REQUEST_FAILED' });
+  });
+
+  it('maps a type change the API server refuses to 409', async () => {
+    const api = writeOnlySecretsApi();
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    api.secrets.set('registry-creds', {
+      metadata: { name: 'registry-creds' },
+      type: 'example.com/registry-credential',
+      data: { credential: encode('old') },
+    });
+    const logs: string[] = [];
+    const cluster = createKubectlConsoleCluster(depsWithApi('/tmp', api), (line) =>
+      logs.push(line),
+    );
+    await expect(
+      cluster.reassignSecret(CONNECTION, 'registry-creds', 'next-value'),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: 'SECRET_TYPE_MISMATCH',
+      message:
+        'registry-creds is not a plain (Opaque) Secret and its type cannot change, so it cannot be reassigned here.',
+    });
+    expect(decoded(api.secrets.get('registry-creds'), 'credential')).toBe('old');
+    expect(logs.join('\n')).toContain('field is immutable');
+    expect(api.requests.map((entry) => `${entry.verb} ${entry.status}`)).toEqual(['update 422']);
+
+    // Other validation failures stay a generic error.
+    const invalid = createKubectlConsoleCluster({
+      ...fakeDeps({ cwd: '/tmp' }),
+      runCaptured: async () => ({
+        exitCode: 1,
+        stdout: '',
+        stderr: 'The Secret "big" is invalid: data: Too long: must have at most 1048576 bytes',
+      }),
+    });
+    await expect(invalid.reassignSecret(CONNECTION, 'big', 'next-value')).rejects.toMatchObject({
+      status: 502,
+      code: 'REQUEST_FAILED',
+    });
+  });
+
   it('refuses a platform-managed Secret locally, before any request', async () => {
     const api = writeOnlySecretsApi();
     const invocations: RunnerInvocation[] = [];
@@ -531,6 +611,8 @@ describe('write-only Secrets (platform#112)', () => {
 const kubectlPath = Bun.which('kubectl');
 describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl', () => {
   const requests: string[] = [];
+  const puts: StoredSecret[] = [];
+  const deletes: { query: string; body: string }[] = [];
   const secrets = new Map<string, unknown>();
   let server: ReturnType<typeof Bun.serve>;
   let connection: ClusterConnection;
@@ -591,6 +673,31 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
             return status(404, 'NotFound', `secrets "${name}" not found`);
           }
           const body = (await incoming.json()) as StoredSecret;
+          puts.push(body);
+          if ((existing.type ?? 'Opaque') !== (body.type ?? 'Opaque')) {
+            return Response.json(
+              {
+                kind: 'Status',
+                apiVersion: 'v1',
+                status: 'Failure',
+                reason: 'Invalid',
+                code: 422,
+                message: typeImmutable(name),
+                details: {
+                  name,
+                  kind: 'Secret',
+                  causes: [
+                    {
+                      reason: 'FieldValueInvalid',
+                      message: 'Invalid value: "Opaque": field is immutable',
+                      field: 'type',
+                    },
+                  ],
+                },
+              },
+              { status: 422 },
+            );
+          }
           // A name the platform manages that this CLI does not know of yet still reaches the
           // policy; it stands in for the server-side managed-name rule.
           const denial = name.startsWith('future-managed-')
@@ -603,6 +710,7 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
           return Response.json(body);
         }
         if (incoming.method === 'DELETE' && name !== undefined) {
+          deletes.push({ query: url.search, body: await incoming.text() });
           const existing = secrets.get(name);
           if (existing === undefined) {
             return status(404, 'NotFound', `secrets "${name}" not found`);
@@ -679,6 +787,28 @@ current-context: fake
     await expect(cluster.reassignSecret(connection, 'di-bs-orders', 'value')).rejects.toMatchObject(
       { status: 403, code: 'SECRET_MANAGED' },
     );
+    secrets.set('registry-creds', {
+      metadata: { name: 'registry-creds' },
+      type: 'kubernetes.io/basic-auth',
+      data: { credential: encode('old') },
+    });
+    await expect(
+      cluster.reassignSecret(connection, 'registry-creds', 'value'),
+    ).rejects.toMatchObject({ status: 409, code: 'SECRET_TYPE_MISMATCH' });
+    // platform#114's `tenant-secret-delete` rule refuses a dry run and an Orphan or Foreground
+    // propagation policy, since each answers with the Secret's data without removing it.
+    expect(deletes).toHaveLength(2);
+    for (const entry of deletes) {
+      expect(entry.query).not.toMatch(/dryRun/i);
+      const options = entry.body === '' ? {} : (JSON.parse(entry.body) as Record<string, unknown>);
+      expect(options.dryRun).toBeUndefined();
+      expect(options.orphanDependents).toBeUndefined();
+      expect([undefined, 'Background']).toContain(options.propagationPolicy as string | undefined);
+    }
+    // The unconditional update carries no resourceVersion, so nothing had to be read for it.
+    for (const body of puts) {
+      expect((body.metadata as Record<string, unknown>).resourceVersion).toBeUndefined();
+    }
     expect(requests).toEqual([
       `POST ${collection}`,
       `POST ${collection}`,
@@ -688,6 +818,7 @@ current-context: fake
       `PUT ${collection}/absent`,
       `PUT ${collection}/db-login`,
       `PUT ${collection}/future-managed-creds`,
+      `PUT ${collection}/registry-creds`,
     ]);
   }, 30_000);
 });

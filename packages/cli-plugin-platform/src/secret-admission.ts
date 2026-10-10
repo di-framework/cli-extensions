@@ -19,10 +19,14 @@ export const MANAGED_SECRET_DENIALS = [
 ] as const;
 
 /**
- * The Kubernetes Status reason of a failed kubectl request, from its
- * `Error from server (<Reason>): …` line. Matching the reason rather than free text keeps a
- * resource name such as `notfound-creds` from changing how an error is classified.
+ * The Kubernetes Status reason of a failed kubectl request. kubectl prints most failures as
+ * `Error from server (<Reason>): …`, but an `Invalid` (422) one as
+ * `The <Kind> "<name>" is invalid: …` or `The request is invalid: …`. Matching the reason
+ * rather than free text keeps a resource name such as `notfound-creds` from changing how an
+ * error is classified.
  */
 export function kubectlStatusReason(stderr: string): string | undefined {
-  return /Error from server \(([A-Za-z]+)\)/.exec(stderr)?.[1];
+  const reason = /^Error from server \(([A-Za-z]+)\)/m.exec(stderr)?.[1];
+  if (reason !== undefined) return reason;
+  return /^The (?:request|[A-Za-z]+ "[^"]*") is invalid: /m.test(stderr) ? 'Invalid' : undefined;
 }

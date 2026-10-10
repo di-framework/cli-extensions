@@ -324,7 +324,8 @@ so the CLI never reads it back:
   `credential`; labels and annotations on it are not kept. It works only on a Secret whose
   single key is `credential`: the console cannot read the Secret, so the platform's
   `tenant-secret-update` admission policy refuses a replace that drops a key, and the
-  console answers 409. Platform-managed Secrets (`di-binding-*`, `di-bs-*`,
+  console answers 409. So does a Secret whose type is not `Opaque`, since the API server
+  refuses to change a Secret's type. Platform-managed Secrets (`di-binding-*`, `di-bs-*`,
   `di-tenant-stock`, `di-platform-routes`) are refused with 403 before any request, and an
   admission denial for a managed name also answers 403.
 
