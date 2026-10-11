@@ -386,7 +386,9 @@ function readLocalProvider(
       `PGlite provider ${local} (from ${origin}) does not exist`,
       { path: local },
     );
-  const context = options.deploy ? 'deploy' : deps.env.CI ? 'CI' : undefined;
+  let context: string | undefined;
+  if (options.deploy) context = 'deploy';
+  else if (deps.env.CI) context = 'CI';
   if (context !== undefined && deps.env[ALLOW_LOCAL_PGLITE_ENV] !== '1')
     throw failure(
       'WASMCLOUD_PGLITE_LOCAL_REFUSED',
@@ -513,7 +515,7 @@ export async function warnIfHostIgnoresExclusive(
   const risk =
     'Without it a second instance can open the same PGlite data directory and corrupt it';
   const hostgroup = connection.hostgroup;
-  if (hostgroup === undefined || !hostgroup.startsWith('tenant-')) {
+  if (!hostgroup?.startsWith('tenant-')) {
     const group = hostgroup ?? connection.storageHostgroup ?? 'storage';
     io.stderr.write(
       `Note: ${project.applicationName} embeds PGlite and is marked exclusive; host group ${group} ` +

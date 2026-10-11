@@ -91,11 +91,16 @@ export async function runWasmcloudDeploy(
           }
         : {}),
     },
-    text: `Deployed ${project.applicationName} to ${connection.target} (namespace ${connection.namespace}, ${image.pullReference}).${
+    text: [
+      `Deployed ${project.applicationName} to ${connection.target} (namespace ${connection.namespace}, ${image.pullReference}).`,
       hasHttp && connection.endpoints?.http !== undefined
         ? ` HTTP: ${connection.endpoints.http} with Host: ${project.applicationName}`
-        : ''
-    }${pgliteText(build.pglite)}${cronJobs.length > 0 ? ` Scheduled jobs (${cronJobs.length}): ${cronJobs.map((j) => j.jobId).join(', ')}` : ''}`,
+        : '',
+      pgliteText(build.pglite),
+      cronJobs.length > 0
+        ? ` Scheduled jobs (${cronJobs.length}): ${cronJobs.map((j) => j.jobId).join(', ')}`
+        : '',
+    ].join(''),
   };
 }
 
