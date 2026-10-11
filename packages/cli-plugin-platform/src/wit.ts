@@ -29,6 +29,9 @@ export const DI_SQLITE_VERSION = '0.1.0';
 export const DI_SQLITE_INTERFACE = 'database';
 export const DI_SQLITE_TYPES_INTERFACE = 'types';
 export const SQLITE_SOURCE = 'sqlite-backend';
+export const DI_PGLITE_PACKAGE = 'di-framework:pglite';
+export const DI_PGLITE_VERSION = '0.2.0';
+export const PGLITE_SOURCE = 'pglite-backend';
 
 export type WitDirection = 'import' | 'export';
 
@@ -189,6 +192,15 @@ export function runtimeRequirementsFromJavaScript(source: string): WitRequiremen
       interfaces: [DI_SQLITE_TYPES_INTERFACE, DI_SQLITE_INTERFACE],
       direction: 'import',
       source: SQLITE_SOURCE,
+    });
+  }
+  if (source.includes(`${DI_PGLITE_PACKAGE}/database@${DI_PGLITE_VERSION}`)) {
+    requirements.push({
+      package: DI_PGLITE_PACKAGE,
+      version: DI_PGLITE_VERSION,
+      interfaces: ['types', 'database'],
+      direction: 'import',
+      source: PGLITE_SOURCE,
     });
   }
   return requirements;

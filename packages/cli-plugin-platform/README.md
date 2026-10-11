@@ -512,7 +512,7 @@ matching pool is unavailable. `hostgroup` defaults to `default`. These selectors
 existing host pools; application deployment does not provision them.
 
 A target with a `hostgroup` is a tenant target, and its storage belongs to the platform.
-Actors, queues, workers, and `persistentStorage: true` deploy with the annotation
+Actors, queues, workers, PGlite guests, and `persistentStorage: true` deploy with the annotation
 `di-framework.dev/persistent-storage: "true"` (plus `di-framework.dev/storage-mount:
 "/data/actors"` for actors) and no volume, volume mount, or host path. The platform
 controller creates `<storageRoot>/di-tenants/<tenant uid>/workloads/<workload>`, shared by
@@ -538,6 +538,85 @@ a host in its own namespace environment. Workload names and decorator paths rema
 to the implicit workload; they do not select user identity or Kubernetes namespaces.
 
 Generated platforms support declarative `tenants` and `users` in their Pulumi stack configuration. See [the generated platform guide](assets/platform/README.md#users-and-tenants) for CRDs, roles, token issuance, and lifecycle behavior.
+
+### Embedded PostgreSQL (PGlite)
+
+A guest that imports `di-framework:pglite/database@0.2.0` gets the
+[PGlite provider](https://github.com/di-framework/platform/tree/main/platform/pglite-component)
+plugged in after componentize (`wac plug`, like the SQLite provider). The database runs inside
+the component: there is no `wasmcloud:postgres` binding, service, or connection string. Pin the
+published provider by digest in `di-framework.config.json`:
+
+```json
+{
+  "name": "orders",
+  "entry": "src/app.ts",
+  "pglite": {
+    "image": "ghcr.io/di-framework/pglite-component@sha256:<64 hex>",
+    "storageMount": "/data",
+    "dataDir": "/data/pglite"
+  }
+}
+```
+
+```ts
+import { open } from 'di-framework:pglite/database@0.2.0';
+
+const db = open(process.env.DI_PGLITE_DATA_DIR ?? '/data/pglite', undefined);
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `image` | required unless `wasm` is set | `<repository>@sha256:<digest>`, the manifest digest the platform publish job records. Tags are refused because they move. |
+| `wasm` | none | A local provider build inside the project (symlinks resolved), used instead of `image` for offline development. Unverified; see below. |
+| `storageMount` | `/data` | Guest preopen of the workload's persistent directory. Tenant targets accept `/data` or `/data/actors`. |
+| `dataDir` | `<storageMount>/pglite` | Database root, at or under `storageMount`. The guest receives it as `DI_PGLITE_DATA_DIR`. |
+
+The build pulls the provider with `oras`: `oras manifest fetch`, then `oras blob fetch` of the
+manifest's single `application/wasm` layer. It checks that the manifest hashes to the pinned
+digest and the layer to the digest the manifest names, then caches both at
+`oci/sha256/<digest>/` under `$DI_FRAMEWORK_CACHE_DIR` (default `$XDG_CACHE_HOME/di-framework`,
+else `~/.cache/di-framework`). A cached entry is verified again on every build and pulled again
+if it no longer matches, and stale `.pull-*` staging directories (older than a day) are removed.
+The build plugs a private copy of the verified bytes (`.di-framework/di-framework-pglite.wasm`),
+so a later change to the shared cache cannot reach the composed component. While the GHCR
+package is private, run `oras login ghcr.io` first.
+
+`DI_FRAMEWORK_PGLITE_WASM=/path/to/di-framework-pglite.wasm` overrides both `wasm` and `image`.
+A local provider is only checked to be WebAssembly, never against the digest, and the build prints
+a `Warning:` on stderr when it uses one. `platform deploy`, and any build with `CI` set, refuse a
+local provider unless `DI_FRAMEWORK_ALLOW_LOCAL_PGLITE=1` is set. The deploy result reports the
+provider's source: the digest pin, or the local path marked unverified. Don't commit `wasm`
+next to `image`: it replaces the pin on every build.
+
+The build fails when the guest imports the database without a `pglite` entry, or when a `pglite`
+entry has no matching import, because the deploy renders the following from the config alone:
+
+- The workload's single component gets `localResources.config`
+  `di-framework.dev/exclusive-instance: "true"`, so the tenant host runs at most one instance of
+  it. The key is never put on a WorkloadService, which admission rejects; a guest shaped as a
+  service deploys as a component. The opt-in takes effect only on the exclusive tenant host
+  image (`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, selected with the platform's
+  `tenantHostImage`); see the platform's `tenant-host/README.md`. On stock wash the key is
+  ignored, and a saturated or draining pool builds a second instance that opens the same data
+  directory. `platform deploy` warns on stderr when a tenant host group's pod image is not
+  tagged `*-exclusive`. On other targets, including the `storage` host group, it cannot see the
+  host and prints a note instead.
+- Persistent storage, as for `persistentStorage: true`. Tenant targets get the
+  `di-framework.dev/persistent-storage: "true"` annotation, plus `di-framework.dev/storage-mount`
+  when `storageMount` is not `/data`. Other targets get a host path volume on the `storage` pool.
+- `replicas: 1` and `deployPolicy: Recreate`. Other replica counts are refused.
+
+Give each database one owner. Members of one implicit workload share one storage directory,
+mounted at each member's own `storageMount`. So `/data/pglite` under a `/data` mount and
+`/data/actors/pglite` under a `/data/actors` mount are the same database. Members that both embed
+PGlite need different `dataDir` values *relative to `storageMount`*. `platform deploy` refuses a
+workload where two members resolve to the same root (`WASMCLOUD_PGLITE_DATA_DIR_CONFLICT`).
+
+`platform dev` composes the provider but does not support PGlite yet. It mounts no storage
+directory and sets no `DI_PGLITE_DATA_DIR`, so `open` fails locally. Exercise the database
+against a deployed workload, or run the composed component with
+`wasmtime run --dir ./data::/data` as the provider README shows.
 
 ### Managed PostgreSQL (upcoming release)
 
