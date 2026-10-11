@@ -25,6 +25,13 @@ import { discoverScheduledJobs, renderCronAdapterModule, renderCronInvokerModule
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { renderGuestsModule } from './guests';
 import { OCI_ARTIFACT_PLATFORM } from './oci';
+import {
+  DI_PGLITE_PACKAGE,
+  DI_PGLITE_VERSION,
+  PGLITE_WASM_FILE,
+  type ResolvedPglite,
+  resolvePgliteComponent,
+} from './pglite';
 import { loadProject, type WasmcloudProject } from './project';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { renderQueuesModule } from './queues-module';
@@ -59,6 +66,8 @@ export type BuildSummary = {
   entry: string;
   profile: string;
   actors?: string[];
+  /** The composed PGlite provider: where it came from and, when pulled, its pinned image. */
+  pglite?: { source: ResolvedPglite['source']; image?: string; path?: string };
 };
 
 export function requirementsForProject(
@@ -278,6 +287,7 @@ async function inspectComponentImports(
   project: WasmcloudProject,
   requirements: readonly WitRequirement[],
   deps: WasmcloudDeps,
+  composedAway: readonly { package: string; failureCode: string }[] = [],
 ): Promise<void> {
   if (!isWasmMagic(project.outputPath)) return;
   const captured = await deps.runCaptured(
@@ -294,6 +304,16 @@ async function inspectComponentImports(
     );
   }
   const wit = `${captured.stdout}\n${captured.stderr}`;
+  for (const provider of composedAway) {
+    if (wit.includes(`${provider.package}/`)) {
+      throw new CommandFailure(
+        provider.failureCode,
+        `Composed component still imports ${provider.package}; the provider was not plugged in`,
+        3,
+        { application: project.applicationName, package: provider.package },
+      );
+    }
+  }
   for (const requirement of requirements) {
     if (requirement.direction !== 'import') continue;
     for (const iface of requirement.interfaces) {
@@ -310,12 +330,44 @@ async function inspectComponentImports(
   }
 }
 
+/**
+ * The PGlite provider for a guest that imports `di-framework:pglite/database`. The config
+ * and the import must agree: the deploy marks the component exclusive and gives it storage
+ * from the config alone, so a config without the import (or the reverse) is refused.
+ */
+async function resolvePglite(
+  project: WasmcloudProject,
+  imported: boolean,
+  io: CliIo,
+  deps: WasmcloudDeps,
+  deploy: boolean,
+): Promise<ResolvedPglite | undefined> {
+  if (imported && project.pglite === undefined) {
+    throw new CommandFailure(
+      'WASMCLOUD_PGLITE_NOT_CONFIGURED',
+      `${project.applicationName} imports ${DI_PGLITE_PACKAGE}/database@${DI_PGLITE_VERSION}; pin the provider in di-framework.config.json: "pglite": { "image": "ghcr.io/di-framework/pglite-component@sha256:<digest>" }`,
+      2,
+      { application: project.applicationName },
+    );
+  }
+  if (project.pglite === undefined) return undefined;
+  if (!imported) {
+    throw new CommandFailure(
+      'WASMCLOUD_PGLITE_UNUSED',
+      `di-framework.config.json configures "pglite", but ${project.applicationName} does not import ${DI_PGLITE_PACKAGE}/database@${DI_PGLITE_VERSION}; remove "pglite" or import it`,
+      2,
+      { application: project.applicationName },
+    );
+  }
+  return resolvePgliteComponent(project.pglite, io, deps, project.projectRoot, { deploy });
+}
+
 /** The disposable `.di-framework/` build directory: WIT world, bundle, and manifests. */
 export async function buildComponent(
   project: WasmcloudProject,
   io: CliIo,
   deps: WasmcloudDeps,
-  options: { guestLogging?: boolean } = {},
+  options: { guestLogging?: boolean; deploy?: boolean } = {},
 ): Promise<BuildSummary> {
   const generatedDirectory = join(project.projectRoot, '.di-framework');
   const generatedWit = join(generatedDirectory, 'wit');
@@ -452,6 +504,15 @@ export async function buildComponent(
     writeFileSync(join(generatedDirectory, 'wit.lock.json'), `${JSON.stringify(lock, null, 2)}\n`);
   }
 
+  const needsPglite = finalRequirements.some(
+    (requirement) =>
+      requirement.package === DI_PGLITE_PACKAGE && requirement.direction === 'import',
+  );
+  const pglite = await resolvePglite(project, needsPglite, io, deps, options.deploy === true);
+  // Plug a private copy of the verified bytes: the shared cache may change after verification.
+  const pgliteWasm = join(generatedDirectory, PGLITE_WASM_FILE);
+  if (pglite !== undefined) writeFileSync(pgliteWasm, pglite.bytes);
+
   const componentize = await runComponentize(project, generatedWit, bundledJavaScript, deps);
   if (componentize.exitCode !== 0) {
     throw toolFailed(componentize.tool, componentize.exitCode);
@@ -469,7 +530,16 @@ export async function buildComponent(
   for (const provider of composedProviders) {
     await composeComponentProvider(project, deps, io, provider, namedImports);
   }
+  if (pglite !== undefined) {
+    await composeProvider(project, deps, io, {
+      label: `${DI_PGLITE_PACKAGE}@${DI_PGLITE_VERSION}`,
+      wasm: pgliteWasm,
+      namedImports,
+      failureCode: 'WASMCLOUD_PGLITE_COMPOSE_FAILED',
+    });
+  }
   const composedPackages = new Set(composedProviders.map((provider) => provider.package));
+  if (pglite !== undefined) composedPackages.add(DI_PGLITE_PACKAGE);
 
   await inspectComponentImports(
     project,
@@ -482,6 +552,9 @@ export async function buildComponent(
         ),
     ),
     deps,
+    pglite === undefined
+      ? []
+      : [{ package: DI_PGLITE_PACKAGE, failureCode: 'WASMCLOUD_PGLITE_COMPOSE_FAILED' }],
   );
 
   const deploymentDigest = canonicalBuildDigest(
@@ -493,7 +566,10 @@ export async function buildComponent(
     needsSqliteCompose
       ? join(deps.assetsDirectory(), 'sqlite', 'di-framework-sqlite.wasm')
       : undefined,
-    composedProviders.map((provider) => provider.wasm),
+    [
+      ...composedProviders.map((provider) => provider.wasm),
+      ...(pglite === undefined ? [] : [pgliteWasm]),
+    ],
   );
   const artifactDigest = digestBytes(readFileSync(project.outputPath));
   const summary: BuildSummary = {
@@ -505,6 +581,15 @@ export async function buildComponent(
     entry: relative(project.projectRoot, project.entryPath),
     profile,
     ...(actors.length > 0 ? { actors: actors.map((a) => a.actorName) } : {}),
+    ...(pglite === undefined
+      ? {}
+      : {
+          pglite: {
+            source: pglite.source,
+            ...(pglite.image === undefined ? {} : { image: pglite.image }),
+            ...(pglite.path === undefined ? {} : { path: pglite.path }),
+          },
+        }),
   };
   writeFileSync(
     join(generatedDirectory, 'build.json'),

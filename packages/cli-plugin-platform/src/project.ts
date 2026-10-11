@@ -1,7 +1,8 @@
-import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { CommandFailure } from '@di-framework/cli-extension';
+import { type PgliteConfig, parsePgliteConfig } from './pglite';
 import { discoverWorkloadEntry, type WorkloadEntry } from './workload-members';
 
 export const CONFIG_FILE_NAME = 'di-framework.config.json';
@@ -42,6 +43,11 @@ export type WasmcloudProject = {
    * `di-framework.dev/logs: "false"` WorkloadDeployment annotation. Absent means on.
    */
   logs?: false;
+  /**
+   * Embedded PostgreSQL provider composed into the guest, from `"pglite"`. The deployed
+   * component is exclusive and gets persistent storage at `storageMount`.
+   */
+  pglite?: PgliteConfig;
 };
 
 export function findUp(startDirectory: string, fileName: string): string | undefined {
@@ -77,6 +83,22 @@ export function resolveInside(
   ) {
     configInvalid(`${label} must point to a file inside the project`, configPath);
   }
+  return absolutePath;
+}
+
+/**
+ * {@link resolveInside}, then the same check on the resolved real path, so a symlink inside
+ * the project cannot point outside it. A missing file is left for the caller to report.
+ */
+export function resolveRealInside(
+  projectRoot: string,
+  value: string,
+  label: string,
+  configPath: string,
+): string {
+  const absolutePath = resolveInside(projectRoot, value, label, configPath);
+  if (existsSync(absolutePath))
+    resolveInside(realpathSync(projectRoot), realpathSync(absolutePath), label, configPath);
   return absolutePath;
 }
 
@@ -191,6 +213,9 @@ export function loadProject(startDirectory: string): WasmcloudProject {
     : config.ingress !== false && config.http !== false;
   const cronMode = config.cronMode === 'external' ? 'external' : undefined;
   const persistentStorage = config.persistentStorage === true;
+  const pglite = parsePgliteConfig(config.pglite, configPath, (path) =>
+    resolveRealInside(projectRoot, path, 'pglite.wasm', configPath),
+  );
 
   return {
     applicationName: config.name,
@@ -199,6 +224,7 @@ export function loadProject(startDirectory: string): WasmcloudProject {
     ...(cronMode ? { cronMode } : {}),
     ...(persistentStorage ? { persistentStorage: true } : {}),
     ...(config.logs === false ? { logs: false as const } : {}),
+    ...(pglite ? { pglite } : {}),
     ...(config.allowedIpNameLookups === undefined
       ? {}
       : { allowedIpNameLookups: config.allowedIpNameLookups as string[] }),

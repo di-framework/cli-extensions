@@ -23,6 +23,12 @@ import {
 import { hostInterfacesFromRequirements, renderHostInterfacesYaml } from './host-interface';
 import { captureKubectl, runKubectl } from './kubernetes';
 import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings';
+import {
+  EXCLUSIVE_INSTANCE_KEY,
+  isWithin,
+  PGLITE_DATA_DIR_ENV,
+  warnIfHostIgnoresExclusive,
+} from './pglite';
 import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
@@ -161,9 +167,12 @@ export function renderWorkloadManifest(
     queueHandlers.length > 0 ? queueHandlers : discoverQueueHandlers(project);
   const isWorker = isQueueWorkerProject(project, resolvedHandlers);
   const hasQueues = resolvedHandlers.length > 0;
+  const pglite = project.pglite;
+  // An embedded PostgreSQL data directory needs persistent storage whatever the caller says.
   const needsPersistentStorage =
-    opts.hasPersistentStorage ??
-    (hasActors || hasQueues || isWorker || project.persistentStorage === true);
+    pglite !== undefined ||
+    (opts.hasPersistentStorage ??
+      (hasActors || hasQueues || isWorker || project.persistentStorage === true));
   const needsControlHttp = hasActors || cronJobs.length > 0 || hasQueues || isWorker;
   const publicIngress = project.ingress !== false && !isWorker;
   // Cluster Service is required for cron invokers and queue/actor control even when
@@ -174,7 +183,9 @@ export function renderWorkloadManifest(
     if (opts.replicas !== undefined && opts.replicas !== 1) {
       throw new CommandFailure(
         'WASMCLOUD_STORAGE_REPLICA_CONSTRAINT',
-        'SQLite-backed workloads require replicas: 1 because the WASI VFS lacks file locking',
+        pglite === undefined
+          ? 'SQLite-backed workloads require replicas: 1 because the WASI VFS lacks file locking'
+          : 'PGlite workloads require replicas: 1 because each database directory allows one opener',
         2,
         { replicas: opts.replicas },
       );
@@ -192,7 +203,16 @@ export function renderWorkloadManifest(
   const volumeName = opts.storageVolume?.volumeName ?? 'app-storage';
   const mountPath =
     opts.storageVolume?.mountPath ??
+    pglite?.storageMount ??
     (hasActors ? `${DEFAULT_STORAGE_MOUNT}/actors` : DEFAULT_STORAGE_MOUNT);
+  if (pglite !== undefined && !isWithin(pglite.dataDir, mountPath)) {
+    throw new CommandFailure(
+      'WASMCLOUD_PGLITE_STORAGE_MISMATCH',
+      `pglite.dataDir ${pglite.dataDir} is outside the storage mount ${mountPath}`,
+      2,
+      { dataDir: pglite.dataDir, mountPath },
+    );
+  }
   const hostPath = opts.storageVolume?.hostPath ?? hostStoragePath(storageDirectoryName(project));
   const platformStorage = needsPersistentStorage && usesPlatformStorage(connection);
   if (platformStorage && !PLATFORM_STORAGE_MOUNTS.includes(mountPath)) {
@@ -218,6 +238,7 @@ export function renderWorkloadManifest(
     environment.DI_STORAGE_DIR = mountPath;
   }
   if (hasActors) environment.ACTOR_STORAGE_DIR = mountPath;
+  if (pglite !== undefined) environment[PGLITE_DATA_DIR_ENV] = pglite.dataDir;
   if (needsPersistentStorage && !hasActors) {
     environment.QUEUE_DB_PATH = `${mountPath}/queue.db`;
     environment.MIGRATION_DB_PATH = `${mountPath}/migrations.db`;
@@ -292,6 +313,15 @@ spec:
     }
   } else if (ipNameLookups !== undefined) {
     localResourcesLines.push('          localResources:');
+  }
+
+  // The component itself is the exclusive unit (#140): never the service, which admission
+  // rejects, and never a separately linked provider, which the host refuses to load.
+  if (pglite !== undefined) {
+    localResourcesLines.push(
+      '            config:',
+      `              ${EXCLUSIVE_INSTANCE_KEY}: "true"`,
+    );
   }
 
   if (needsPersistentStorage && !platformStorage) {
@@ -609,7 +639,10 @@ export async function applyWorkload(
   const hasActors = discoverActors(project).length > 0 || project.actors === true;
   const cronJobs = discoverScheduledJobs(project.projectRoot);
   const hasPersistentStorage =
-    hasActors || queueHandlers.length > 0 || project.persistentStorage === true;
+    hasActors ||
+    queueHandlers.length > 0 ||
+    project.persistentStorage === true ||
+    project.pglite !== undefined;
   const needsHttp =
     (project.ingress !== false && !isWorker) ||
     hasActors ||
@@ -634,6 +667,7 @@ export async function applyWorkload(
       source: 'workload-service',
     });
   await warnIfTenantHostLacksTls(project, connection, io, deps);
+  await warnIfHostIgnoresExclusive(project, connection, io, deps);
   const associations = await applyManagedBindings(project, connection, bindings, deps);
   const egress = await applyWorkloadEgress(project, connection, deps);
   if (egress !== undefined) associations.add(egress);
