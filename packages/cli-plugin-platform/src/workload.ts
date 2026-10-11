@@ -23,7 +23,7 @@ import {
 import { hostInterfacesFromRequirements, renderHostInterfacesYaml } from './host-interface';
 import { captureKubectl, runKubectl } from './kubernetes';
 import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings';
-import { EXCLUSIVE_INSTANCE_KEY, PGLITE_DATA_DIR_ENV } from './pglite';
+import { EXCLUSIVE_INSTANCE_KEY, isWithin, PGLITE_DATA_DIR_ENV } from './pglite';
 import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
@@ -178,7 +178,9 @@ export function renderWorkloadManifest(
     if (opts.replicas !== undefined && opts.replicas !== 1) {
       throw new CommandFailure(
         'WASMCLOUD_STORAGE_REPLICA_CONSTRAINT',
-        'SQLite-backed workloads require replicas: 1 because the WASI VFS lacks file locking',
+        pglite === undefined
+          ? 'SQLite-backed workloads require replicas: 1 because the WASI VFS lacks file locking'
+          : 'PGlite workloads require replicas: 1 because each database directory allows one opener',
         2,
         { replicas: opts.replicas },
       );
@@ -198,11 +200,7 @@ export function renderWorkloadManifest(
     opts.storageVolume?.mountPath ??
     pglite?.storageMount ??
     (hasActors ? `${DEFAULT_STORAGE_MOUNT}/actors` : DEFAULT_STORAGE_MOUNT);
-  if (
-    pglite !== undefined &&
-    pglite.dataDir !== mountPath &&
-    !pglite.dataDir.startsWith(`${mountPath}/`)
-  ) {
+  if (pglite !== undefined && !isWithin(pglite.dataDir, mountPath)) {
     throw new CommandFailure(
       'WASMCLOUD_PGLITE_STORAGE_MISMATCH',
       `pglite.dataDir ${pglite.dataDir} is outside the storage mount ${mountPath}`,
@@ -315,8 +313,10 @@ spec:
   // The component itself is the exclusive unit (#140): never the service, which admission
   // rejects, and never a separately linked provider, which the host refuses to load.
   if (pglite !== undefined) {
-    localResourcesLines.push('            config:');
-    localResourcesLines.push(`              ${EXCLUSIVE_INSTANCE_KEY}: "true"`);
+    localResourcesLines.push(
+      '            config:',
+      `              ${EXCLUSIVE_INSTANCE_KEY}: "true"`,
+    );
   }
 
   if (needsPersistentStorage && !platformStorage) {

@@ -4,7 +4,9 @@ import { homedir } from 'node:os';
 import { join, posix, resolve } from 'node:path';
 import { type CliIo, CommandFailure } from '@di-framework/cli-extension';
 import type { WasmcloudDeps } from './deps';
-import { DI_PGLITE_PACKAGE, DI_PGLITE_VERSION, PGLITE_SOURCE } from './wit';
+import { DI_PGLITE_VERSION } from './wit';
+
+export { DI_PGLITE_PACKAGE, DI_PGLITE_VERSION, PGLITE_SOURCE } from './wit';
 
 /**
  * Embedded PostgreSQL provider (`di-framework:pglite`), published by di-framework/platform
@@ -13,7 +15,6 @@ import { DI_PGLITE_PACKAGE, DI_PGLITE_VERSION, PGLITE_SOURCE } from './wit';
  * exclusive and given persistent storage, because the engine tolerates exactly one opener
  * of its data directory.
  */
-export { DI_PGLITE_PACKAGE, DI_PGLITE_VERSION, PGLITE_SOURCE };
 export const PGLITE_REPOSITORY = 'ghcr.io/di-framework/pglite-component';
 /** Absolute (or cwd-relative) path of a local provider build; wins over the config. */
 export const PGLITE_WASM_ENV = 'DI_FRAMEWORK_PGLITE_WASM';
@@ -75,6 +76,30 @@ function absoluteGuestPath(value: unknown, label: string, configPath: string): s
   return normalized.length > 1 && normalized.endsWith('/') ? normalized.slice(0, -1) : normalized;
 }
 
+/** `image` must be a digest pin and `wasm` a path; at least one of them is required. */
+function validateProviderSource(entry: Record<string, unknown>, configPath: string): void {
+  if (entry.image !== undefined) {
+    if (typeof entry.image !== 'string') configInvalid('pglite.image must be a string', configPath);
+    try {
+      parseDigestReference(entry.image);
+    } catch (error) {
+      configInvalid(`pglite.image: ${(error as Error).message}`, configPath);
+    }
+  }
+  if (entry.wasm !== undefined && (typeof entry.wasm !== 'string' || entry.wasm.trim() === ''))
+    configInvalid('pglite.wasm must be a non-empty path', configPath);
+  if (entry.image === undefined && entry.wasm === undefined)
+    configInvalid(
+      `pglite needs "image" (${PGLITE_REPOSITORY}@sha256:<digest>) or a local "wasm" path`,
+      configPath,
+    );
+}
+
+/** True when `path` is `directory` or below it (both normalized guest paths). */
+export function isWithin(path: string, directory: string): boolean {
+  return path === directory || path.startsWith(directory === '/' ? '/' : `${directory}/`);
+}
+
 /** Validates `pglite` from the config. `resolveFile` keeps `wasm` inside the project. */
 export function parsePgliteConfig(
   value: unknown,
@@ -91,21 +116,7 @@ export function parsePgliteConfig(
       `pglite has unsupported fields: ${unknown.join(', ')}. Use ${CONFIG_KEYS.join(', ')}`,
       configPath,
     );
-  if (entry.image !== undefined) {
-    if (typeof entry.image !== 'string') configInvalid('pglite.image must be a string', configPath);
-    try {
-      parseDigestReference(entry.image);
-    } catch (error) {
-      configInvalid(`pglite.image: ${(error as Error).message}`, configPath);
-    }
-  }
-  if (entry.wasm !== undefined && (typeof entry.wasm !== 'string' || entry.wasm.trim() === ''))
-    configInvalid('pglite.wasm must be a non-empty path', configPath);
-  if (entry.image === undefined && entry.wasm === undefined)
-    configInvalid(
-      `pglite needs "image" (${PGLITE_REPOSITORY}@sha256:<digest>) or a local "wasm" path`,
-      configPath,
-    );
+  validateProviderSource(entry, configPath);
   const storageMount =
     entry.storageMount === undefined
       ? DEFAULT_PGLITE_STORAGE_MOUNT
@@ -114,10 +125,7 @@ export function parsePgliteConfig(
     entry.dataDir === undefined
       ? posix.join(storageMount, 'pglite')
       : absoluteGuestPath(entry.dataDir, 'dataDir', configPath);
-  if (
-    dataDir !== storageMount &&
-    !dataDir.startsWith(`${storageMount === '/' ? '' : storageMount}/`)
-  )
+  if (!isWithin(dataDir, storageMount))
     configInvalid(
       `pglite.dataDir ${dataDir} must be inside storageMount ${storageMount}; only that directory is persistent`,
       configPath,
@@ -237,9 +245,10 @@ async function oras(
   const result = await deps.runCaptured('oras', args, { cwd });
   if (result.exitCode === 0) return;
   const reason = (result.stderr || result.stdout).trim();
+  const detail = reason ? `: ${reason}` : '';
   throw failure(
     'WASMCLOUD_PGLITE_PULL_FAILED',
-    `oras ${args.slice(0, 2).join(' ')} failed for ${image}${reason ? `: ${reason}` : ''}. ` +
+    `oras ${args.slice(0, 2).join(' ')} failed for ${image}${detail}. ` +
       `If the package is private, run \`oras login ghcr.io\`; offline, set ${PGLITE_WASM_ENV} or pglite.wasm`,
     { image, exitCode: String(result.exitCode) },
   );
@@ -290,7 +299,12 @@ export async function pullPgliteComponent(
     );
     verifyLayer(readFileSync(stagedWasm), image, layerDigest);
     mkdirSync(join(entry, '..'), { recursive: true });
-    renameSync(staging, entry);
+    try {
+      renameSync(staging, entry);
+    } catch (error) {
+      // A concurrent build sharing the cache may have stored the same digest first.
+      if (!verifyCacheEntry(entry, image)) throw error;
+    }
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
@@ -316,9 +330,8 @@ export async function resolvePgliteComponent(
         `PGlite provider ${local} (from ${fromEnv ? PGLITE_WASM_ENV : 'pglite.wasm'}) does not exist`,
         { path: local },
       );
-    io.stdout.write(
-      `Using local PGlite provider ${local}${config.image ? ` instead of ${config.image}` : ''}\n`,
-    );
+    const replaced = config.image ? ` instead of ${config.image}` : '';
+    io.stdout.write(`Using local PGlite provider ${local}${replaced}\n`);
     return { wasm: local, source: 'local' };
   }
   return pullPgliteComponent(config.image as string, io, deps, projectRoot);

@@ -10,6 +10,7 @@ import {
   cacheEntry,
   cacheRoot,
   EXCLUSIVE_INSTANCE_KEY,
+  isWithin,
   PGLITE_WASM_ENV,
   PGLITE_WASM_FILE,
   parseDigestReference,
@@ -115,6 +116,13 @@ describe('pglite config', () => {
       dataDir: '/data/actors',
     });
     expect(parse({ image: IMAGE, storageMount: '/', dataDir: '/db' })?.dataDir).toBe('/db');
+  });
+
+  it('checks guest paths against the mount', () => {
+    expect(isWithin('/data', '/data')).toBe(true);
+    expect(isWithin('/data/pglite', '/data')).toBe(true);
+    expect(isWithin('/database', '/data')).toBe(false);
+    expect(isWithin('/db', '/')).toBe(true);
   });
 
   it('accepts only digest pins, never a floating tag', () => {
@@ -291,6 +299,44 @@ describe('pglite cache and pull', () => {
     expect(readFileSync(pulled.wasm).equals(PROVIDER)).toBe(true);
     expect(stderr.join('')).toContain('failed verification');
     expect(invocations).toHaveLength(2);
+  });
+
+  it('uses the entry a concurrent build stored first, and only if it verifies', async () => {
+    const winner = (layer: Buffer) => {
+      const cache = mkdtempSync(join(tmpdir(), 'pglite-cache-'));
+      const deps = registryDeps({ cache });
+      const entry = cacheEntry(deps.env, digestOf(MANIFEST));
+      return {
+        entry,
+        deps: {
+          ...deps,
+          runCaptured: async (
+            command: string,
+            args: readonly string[],
+            options: { cwd: string },
+          ) => {
+            const result = await deps.runCaptured(command, args, options);
+            if (args[0] === 'blob') {
+              mkdirSync(entry, { recursive: true });
+              writeFileSync(join(entry, 'manifest.json'), MANIFEST);
+              writeFileSync(join(entry, PGLITE_WASM_FILE), layer);
+            }
+            return result;
+          },
+        } satisfies WasmcloudDeps,
+      };
+    };
+    const valid = winner(PROVIDER);
+    const pulled = await pullPgliteComponent(IMAGE, captureIo().io, valid.deps, '/p');
+    expect(pulled).toEqual({
+      wasm: join(valid.entry, PGLITE_WASM_FILE),
+      source: 'registry',
+      image: IMAGE,
+    });
+    const corrupt = winner(Buffer.from('\0asmcorrupt'));
+    await expect(
+      pullPgliteComponent(IMAGE, captureIo().io, corrupt.deps, '/p'),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/^E/) });
   });
 
   it('leaves no cache entry when the pulled layer does not match', async () => {
@@ -599,6 +645,9 @@ describe('pglite workload manifest', () => {
       'WASMCLOUD_STORAGE_REPLICA_CONSTRAINT',
       2,
     );
+    expect(() =>
+      renderWorkloadManifest(project(), tenant, 'r/o:1', undefined, [], { replicas: 2 }),
+    ).toThrow('PGlite workloads require replicas: 1');
   });
 
   it('deploys a service-shaped guest as a component so the opt-in stays legal', () => {
