@@ -1,11 +1,22 @@
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { buildComponent } from '../src/build';
+import { runWasmcloudDeploy } from '../src/deploy';
 import type { WasmcloudDeps } from '../src/deps';
 import {
+  ALLOW_LOCAL_PGLITE_ENV,
+  assertDistinctPgliteRoots,
   CACHE_DIR_ENV,
   cacheEntry,
   cacheRoot,
@@ -17,8 +28,10 @@ import {
   parsePgliteConfig,
   pullPgliteComponent,
   resolvePgliteComponent,
+  STALE_STAGING_MS,
   verifyLayer,
   verifyManifest,
+  warnIfHostIgnoresExclusive,
 } from '../src/pglite';
 import { loadProject } from '../src/project';
 import type { ClusterConnection } from '../src/target';
@@ -30,6 +43,7 @@ import {
   fakeDeps,
   makeAssets,
   makeProject,
+  makeWorkspace,
   type RunnerInvocation,
 } from './helpers';
 
@@ -167,6 +181,28 @@ describe('pglite config', () => {
     );
   });
 
+  it('refuses a pglite.wasm symlink that leaves the project', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'pglite-outside-'));
+    writeFileSync(join(outside, 'pglite.wasm'), PROVIDER);
+    const root = makeProject({
+      name: 'Orders',
+      entry: 'src/app.ts',
+      pglite: { wasm: 'vendor/pglite.wasm' },
+    });
+    mkdirSync(join(root, 'vendor'));
+    symlinkSync(join(outside, 'pglite.wasm'), join(root, 'vendor', 'pglite.wasm'));
+    expectFailure(() => loadProject(root), 'WASMCLOUD_CONFIG_INVALID', 2);
+    const inside = makeProject({
+      name: 'Orders',
+      entry: 'src/app.ts',
+      pglite: { wasm: 'vendor/link.wasm' },
+    });
+    mkdirSync(join(inside, 'vendor'));
+    writeFileSync(join(inside, 'vendor', 'real.wasm'), PROVIDER);
+    symlinkSync(join(inside, 'vendor', 'real.wasm'), join(inside, 'vendor', 'link.wasm'));
+    expect(loadProject(inside).pglite?.wasm).toBe(join(inside, 'vendor', 'link.wasm'));
+  });
+
   it('loads from di-framework.config.json and keeps wasm inside the project', () => {
     const root = makeProject({ name: 'Orders', entry: 'src/app.ts', pglite: { image: IMAGE } });
     expect(loadProject(root).pglite).toEqual({
@@ -265,12 +301,9 @@ describe('pglite cache and pull', () => {
     const { io, stdout } = captureIo();
     const pulled = await pullPgliteComponent(IMAGE, io, deps, '/project');
     const entry = cacheEntry(deps.env, digestOf(MANIFEST));
-    expect(pulled).toEqual({
-      wasm: join(entry, PGLITE_WASM_FILE),
-      source: 'registry',
-      image: IMAGE,
-    });
-    expect(readFileSync(pulled.wasm).equals(PROVIDER)).toBe(true);
+    expect(pulled).toMatchObject({ source: 'registry', image: IMAGE });
+    expect(pulled.bytes.equals(PROVIDER)).toBe(true);
+    expect(readFileSync(join(entry, PGLITE_WASM_FILE)).equals(PROVIDER)).toBe(true);
     expect(readFileSync(join(entry, 'manifest.json')).equals(MANIFEST)).toBe(true);
     expect(invocations.map((entry) => entry.args.slice(0, 2).join(' '))).toEqual([
       'manifest fetch',
@@ -282,6 +315,7 @@ describe('pglite cache and pull', () => {
 
     const again = await pullPgliteComponent(IMAGE, io, deps, '/project');
     expect(again.source).toBe('cache');
+    expect(again.bytes.equals(PROVIDER)).toBe(true);
     expect(invocations).toHaveLength(2);
   });
 
@@ -296,7 +330,7 @@ describe('pglite cache and pull', () => {
     const { io, stderr } = captureIo();
     const pulled = await pullPgliteComponent(IMAGE, io, deps, '/project');
     expect(pulled.source).toBe('registry');
-    expect(readFileSync(pulled.wasm).equals(PROVIDER)).toBe(true);
+    expect(pulled.bytes.equals(PROVIDER)).toBe(true);
     expect(stderr.join('')).toContain('failed verification');
     expect(invocations).toHaveLength(2);
   });
@@ -328,15 +362,31 @@ describe('pglite cache and pull', () => {
     };
     const valid = winner(PROVIDER);
     const pulled = await pullPgliteComponent(IMAGE, captureIo().io, valid.deps, '/p');
-    expect(pulled).toEqual({
-      wasm: join(valid.entry, PGLITE_WASM_FILE),
-      source: 'registry',
-      image: IMAGE,
-    });
+    expect(pulled).toMatchObject({ source: 'registry', image: IMAGE });
+    expect(pulled.bytes.equals(PROVIDER)).toBe(true);
     const corrupt = winner(Buffer.from('\0asmcorrupt'));
     await expect(
       pullPgliteComponent(IMAGE, captureIo().io, corrupt.deps, '/p'),
-    ).rejects.toMatchObject({ code: expect.stringMatching(/^E/) });
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_CACHE_CONFLICT',
+      exitCode: 3,
+      message: expect.stringContaining(`remove ${corrupt.entry} and retry`),
+    });
+  });
+
+  it('sweeps staging directories a killed build left behind', async () => {
+    const cache = mkdtempSync(join(tmpdir(), 'pglite-cache-'));
+    const stale = join(cache, '.pull-old');
+    const fresh = join(cache, '.pull-new');
+    const other = join(cache, 'keep');
+    for (const dir of [stale, fresh, other]) mkdirSync(dir);
+    const old = new Date(Date.now() - STALE_STAGING_MS - 60_000);
+    utimesSync(stale, old, old);
+    utimesSync(other, old, old);
+    await pullPgliteComponent(IMAGE, captureIo().io, registryDeps({ cache }), '/p');
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(other)).toBe(true);
   });
 
   it('leaves no cache entry when the pulled layer does not match', async () => {
@@ -391,17 +441,20 @@ describe('pglite cache and pull', () => {
       storageMount: '/data',
       dataDir: '/data/pglite',
     };
-    const { io, stdout } = captureIo();
+    const { io, stderr } = captureIo();
     const fromEnv = await resolvePgliteComponent(
       config,
       io,
       registryDeps({ invocations, cwd: dir, env: { [PGLITE_WASM_ENV]: 'env.wasm' } }),
       dir,
     );
-    expect(fromEnv).toEqual({ wasm: join(dir, 'env.wasm'), source: 'local' });
-    expect(stdout.join('')).toContain(`instead of ${IMAGE}`);
+    expect(fromEnv).toMatchObject({ path: join(dir, 'env.wasm'), source: 'local' });
+    expect(stderr.join('')).toContain(
+      `Warning: using the local, unverified PGlite provider ${join(dir, 'env.wasm')} (from ${PGLITE_WASM_ENV}) instead of the pinned ${IMAGE}`,
+    );
     const fromConfig = await resolvePgliteComponent(config, io, registryDeps({ invocations }), dir);
-    expect(fromConfig).toEqual({ wasm: join(dir, 'config.wasm'), source: 'local' });
+    expect(fromConfig).toMatchObject({ path: join(dir, 'config.wasm'), source: 'local' });
+    expect(fromConfig.bytes.equals(PROVIDER)).toBe(true);
     expect(invocations).toHaveLength(0);
 
     const pulled = await resolvePgliteComponent(
@@ -431,6 +484,50 @@ describe('pglite cache and pull', () => {
         dir,
       ),
     ).rejects.toThrow(`/nope (from ${PGLITE_WASM_ENV}) does not exist`);
+  });
+
+  it('checks local providers are wasm and refuses them in deploys and on CI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pglite-local-'));
+    writeFileSync(join(dir, 'text.wasm'), 'not wasm');
+    writeFileSync(join(dir, 'ok.wasm'), PROVIDER);
+    const local = (name: string) => ({
+      wasm: join(dir, name),
+      storageMount: '/data',
+      dataDir: '/data/pglite',
+    });
+    await expect(
+      resolvePgliteComponent(local('text.wasm'), captureIo().io, registryDeps(), dir),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_PGLITE_PROVIDER_INVALID' });
+    await expect(
+      resolvePgliteComponent(local('ok.wasm'), captureIo().io, registryDeps(), dir, {
+        deploy: true,
+      }),
+    ).rejects.toThrow(
+      `Refusing the unverified local PGlite provider ${join(dir, 'ok.wasm')} (from pglite.wasm) in deploy; pin "pglite.image" by digest, or set ${ALLOW_LOCAL_PGLITE_ENV}=1`,
+    );
+    await expect(
+      resolvePgliteComponent(
+        local('ok.wasm'),
+        captureIo().io,
+        registryDeps({ env: { CI: 'true' } }),
+        dir,
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_LOCAL_REFUSED',
+      message: expect.stringContaining('in CI'),
+    });
+    const { io, stderr } = captureIo();
+    const allowed = await resolvePgliteComponent(
+      local('ok.wasm'),
+      io,
+      registryDeps({ env: { CI: 'true', [ALLOW_LOCAL_PGLITE_ENV]: '1' } }),
+      dir,
+      { deploy: true },
+    );
+    expect(allowed.source).toBe('local');
+    expect(stderr.join('')).toBe(
+      `Warning: using the local, unverified PGlite provider ${join(dir, 'ok.wasm')} (from pglite.wasm)\n`,
+    );
   });
 });
 
@@ -483,9 +580,10 @@ describe('pglite composition', () => {
     expect(world).toContain('import di-framework:pglite/database@0.2.0;');
     const plugs = invocations.filter((entry) => entry.args[0] === 'plug');
     expect(plugs).toHaveLength(1);
-    expect(plugs[0]?.args).toContain(
-      join(cacheEntry(deps.env, digestOf(MANIFEST)), PGLITE_WASM_FILE),
-    );
+    // The plug reads a private copy of the verified bytes, not the shared cache file.
+    const copy = join(root, '.di-framework', PGLITE_WASM_FILE);
+    expect(plugs[0]?.args).toContain(copy);
+    expect(readFileSync(copy).equals(PROVIDER)).toBe(true);
     const build = JSON.parse(readFileSync(join(root, '.di-framework', 'build.json'), 'utf8'));
     expect(build.pglite).toEqual({ source: 'registry', image: IMAGE });
   });
@@ -505,11 +603,71 @@ describe('pglite composition', () => {
         capturedStdout: { wit: WIT },
       }),
     );
-    expect(summary.pglite).toEqual({ source: 'local' });
+    expect(summary.pglite).toEqual({ source: 'local', path: join(root, 'vendor', 'pglite.wasm') });
     expect(invocations.some((entry) => entry.command === 'oras')).toBe(false);
     expect(invocations.find((entry) => entry.args[0] === 'plug')?.args).toContain(
-      join(root, 'vendor', 'pglite.wasm'),
+      join(root, '.di-framework', PGLITE_WASM_FILE),
     );
+  });
+
+  it('refuses a local provider in a deploy build unless opted in', async () => {
+    const root = pgliteProject({ wasm: 'vendor/pglite.wasm' });
+    const deps = (env: Record<string, string> = {}) =>
+      fakeDeps({
+        cwd: root,
+        assets: makeAssets(),
+        env,
+        bundleContents: GUEST,
+        componentOutput: () => '\0asm pglite-import',
+        capturedStdout: { wit: WIT },
+      });
+    await expect(
+      buildComponent(loadProject(root), captureIo().io, deps(), { deploy: true }),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_PGLITE_LOCAL_REFUSED' });
+    const summary = await buildComponent(
+      loadProject(root),
+      captureIo().io,
+      deps({ [ALLOW_LOCAL_PGLITE_ENV]: '1' }),
+      { deploy: true },
+    );
+    expect(summary.pglite?.source).toBe('local');
+  });
+
+  it('fails when the composed component still imports pglite', async () => {
+    const root = pgliteProject({ wasm: 'vendor/pglite.wasm' });
+    const deps = (wit: string): WasmcloudDeps => {
+      const base = fakeDeps({
+        cwd: root,
+        assets: makeAssets(),
+        env: { [ALLOW_LOCAL_PGLITE_ENV]: '1' },
+        bundleContents: GUEST,
+        componentOutput: () => '\0asm pglite-import',
+        capturedStdout: { wit },
+      });
+      return {
+        ...base,
+        // The fake plug writes a non-wasm placeholder; make it look composed so imports are read.
+        runCaptured: async (command, args, options) => {
+          const result = await base.runCaptured(command, args, options);
+          if (args[0] === 'plug')
+            writeFileSync(args[args.indexOf('-o') + 1] as string, '\0asm composed');
+          return result;
+        },
+      };
+    };
+    await expect(
+      buildComponent(
+        loadProject(root),
+        captureIo().io,
+        deps(`${WIT}  import di-framework:pglite/database@0.2.0;\n`),
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_COMPOSE_FAILED',
+      message: expect.stringContaining('still imports di-framework:pglite'),
+    });
+    expect(
+      (await buildComponent(loadProject(root), captureIo().io, deps(WIT))).pglite?.source,
+    ).toBe('local');
   });
 
   it('requires the pin when the guest imports pglite, and the import when pinned', async () => {
@@ -664,5 +822,202 @@ describe('pglite workload manifest', () => {
     expect(yaml).toContain('      components:\n');
     expect(yaml).not.toMatch(/^ {6}service:/m);
     expect(yaml).toContain(`${EXCLUSIVE_INSTANCE_KEY}: "true"`);
+  });
+});
+
+describe('pglite workload safety', () => {
+  const config = (storageMount: string, dataDir: string) => ({
+    image: IMAGE,
+    storageMount,
+    dataDir,
+  });
+
+  it('refuses two members that resolve to the same database root', () => {
+    // /data/pglite and /data/actors/pglite are the same host directory: members share it.
+    expectFailure(
+      () =>
+        assertDistinctPgliteRoots('shop', [
+          { applicationName: 'a', workload: 'shop', pglite: config('/data', '/data/pglite') },
+          {
+            applicationName: 'b',
+            workload: 'shop',
+            pglite: config('/data/actors', '/data/actors/pglite'),
+          },
+        ]),
+      'WASMCLOUD_PGLITE_DATA_DIR_CONFLICT',
+      2,
+    );
+    expect(() =>
+      assertDistinctPgliteRoots('shop', [
+        { applicationName: 'a', workload: 'shop', pglite: config('/data', '/data') },
+        { applicationName: 'b', workload: 'shop', pglite: config('/data/actors', '/data/actors') },
+      ]),
+    ).toThrow('a and b would open the same PGlite database (<workload storage>/.)');
+    expect(() =>
+      assertDistinctPgliteRoots('shop', [
+        { applicationName: 'a', workload: 'shop', pglite: config('/data', '/data/orders') },
+        { applicationName: 'b', workload: 'shop', pglite: config('/data', '/data/users') },
+        { applicationName: 'c', workload: 'other', pglite: config('/data', '/data/orders') },
+        { applicationName: 'd', workload: 'shop' },
+      ]),
+    ).not.toThrow();
+  });
+
+  const pods = (...images: string[]) =>
+    JSON.stringify({ items: [{ spec: { containers: images.map((image) => ({ image })) } }, {}] });
+  const tenant: ClusterConnection = {
+    target: 'acme',
+    kubeconfig: '/tmp/kube',
+    namespace: 'di-tenant-acme',
+    registry: { push: 'r', pull: 'r', insecure: false },
+    hostgroup: 'tenant-acme',
+  };
+  const app = { applicationName: 'orders', projectRoot: '/tmp', pglite: config('/data', '/data') };
+
+  it('warns when the tenant host is not the exclusive build', async () => {
+    const invocations: RunnerInvocation[] = [];
+    const out = captureIo();
+    await warnIfHostIgnoresExclusive(
+      app,
+      tenant,
+      out.io,
+      fakeDeps({
+        cwd: '/tmp',
+        invocations,
+        capturedStdout: { 'kubectl get': pods('ghcr.io/di-framework/wash:2.8.0-wasi-tls') },
+      }),
+    );
+    expect(invocations[0]?.args).toContain('di-runtime-acme');
+    expect(invocations[0]?.args).toContain('wasmcloud.com/hostgroup=tenant-acme');
+    expect(out.stderr.join('')).toContain(
+      'Warning: orders embeds PGlite and is marked exclusive, but host group tenant-acme runs ghcr.io/di-framework/wash:2.8.0-wasi-tls, which does not look like the exclusive build',
+    );
+    expect(out.stderr.join('')).toContain(
+      'a second instance can open the same PGlite data directory',
+    );
+
+    for (const result of [
+      { exitCodes: { 'kubectl get': 1 } },
+      { capturedStdout: { 'kubectl get': 'nope' } },
+      { capturedStdout: { 'kubectl get': '{}' } },
+    ]) {
+      const unread = captureIo();
+      await warnIfHostIgnoresExclusive(
+        app,
+        tenant,
+        unread.io,
+        fakeDeps({ cwd: '/tmp', ...result }),
+      );
+      expect(unread.stderr.join('')).toContain('could not read its host image');
+    }
+  });
+
+  it('stays quiet on the exclusive build and without pglite, and notes other targets', async () => {
+    const quiet = captureIo();
+    await warnIfHostIgnoresExclusive(
+      app,
+      tenant,
+      quiet.io,
+      fakeDeps({
+        cwd: '/tmp',
+        capturedStdout: {
+          'kubectl get': pods('ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:abc'),
+        },
+      }),
+    );
+    await warnIfHostIgnoresExclusive(
+      { ...app, pglite: undefined },
+      tenant,
+      quiet.io,
+      fakeDeps({ cwd: '/tmp' }),
+    );
+    expect(quiet.stderr).toEqual([]);
+
+    const external = captureIo();
+    const invocations: RunnerInvocation[] = [];
+    await warnIfHostIgnoresExclusive(
+      app,
+      { ...tenant, hostgroup: undefined, storageHostgroup: 'db' },
+      external.io,
+      fakeDeps({ cwd: '/tmp', invocations }),
+    );
+    await warnIfHostIgnoresExclusive(
+      app,
+      { ...tenant, hostgroup: undefined },
+      external.io,
+      fakeDeps({ cwd: '/tmp', invocations }),
+    );
+    await warnIfHostIgnoresExclusive(
+      app,
+      { ...tenant, hostgroup: 'shared' },
+      external.io,
+      fakeDeps({ cwd: '/tmp', invocations }),
+    );
+    expect(invocations).toEqual([]);
+    expect(external.stderr.join('')).toContain(
+      'Note: orders embeds PGlite and is marked exclusive; host group db must run',
+    );
+    expect(external.stderr.join('')).toContain('host group storage must run');
+    expect(external.stderr.join('')).toContain('host group shared must run');
+  });
+});
+
+describe('pglite deploy', () => {
+  const GUEST =
+    'import { open } from "di-framework:pglite/database@0.2.0";\nexport default open;\n';
+
+  function workspace(pglite: Record<string, unknown>): string {
+    const { greeter } = makeWorkspace();
+    const configPath = join(greeter, 'di-framework.config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    writeFileSync(configPath, `${JSON.stringify({ ...config, pglite })}\n`);
+    mkdirSync(join(greeter, 'vendor'), { recursive: true });
+    writeFileSync(join(greeter, 'vendor', 'pglite.wasm'), PROVIDER);
+    return greeter;
+  }
+
+  const deps = (cwd: string, env: Record<string, string>) =>
+    fakeDeps({
+      cwd,
+      assets: makeAssets(),
+      env,
+      bundleContents: GUEST,
+      componentOutput: () => '\0asm pglite-import',
+      capturedStdout: { wit: 'world application {}\n' },
+    });
+
+  it('reports a pinned provider and notes the host requirement', async () => {
+    const greeter = workspace({ image: IMAGE });
+    const cache = mkdtempSync(join(tmpdir(), 'pglite-cache-'));
+    const entry = cacheEntry({ [CACHE_DIR_ENV]: cache }, digestOf(MANIFEST));
+    mkdirSync(entry, { recursive: true });
+    writeFileSync(join(entry, 'manifest.json'), MANIFEST);
+    writeFileSync(join(entry, PGLITE_WASM_FILE), PROVIDER);
+    const out = captureIo();
+    const result = await runWasmcloudDeploy(
+      ['--target', 'development'],
+      out.io,
+      deps(greeter, { [CACHE_DIR_ENV]: cache }),
+    );
+    expect(result.data.pglite).toEqual({ source: 'cache', image: IMAGE });
+    expect(result.text).toContain(` PGlite: ${IMAGE}.`);
+    expect(out.stderr.join('')).toContain(
+      'host group storage must run a wash image built with the exclusive patch',
+    );
+  });
+
+  it('refuses a local provider unless opted in, then reports it as unverified', async () => {
+    const greeter = workspace({ wasm: 'vendor/pglite.wasm' });
+    await expect(
+      runWasmcloudDeploy(['--target', 'development'], captureIo().io, deps(greeter, {})),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_PGLITE_LOCAL_REFUSED' });
+    const result = await runWasmcloudDeploy(
+      ['--target', 'development'],
+      captureIo().io,
+      deps(greeter, { [ALLOW_LOCAL_PGLITE_ENV]: '1' }),
+    );
+    const path = join(greeter, 'vendor', 'pglite.wasm');
+    expect(result.data.pglite).toEqual({ source: 'local', path });
+    expect(result.text).toContain(` PGlite: local ${path} (unverified).`);
   });
 });

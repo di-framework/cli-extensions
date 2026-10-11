@@ -5,6 +5,7 @@ import { discoverScheduledJobs } from './cron';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { discoverProjects, resolveApplication } from './discovery';
 import { loadDeployManifest } from './manifest';
+import { assertDistinctPgliteRoots } from './pglite';
 import { publishComponent } from './publish';
 import type { RegistryLocation } from './registry';
 import { resolveConnection, resolveTarget } from './target';
@@ -24,6 +25,8 @@ export type WasmcloudDeployData = {
   service: string;
   http?: { url: string; host: string };
   endpoints?: Record<string, string>;
+  /** Where the composed PGlite provider came from: a digest pin or a local file. */
+  pglite?: { source: 'local' | 'cache' | 'registry'; image?: string; path?: string };
 };
 
 export type WasmcloudDeployResult = Omit<CommandResult, 'data' | 'text'> & {
@@ -46,14 +49,12 @@ export async function runWasmcloudDeploy(
     manifest.discovery,
   );
   if (project.workload) {
-    const path = writeWorkloadManifest(
-      manifest.workspaceRoot,
-      project.workload,
-      discoverProjects(manifest.workspaceRoot, manifest.discovery).values(),
-    );
+    const members = [...discoverProjects(manifest.workspaceRoot, manifest.discovery).values()];
+    assertDistinctPgliteRoots(project.workload, members);
+    const path = writeWorkloadManifest(manifest.workspaceRoot, project.workload, members);
     io.stdout.write(`Generated workload manifest ${path}\n`);
   }
-  const build = await buildComponent(project, io, deps);
+  const build = await buildComponent(project, io, deps, { deploy: true });
   const connection = await resolveConnection(target, manifest.workspaceRoot, manifest.path, deps);
 
   io.stdout.write(`Deploying ${project.applicationName} to target ${connection.target}...\n`);
@@ -79,6 +80,7 @@ export async function runWasmcloudDeploy(
         ? { http: { url: connection.endpoints.http, host: project.applicationName } }
         : {}),
       ...(connection.endpoints === undefined ? {} : { endpoints: connection.endpoints }),
+      ...(build.pglite === undefined ? {} : { pglite: build.pglite }),
       ...(cronJobs.length > 0
         ? {
             cronJobs: cronJobs.map((j) => ({
@@ -93,6 +95,13 @@ export async function runWasmcloudDeploy(
       hasHttp && connection.endpoints?.http !== undefined
         ? ` HTTP: ${connection.endpoints.http} with Host: ${project.applicationName}`
         : ''
-    }${cronJobs.length > 0 ? ` Scheduled jobs (${cronJobs.length}): ${cronJobs.map((j) => j.jobId).join(', ')}` : ''}`,
+    }${pgliteText(build.pglite)}${cronJobs.length > 0 ? ` Scheduled jobs (${cronJobs.length}): ${cronJobs.map((j) => j.jobId).join(', ')}` : ''}`,
   };
+}
+
+function pgliteText(pglite: WasmcloudDeployData['pglite']): string {
+  if (pglite === undefined) return '';
+  return pglite.path === undefined
+    ? ` PGlite: ${pglite.image}.`
+    : ` PGlite: local ${pglite.path} (unverified).`;
 }

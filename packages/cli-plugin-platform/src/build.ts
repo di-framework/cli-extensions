@@ -28,6 +28,7 @@ import { OCI_ARTIFACT_PLATFORM } from './oci';
 import {
   DI_PGLITE_PACKAGE,
   DI_PGLITE_VERSION,
+  PGLITE_WASM_FILE,
   type ResolvedPglite,
   resolvePgliteComponent,
 } from './pglite';
@@ -66,7 +67,7 @@ export type BuildSummary = {
   profile: string;
   actors?: string[];
   /** The composed PGlite provider: where it came from and, when pulled, its pinned image. */
-  pglite?: { source: ResolvedPglite['source']; image?: string };
+  pglite?: { source: ResolvedPglite['source']; image?: string; path?: string };
 };
 
 export function requirementsForProject(
@@ -286,6 +287,7 @@ async function inspectComponentImports(
   project: WasmcloudProject,
   requirements: readonly WitRequirement[],
   deps: WasmcloudDeps,
+  composedAway: readonly { package: string; failureCode: string }[] = [],
 ): Promise<void> {
   if (!isWasmMagic(project.outputPath)) return;
   const captured = await deps.runCaptured(
@@ -302,6 +304,16 @@ async function inspectComponentImports(
     );
   }
   const wit = `${captured.stdout}\n${captured.stderr}`;
+  for (const provider of composedAway) {
+    if (wit.includes(`${provider.package}/`)) {
+      throw new CommandFailure(
+        provider.failureCode,
+        `Composed component still imports ${provider.package}; the provider was not plugged in`,
+        3,
+        { application: project.applicationName, package: provider.package },
+      );
+    }
+  }
   for (const requirement of requirements) {
     if (requirement.direction !== 'import') continue;
     for (const iface of requirement.interfaces) {
@@ -328,6 +340,7 @@ async function resolvePglite(
   imported: boolean,
   io: CliIo,
   deps: WasmcloudDeps,
+  deploy: boolean,
 ): Promise<ResolvedPglite | undefined> {
   if (imported && project.pglite === undefined) {
     throw new CommandFailure(
@@ -346,7 +359,7 @@ async function resolvePglite(
       { application: project.applicationName },
     );
   }
-  return resolvePgliteComponent(project.pglite, io, deps, project.projectRoot);
+  return resolvePgliteComponent(project.pglite, io, deps, project.projectRoot, { deploy });
 }
 
 /** The disposable `.di-framework/` build directory: WIT world, bundle, and manifests. */
@@ -354,7 +367,7 @@ export async function buildComponent(
   project: WasmcloudProject,
   io: CliIo,
   deps: WasmcloudDeps,
-  options: { guestLogging?: boolean } = {},
+  options: { guestLogging?: boolean; deploy?: boolean } = {},
 ): Promise<BuildSummary> {
   const generatedDirectory = join(project.projectRoot, '.di-framework');
   const generatedWit = join(generatedDirectory, 'wit');
@@ -495,7 +508,10 @@ export async function buildComponent(
     (requirement) =>
       requirement.package === DI_PGLITE_PACKAGE && requirement.direction === 'import',
   );
-  const pglite = await resolvePglite(project, needsPglite, io, deps);
+  const pglite = await resolvePglite(project, needsPglite, io, deps, options.deploy === true);
+  // Plug a private copy of the verified bytes: the shared cache may change after verification.
+  const pgliteWasm = join(generatedDirectory, PGLITE_WASM_FILE);
+  if (pglite !== undefined) writeFileSync(pgliteWasm, pglite.bytes);
 
   const componentize = await runComponentize(project, generatedWit, bundledJavaScript, deps);
   if (componentize.exitCode !== 0) {
@@ -517,7 +533,7 @@ export async function buildComponent(
   if (pglite !== undefined) {
     await composeProvider(project, deps, io, {
       label: `${DI_PGLITE_PACKAGE}@${DI_PGLITE_VERSION}`,
-      wasm: pglite.wasm,
+      wasm: pgliteWasm,
       namedImports,
       failureCode: 'WASMCLOUD_PGLITE_COMPOSE_FAILED',
     });
@@ -536,6 +552,9 @@ export async function buildComponent(
         ),
     ),
     deps,
+    pglite === undefined
+      ? []
+      : [{ package: DI_PGLITE_PACKAGE, failureCode: 'WASMCLOUD_PGLITE_COMPOSE_FAILED' }],
   );
 
   const deploymentDigest = canonicalBuildDigest(
@@ -549,7 +568,7 @@ export async function buildComponent(
       : undefined,
     [
       ...composedProviders.map((provider) => provider.wasm),
-      ...(pglite === undefined ? [] : [pglite.wasm]),
+      ...(pglite === undefined ? [] : [pgliteWasm]),
     ],
   );
   const artifactDigest = digestBytes(readFileSync(project.outputPath));
@@ -568,6 +587,7 @@ export async function buildComponent(
           pglite: {
             source: pglite.source,
             ...(pglite.image === undefined ? {} : { image: pglite.image }),
+            ...(pglite.path === undefined ? {} : { path: pglite.path }),
           },
         }),
   };

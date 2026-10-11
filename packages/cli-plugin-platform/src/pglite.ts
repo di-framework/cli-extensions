@@ -1,9 +1,20 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join, posix, resolve } from 'node:path';
 import { type CliIo, CommandFailure } from '@di-framework/cli-extension';
 import type { WasmcloudDeps } from './deps';
+import { captureKubectl } from './kubernetes';
+import type { ClusterConnection } from './target';
 import { DI_PGLITE_VERSION } from './wit';
 
 export { DI_PGLITE_PACKAGE, DI_PGLITE_VERSION, PGLITE_SOURCE } from './wit';
@@ -49,9 +60,13 @@ export type PgliteConfig = {
 };
 
 export type ResolvedPglite = {
-  wasm: string;
+  /** Verified provider bytes; the build plugs a private copy of these. */
+  bytes: Buffer;
   source: 'local' | 'cache' | 'registry';
+  /** The digest pin, when the bytes came from the registry or the cache. */
   image?: string;
+  /** The local file, when the bytes came from one. */
+  path?: string;
 };
 
 function configInvalid(message: string, configPath: string): never {
@@ -202,6 +217,16 @@ export function verifyManifest(bytes: Uint8Array, image: string): string {
   return layer.digest;
 }
 
+function isWasm(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 4 &&
+    bytes[0] === 0 &&
+    bytes[1] === 0x61 &&
+    bytes[2] === 0x73 &&
+    bytes[3] === 0x6d
+  );
+}
+
 export function verifyLayer(bytes: Uint8Array, image: string, layerDigest: string): void {
   const actual = sha256(bytes);
   if (actual !== layerDigest)
@@ -210,13 +235,7 @@ export function verifyLayer(bytes: Uint8Array, image: string, layerDigest: strin
       `Provider layer of ${image} hashes to ${actual}, not ${layerDigest} from its manifest`,
       { image, expected: layerDigest, actual },
     );
-  if (
-    bytes.length < 4 ||
-    bytes[0] !== 0 ||
-    bytes[1] !== 0x61 ||
-    bytes[2] !== 0x73 ||
-    bytes[3] !== 0x6d
-  )
+  if (!isWasm(bytes))
     throw failure(
       'WASMCLOUD_PGLITE_MANIFEST_INVALID',
       `Provider layer of ${image} is not a WebAssembly binary`,
@@ -224,15 +243,33 @@ export function verifyLayer(bytes: Uint8Array, image: string, layerDigest: strin
     );
 }
 
-function verifyCacheEntry(directory: string, image: string): boolean {
+/** The verified provider bytes of a cache entry, or undefined when it is absent or stale. */
+function readVerifiedEntry(directory: string, image: string): Buffer | undefined {
   const manifestPath = join(directory, 'manifest.json');
   const wasmPath = join(directory, PGLITE_WASM_FILE);
-  if (!existsSync(manifestPath) || !existsSync(wasmPath)) return false;
+  if (!existsSync(manifestPath) || !existsSync(wasmPath)) return undefined;
   try {
-    verifyLayer(readFileSync(wasmPath), image, verifyManifest(readFileSync(manifestPath), image));
-    return true;
+    const bytes = readFileSync(wasmPath);
+    verifyLayer(bytes, image, verifyManifest(readFileSync(manifestPath), image));
+    return bytes;
   } catch {
-    return false;
+    return undefined;
+  }
+}
+
+/** Staging directories older than this were left by a killed build and are removed. */
+export const STALE_STAGING_MS = 24 * 60 * 60 * 1000;
+
+function sweepStaleStaging(root: string, now: number): void {
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith('.pull-')) continue;
+    const path = join(root, name);
+    try {
+      if (now - statSync(path).mtimeMs > STALE_STAGING_MS)
+        rmSync(path, { recursive: true, force: true });
+    } catch {
+      // Another build removed it first.
+    }
   }
 }
 
@@ -255,9 +292,30 @@ async function oras(
 }
 
 /**
+ * Stores a verified staging directory as the cache entry. A concurrent build may have
+ * stored the same digest first; its entry is used when it verifies.
+ */
+function storeEntry(staging: string, entry: string, image: string, bytes: Buffer): Buffer {
+  mkdirSync(join(entry, '..'), { recursive: true });
+  try {
+    renameSync(staging, entry);
+    return bytes;
+  } catch (error) {
+    const winner = readVerifiedEntry(entry, image);
+    if (winner !== undefined) return winner;
+    throw failure(
+      'WASMCLOUD_PGLITE_CACHE_CONFLICT',
+      `Could not store ${image} in the cache at ${entry} (${(error as NodeJS.ErrnoException).code ?? 'unknown error'}), ` +
+        `and the entry there does not verify; remove ${entry} and retry`,
+      { image, entry },
+    );
+  }
+}
+
+/**
  * Pulls the provider by digest with `oras`, verifying the manifest digest and the layer
  * digest, into the cache. A cached entry is re-verified on every use; a corrupt one is
- * pulled again.
+ * pulled again. Returns the verified bytes, so later readers never see a swapped file.
  */
 export async function pullPgliteComponent(
   image: string,
@@ -267,10 +325,10 @@ export async function pullPgliteComponent(
 ): Promise<ResolvedPglite> {
   const { repository, digest } = parseDigestReference(image);
   const entry = cacheEntry(deps.env, digest);
-  const wasm = join(entry, PGLITE_WASM_FILE);
-  if (verifyCacheEntry(entry, image)) {
+  const cached = readVerifiedEntry(entry, image);
+  if (cached !== undefined) {
     io.stdout.write(`Using cached ${image}\n`);
-    return { wasm, source: 'cache', image };
+    return { bytes: cached, source: 'cache', image };
   }
   if (existsSync(entry)) {
     io.stderr.write(`Cached ${image} failed verification; pulling it again\n`);
@@ -284,6 +342,7 @@ export async function pullPgliteComponent(
     );
   const root = cacheRoot(deps.env);
   mkdirSync(root, { recursive: true });
+  sweepStaleStaging(root, Date.now());
   const staging = mkdtempSync(join(root, '.pull-'));
   try {
     io.stdout.write(`Pulling ${image}...\n`);
@@ -297,42 +356,179 @@ export async function pullPgliteComponent(
       image,
       cwd,
     );
-    verifyLayer(readFileSync(stagedWasm), image, layerDigest);
-    mkdirSync(join(entry, '..'), { recursive: true });
-    try {
-      renameSync(staging, entry);
-    } catch (error) {
-      // A concurrent build sharing the cache may have stored the same digest first.
-      if (!verifyCacheEntry(entry, image)) throw error;
-    }
+    const bytes = readFileSync(stagedWasm);
+    verifyLayer(bytes, image, layerDigest);
+    return { bytes: storeEntry(staging, entry, image, bytes), source: 'registry', image };
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
-  return { wasm, source: 'registry', image };
+}
+
+/** Set to `1` to let `deploy` or a CI build use a local, unverified provider. */
+export const ALLOW_LOCAL_PGLITE_ENV = 'DI_FRAMEWORK_ALLOW_LOCAL_PGLITE';
+
+export type ResolvePgliteOptions = {
+  /** A deploy ships the provider, so a local file needs the explicit opt-in. */
+  deploy?: boolean;
+};
+
+function readLocalProvider(
+  local: string,
+  origin: string,
+  config: PgliteConfig,
+  io: CliIo,
+  deps: WasmcloudDeps,
+  options: ResolvePgliteOptions,
+): ResolvedPglite {
+  if (!existsSync(local))
+    throw failure(
+      'WASMCLOUD_PGLITE_PROVIDER_MISSING',
+      `PGlite provider ${local} (from ${origin}) does not exist`,
+      { path: local },
+    );
+  const context = options.deploy ? 'deploy' : deps.env.CI ? 'CI' : undefined;
+  if (context !== undefined && deps.env[ALLOW_LOCAL_PGLITE_ENV] !== '1')
+    throw failure(
+      'WASMCLOUD_PGLITE_LOCAL_REFUSED',
+      `Refusing the unverified local PGlite provider ${local} (from ${origin}) in ${context}; ` +
+        `pin "pglite.image" by digest, or set ${ALLOW_LOCAL_PGLITE_ENV}=1 to use it anyway`,
+      { path: local, context },
+    );
+  const bytes = readFileSync(local);
+  if (!isWasm(bytes))
+    throw failure(
+      'WASMCLOUD_PGLITE_PROVIDER_INVALID',
+      `PGlite provider ${local} (from ${origin}) is not a WebAssembly binary`,
+      { path: local },
+    );
+  const replaced = config.image ? ` instead of the pinned ${config.image}` : '';
+  io.stderr.write(
+    `Warning: using the local, unverified PGlite provider ${local} (from ${origin})${replaced}\n`,
+  );
+  return { bytes, source: 'local', path: local };
 }
 
 /**
  * The provider to compose: `DI_FRAMEWORK_PGLITE_WASM`, then `pglite.wasm`, then the
- * digest-pinned `pglite.image`. Local files are not checked against the digest.
+ * digest-pinned `pglite.image`. Local files are only checked to be WebAssembly, and are
+ * refused in a deploy or on CI without `DI_FRAMEWORK_ALLOW_LOCAL_PGLITE=1`.
  */
 export async function resolvePgliteComponent(
   config: PgliteConfig,
   io: CliIo,
   deps: WasmcloudDeps,
   projectRoot: string,
+  options: ResolvePgliteOptions = {},
 ): Promise<ResolvedPglite> {
   const fromEnv = deps.env[PGLITE_WASM_ENV]?.trim();
-  const local = fromEnv ? resolve(deps.cwd(), fromEnv) : config.wasm;
-  if (local !== undefined) {
-    if (!existsSync(local))
-      throw failure(
-        'WASMCLOUD_PGLITE_PROVIDER_MISSING',
-        `PGlite provider ${local} (from ${fromEnv ? PGLITE_WASM_ENV : 'pglite.wasm'}) does not exist`,
-        { path: local },
-      );
-    const replaced = config.image ? ` instead of ${config.image}` : '';
-    io.stdout.write(`Using local PGlite provider ${local}${replaced}\n`);
-    return { wasm: local, source: 'local' };
-  }
+  if (fromEnv)
+    return readLocalProvider(
+      resolve(deps.cwd(), fromEnv),
+      PGLITE_WASM_ENV,
+      config,
+      io,
+      deps,
+      options,
+    );
+  if (config.wasm !== undefined)
+    return readLocalProvider(config.wasm, 'pglite.wasm', config, io, deps, options);
   return pullPgliteComponent(config.image as string, io, deps, projectRoot);
+}
+
+/**
+ * Members of one workload share one storage directory, mounted at each member's own
+ * `storageMount`. Two members whose `dataDir` is the same path relative to their mount
+ * would open the same database from separate instances, which exclusivity cannot stop.
+ */
+export function assertDistinctPgliteRoots(
+  workload: string,
+  members: Iterable<{ applicationName: string; workload?: string; pglite?: PgliteConfig }>,
+): void {
+  const owners = new Map<string, string>();
+  for (const member of members) {
+    if (member.workload !== workload || member.pglite === undefined) continue;
+    const root = posix.relative(member.pglite.storageMount, member.pglite.dataDir);
+    const previous = owners.get(root);
+    if (previous !== undefined)
+      throw new CommandFailure(
+        'WASMCLOUD_PGLITE_DATA_DIR_CONFLICT',
+        `${workload}: ${previous} and ${member.applicationName} would open the same PGlite database ` +
+          `(<workload storage>/${root || '.'}); members share one storage directory, so give each a different dataDir relative to its storageMount`,
+        2,
+        { workload, root },
+      );
+    owners.set(root, member.applicationName);
+  }
+}
+
+/** Tag fragment of the tenant host image that honours the exclusive opt-in (#140). */
+export const EXCLUSIVE_HOST_IMAGE_MARKER = '-exclusive';
+
+function hasExclusiveTag(image: string): boolean {
+  const tag = image.split('@')[0]?.split('/').pop()?.split(':')[1];
+  return tag?.includes(EXCLUSIVE_HOST_IMAGE_MARKER) === true;
+}
+
+async function hostImages(
+  connection: ClusterConnection,
+  hostgroup: string,
+  deps: WasmcloudDeps,
+  cwd: string,
+): Promise<string[] | undefined> {
+  const runtime = { ...connection, namespace: `di-runtime-${hostgroup.slice('tenant-'.length)}` };
+  const result = await captureKubectl(
+    deps,
+    runtime,
+    ['get', 'pods', '-l', `wasmcloud.com/hostgroup=${hostgroup}`, '-o', 'json'],
+    cwd,
+  );
+  if (result.exitCode !== 0) return undefined;
+  try {
+    const list = JSON.parse(result.stdout) as {
+      items?: { spec?: { containers?: { image?: string }[] } }[];
+    };
+    return (list.items ?? []).flatMap((pod) =>
+      (pod.spec?.containers ?? []).flatMap((container) =>
+        typeof container.image === 'string' ? [container.image] : [],
+      ),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Stock wash ignores `di-framework.dev/exclusive-instance`: when its pool saturates or an
+ * instance drains, it builds a second store, which opens the same data directory. Warn when
+ * a tenant host group's image is not the exclusive build; elsewhere the CLI cannot see the
+ * host, so say what the opt-in depends on.
+ */
+export async function warnIfHostIgnoresExclusive(
+  project: { applicationName: string; projectRoot: string; pglite?: PgliteConfig },
+  connection: ClusterConnection,
+  io: CliIo,
+  deps: WasmcloudDeps,
+): Promise<void> {
+  if (project.pglite === undefined) return;
+  const risk =
+    'Without it a second instance can open the same PGlite data directory and corrupt it';
+  const hostgroup = connection.hostgroup;
+  if (hostgroup === undefined || !hostgroup.startsWith('tenant-')) {
+    const group = hostgroup ?? connection.storageHostgroup ?? 'storage';
+    io.stderr.write(
+      `Note: ${project.applicationName} embeds PGlite and is marked exclusive; host group ${group} ` +
+        `must run a wash image built with the exclusive patch (tagged *${EXCLUSIVE_HOST_IMAGE_MARKER}). ${risk}.\n`,
+    );
+    return;
+  }
+  const images = await hostImages(connection, hostgroup, deps, project.projectRoot);
+  if (images?.some(hasExclusiveTag)) return;
+  const seen =
+    images === undefined || images.length === 0
+      ? 'could not read its host image'
+      : `runs ${images[0]}`;
+  io.stderr.write(
+    `Warning: ${project.applicationName} embeds PGlite and is marked exclusive, but host group ${hostgroup} ` +
+      `${seen}, which does not look like the exclusive build (tagged *${EXCLUSIVE_HOST_IMAGE_MARKER}, set with the platform's tenantHostImage). ${risk}.\n`,
+  );
 }

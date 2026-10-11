@@ -23,7 +23,12 @@ import {
 import { hostInterfacesFromRequirements, renderHostInterfacesYaml } from './host-interface';
 import { captureKubectl, runKubectl } from './kubernetes';
 import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings';
-import { EXCLUSIVE_INSTANCE_KEY, isWithin, PGLITE_DATA_DIR_ENV } from './pglite';
+import {
+  EXCLUSIVE_INSTANCE_KEY,
+  isWithin,
+  PGLITE_DATA_DIR_ENV,
+  warnIfHostIgnoresExclusive,
+} from './pglite';
 import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
@@ -662,6 +667,7 @@ export async function applyWorkload(
       source: 'workload-service',
     });
   await warnIfTenantHostLacksTls(project, connection, io, deps);
+  await warnIfHostIgnoresExclusive(project, connection, io, deps);
   const associations = await applyManagedBindings(project, connection, bindings, deps);
   const egress = await applyWorkloadEgress(project, connection, deps);
   if (egress !== undefined) associations.add(egress);
