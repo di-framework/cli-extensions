@@ -272,15 +272,52 @@ export function closeSync(fd: number): void {
   if (!openHandles.delete(fd)) throw errno('EBADF', 'close', String(fd), -9);
 }
 
+function outOfRange(name: string, range: string, received: unknown): RangeError {
+  return Object.assign(
+    new RangeError(
+      `The value of "${name}" is out of range. It must be ${range}. Received ${String(received)}`,
+    ),
+    { code: 'ERR_OUT_OF_RANGE' },
+  );
+}
+
+/**
+ * Stored reads lower `length` and `position` as WIT u64s, which componentize-qjs
+ * 0.4.4-di.5+ traps on unless they are non-negative safe integers (or BigInts).
+ * Validate like Node's `fs.readSync`: `null`/`-1` mean the current position.
+ */
+function readRange(
+  buffer: Uint8Array,
+  offset: number,
+  length: number,
+  position: number | bigint | null | undefined,
+): { length: number; position: number | null } {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > buffer.byteLength) {
+    throw outOfRange('offset', `>= 0 && <= ${buffer.byteLength}`, offset);
+  }
+  if (!Number.isSafeInteger(length) || length < 0 || length > buffer.byteLength - offset) {
+    throw outOfRange('length', `>= 0 && <= ${buffer.byteLength - offset}`, length);
+  }
+  if (position === null || position === undefined || position === -1 || position === -1n) {
+    return { length, position: null };
+  }
+  const start = typeof position === 'bigint' ? Number(position) : position;
+  if (!Number.isSafeInteger(start) || start < 0) {
+    throw outOfRange('position', `>= -1 && <= ${Number.MAX_SAFE_INTEGER}`, position);
+  }
+  return { length, position: start };
+}
+
 export function readSync(
   fd: number,
   buffer: Uint8Array,
   offset = 0,
-  length = buffer.byteLength - offset,
-  position: number | null = null,
+  requestedLength = buffer.byteLength - offset,
+  requestedPosition: number | bigint | null = null,
 ): number {
   const handle = openHandles.get(fd);
   if (handle === undefined) throw errno('EBADF', 'read', String(fd), -9);
+  const { length, position } = readRange(buffer, offset, requestedLength, requestedPosition);
   const start = position === null ? handle.position : position;
   const slice = handle.stored
     ? storage.readAt(handle.path, length, start)
@@ -295,10 +332,17 @@ export function writeSync(
   data: string | Uint8Array,
   offset?: number,
   length?: number,
-  position?: number | null,
+  requestedPosition?: number | bigint | null,
 ): number {
   const handle = openHandles.get(fd);
   if (handle === undefined) throw errno('EBADF', 'write', String(fd), -9);
+  // Like Node (and libuv), a non-number or negative position writes at the current
+  // position; it must never reach the stored descriptor's u64 offset.
+  const position =
+    typeof requestedPosition === 'number' && requestedPosition >= 0 ? requestedPosition : null;
+  if (position !== null && !Number.isSafeInteger(position)) {
+    throw outOfRange('position', `an integer <= ${Number.MAX_SAFE_INTEGER}`, position);
+  }
   const bytes = asBytes(data).subarray(
     offset ?? 0,
     (offset ?? 0) + (length ?? asBytes(data).byteLength),

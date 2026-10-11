@@ -23,7 +23,21 @@ function wasi<T>(run: () => T): T {
   }
 }
 
-/** A wasi:filesystem@0.2.12 descriptor over a real directory, as the host preopens it. */
+/** Lower a WIT u64 argument the way componentize-qjs 0.4.4-di.5 does, trapping otherwise. */
+function u64(value: number | bigint): number {
+  const valid =
+    typeof value === 'bigint'
+      ? value >= 0n && value <= 0xffff_ffff_ffff_ffffn
+      : Number.isSafeInteger(value) && value >= 0;
+  if (!valid) throw new Error(`u64 lowering trap: ${String(value)}`);
+  return Number(value);
+}
+
+/**
+ * A wasi:filesystem@0.2.12 descriptor over a real directory, as the host preopens it.
+ * `filesize` (u64) arguments and results follow componentize-qjs 0.4.4-di.5: BigInt
+ * results, BigInt or safe-integer arguments.
+ */
 class HostDescriptor implements WasiDescriptor {
   constructor(readonly path: string) {}
   openAt(
@@ -39,14 +53,17 @@ class HostDescriptor implements WasiDescriptor {
       return new HostDescriptor(path);
     });
   }
-  read(length: number, offset: number): [Uint8Array, boolean] {
+  read(lengthArg: number, offsetArg: number): [Uint8Array, boolean] {
+    const length = u64(lengthArg);
+    const offset = u64(offsetArg);
     const data = host.readFileSync(this.path).subarray(offset, offset + length);
     return [new Uint8Array(data), offset + data.byteLength >= host.statSync(this.path).size];
   }
-  write(buffer: Uint8Array, offset: number): number {
+  write(buffer: Uint8Array, offset: number): bigint {
+    const position = u64(offset);
     const fd = host.openSync(this.path, 'r+');
     try {
-      return host.writeSync(fd, buffer, 0, buffer.byteLength, offset);
+      return BigInt(host.writeSync(fd, buffer, 0, buffer.byteLength, position));
     } finally {
       host.closeSync(fd);
     }
@@ -210,6 +227,33 @@ describe('guest storage under /data', () => {
     expect(new TextDecoder().decode(buffer)).toBe('Jello');
     expect(fs.readSync(reader, buffer, 0, 5, 6)).toBe(5);
     expect(new TextDecoder().decode(buffer)).toBe('world');
+    // u64 offsets/lengths never reach the descriptor unless they are valid.
+    expect(fs.readSync(reader, buffer, 0, 1, 6n)).toBe(1);
+    expect(new TextDecoder().decode(buffer.subarray(0, 1))).toBe('w');
+    expect(fs.readSync(reader, buffer, 0, 1, -1)).toBe(1);
+    expect(new TextDecoder().decode(buffer.subarray(0, 1))).toBe(' ');
+    for (const [offset, length, position] of [
+      [0, 1, -2],
+      [0, 1, 1.5],
+      [0, 1, 2n ** 64n],
+      [0, -1, 0],
+      [0, 6, 0],
+      [-1, 1, 0],
+      [6, 0, 0],
+      [0, 0.5, 0],
+    ] as const) {
+      expect(() => fs.readSync(reader, buffer, offset, length, position)).toThrow(
+        expect.objectContaining({ code: 'ERR_OUT_OF_RANGE' }),
+      );
+    }
+    const positioned = fs.openSync('/data/log', 'r+');
+    expect(fs.writeSync(positioned, 'H', 0, 1, -1)).toBe(1);
+    expect(fs.writeSync(positioned, 'e', 0, 1, 1n as unknown as number)).toBe(1);
+    expect(() => fs.writeSync(positioned, 'x', 0, 1, 1.5)).toThrow(
+      expect.objectContaining({ code: 'ERR_OUT_OF_RANGE' }),
+    );
+    fs.closeSync(positioned);
+    expect(fs.readFileSync('/data/log', 'utf8')).toBe('Hello world!');
     const created = fs.openSync('/data/new', 'a+');
     fs.closeSync(created);
     expect(fs.readFileSync('/data/new', 'utf8')).toBe('');
@@ -292,8 +336,8 @@ describe('guest storage under /data', () => {
           },
         });
       }
-      override write(): number {
-        return 0;
+      override write(): bigint {
+        return 0n;
       }
       override read(length: number, offset: number): [Uint8Array, boolean] {
         const [data] = super.read(length, offset);

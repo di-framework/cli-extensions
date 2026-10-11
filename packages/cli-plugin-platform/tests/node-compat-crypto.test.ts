@@ -18,6 +18,7 @@ import { runtimeRequirementsFromJavaScript } from '../src/wit';
 import * as clock from './memory-wasi-clocks';
 import {
   getRandomBytes,
+  memoryRandomRequests,
   resetMemoryRandom,
   seedMemoryRandom,
   setMemoryRandomMode,
@@ -51,6 +52,34 @@ afterEach(() => {
 });
 
 describe('node:crypto overlay', () => {
+  it('validates getRandomBytes size like Node before lowering it as a u64 BigInt', () => {
+    expect(guestGetRandomBytes(3).length).toBe(3);
+    expect(memoryRandomRequests).toEqual([3n]);
+    for (const size of [-1, 1.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => guestGetRandomBytes(size)).toThrow(RangeError);
+    }
+    try {
+      guestGetRandomBytes(-1);
+      throw new Error('expected a RangeError');
+    } catch (error) {
+      expect((error as { code?: string }).code).toBe('ERR_OUT_OF_RANGE');
+    }
+    for (const size of ['4', 4n, undefined, null]) {
+      expect(() => guestGetRandomBytes(size as unknown as number)).toThrow(TypeError);
+    }
+    try {
+      guestGetRandomBytes(4n as unknown as number);
+      throw new Error('expected a TypeError');
+    } catch (error) {
+      expect((error as Error).message).toContain('type bigint (4n)');
+      expect((error as { code?: string }).code).toBe('ERR_INVALID_ARG_TYPE');
+    }
+    expect(() => randomBytes(-1)).toThrow(RangeError);
+    expect(() => randomFillSync(new Uint8Array(2), 4)).toThrow(RangeError);
+    // Only the one valid request reached the import; invalid sizes never trap it.
+    expect(memoryRandomRequests).toEqual([3n]);
+  });
+
   it('rejects the non-uniform randomInt tail and validates the 48-bit range', async () => {
     const range = 2 ** 47 + 1;
     seedMemoryRandom(255);

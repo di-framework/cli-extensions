@@ -8,17 +8,31 @@ export function setMemoryRandomMode(mode: MemoryRandomMode): void {
   memoryRandomMode = mode;
 }
 
+/** Every `max-len` argument the guest passed, as received. */
+export const memoryRandomRequests: unknown[] = [];
+
 export function resetMemoryRandom(): void {
   next = 1;
   memoryRandomMode = 'bytes';
+  memoryRandomRequests.length = 0;
 }
 
 export function seedMemoryRandom(value: number): void {
   next = value;
 }
 
-/** Deterministic CSPRNG for tests. Not cryptographic. */
+/**
+ * Deterministic CSPRNG for tests. Not cryptographic. Lowers `max-len` like
+ * componentize-qjs 0.4.4-di.5 lowers a WIT u64: a BigInt or a non-negative
+ * safe-integer Number, trapping on anything else.
+ */
 export function getRandomBytes(maxLen: bigint | number): unknown {
+  memoryRandomRequests.push(maxLen);
+  const valid =
+    typeof maxLen === 'bigint'
+      ? maxLen >= 0n && maxLen <= 0xffff_ffff_ffff_ffffn
+      : Number.isSafeInteger(maxLen) && maxLen >= 0;
+  if (!valid) throw new Error(`u64 lowering trap: ${String(maxLen)}`);
   const size = Number(maxLen);
   const out = new Uint8Array(size);
   for (let i = 0; i < size; i++) {

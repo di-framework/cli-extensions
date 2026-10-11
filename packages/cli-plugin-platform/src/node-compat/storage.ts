@@ -9,7 +9,7 @@ export type WasiDescriptor = {
     flags: { read?: boolean; write?: boolean; mutateDirectory?: boolean },
   ): WasiDescriptor;
   read(length: number, offset: number): [Uint8Array | number[], boolean];
-  write(buffer: Uint8Array, offset: number): number;
+  write(buffer: Uint8Array, offset: number): number | bigint;
   setSize(size: number): void;
   stat(): WasiStat;
   statAt(pathFlags: { symlinkFollow?: boolean }, path: string): WasiStat;
