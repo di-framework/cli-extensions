@@ -119,10 +119,8 @@ async function toWebRequest(incoming: {
     headers.append(name, decoder.decode(value));
   }
 
-  if (method === 'GET' || method === 'HEAD') {
-    return new Request(`${scheme}://${authority}${path}`, { method, headers });
-  }
-
+  // Always consume the wasi:http body, even for GET/HEAD: an undrained body stream keeps
+  // the request open, so an exclusive instance stays busy until the host's HTTP timeout.
   let bodyBytes: Uint8Array | undefined;
   try {
     const consumed = (
@@ -147,7 +145,8 @@ async function toWebRequest(incoming: {
   return new Request(`${scheme}://${authority}${path}`, {
     method,
     headers,
-    body: bodyBytes as BodyInit | undefined,
+    // A Web Request with GET/HEAD must not carry a body; the drained bytes are discarded.
+    body: method === 'GET' || method === 'HEAD' ? undefined : (bodyBytes as BodyInit | undefined),
   });
 }
 
@@ -218,8 +217,9 @@ async function fromWebResponse(response: Response): Promise<unknown> {
 export const handler = {
   async handle(incoming: Parameters<typeof toWebRequest>[0]): Promise<unknown> {
     try {
-      ensureWasiEnvironment();
+      // Convert (and so drain) the request first, so a setup failure still releases the body.
       const request = await toWebRequest(incoming);
+      ensureWasiEnvironment();
       const isControlPath =
         isCronInvokeRequest(request) ||
         isQueueControlRequest(request) ||

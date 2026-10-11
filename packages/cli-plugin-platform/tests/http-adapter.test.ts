@@ -31,12 +31,20 @@ function defaultOutgoing(headers: unknown, contents: unknown, trailers: unknown)
 }
 
 const wasiState = {
-  consumeBody: (_request: unknown, _res: Promise<unknown>): unknown => {
-    throw new Error('consumeBody was not stubbed');
-  },
+  consumeBody: (_request: unknown, _res: Promise<unknown>): unknown => emptyBody(),
   newResponse: (headers: unknown, contents: unknown, trailers: unknown): unknown =>
     defaultOutgoing(headers, contents, trailers),
 };
+
+function emptyBody(): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.close();
+    },
+  });
+}
+
+const runtimeState: { ensureError: Error | undefined } = { ensureError: undefined };
 
 mock.module('virtual:di-framework-wasmcloud-guests', () => ({
   guests: {},
@@ -77,7 +85,9 @@ mock.module('virtual:di-framework-wasmcloud-queues', () => ({
 }));
 
 mock.module('virtual:di-framework-wasmcloud-runtime', () => ({
-  ensureWasiEnvironment: () => undefined,
+  ensureWasiEnvironment: () => {
+    if (runtimeState.ensureError) throw runtimeState.ensureError;
+  },
   loadApplication: async () => ({}),
 }));
 
@@ -118,6 +128,21 @@ function readable(...values: Uint8Array[]): ReadableStream<Uint8Array> {
   });
 }
 
+/** A request body stream that records how far the adapter read it. */
+function trackedBody(...values: Uint8Array[]) {
+  const state = { reads: 0, done: false };
+  const stream = {
+    async *[Symbol.asyncIterator]() {
+      for (const value of values) {
+        state.reads += 1;
+        yield value;
+      }
+      state.done = true;
+    },
+  };
+  return { stream, state };
+}
+
 function incoming(
   overrides: {
     method?: { tag: string; val?: string };
@@ -142,9 +167,8 @@ afterEach(() => {
   delete process.env.DI_CONTROL_REJECT_FORWARDED;
   delete process.env.DI_CONTROL_HTTP_HOST;
   applicationState.current = () => new Response('ok');
-  wasiState.consumeBody = () => {
-    throw new Error('consumeBody was not stubbed');
-  };
+  wasiState.consumeBody = () => emptyBody();
+  runtimeState.ensureError = undefined;
   wasiState.newResponse = (headers, contents, trailers) =>
     defaultOutgoing(headers, contents, trailers);
   delete (globalThis as { wit?: unknown }).wit;
@@ -378,9 +402,10 @@ describe('http adapter', () => {
     const postOutgoing = (await handler.handle(
       incoming({ method: { tag: 'post' }, path: '/body' }),
     )) as Outgoing;
-    expect(captured).toEqual([consumeReadable]);
+    expect(captured).toEqual([consumeReadable, consumeReadable]);
     expect(postOutgoing.statusCode).toBe(200);
     expect(written).toEqual([
+      { type: 'void-type', value: { tag: 'ok', val: undefined } },
       { type: 'trailers-type', value: { tag: 'ok', val: null } },
       { type: 'void-type', value: { tag: 'ok', val: undefined } },
       { type: 'trailers-type', value: { tag: 'ok', val: null } },
@@ -480,6 +505,77 @@ describe('http adapter', () => {
     expect(cluster.statusCode).toBe(200);
   });
 
+  for (const tag of ['get', 'head']) {
+    it(`drains the ${tag.toUpperCase()} request body and hands the app a body-less Request`, async () => {
+      const body = trackedBody(new TextEncoder().encode('ab'), new TextEncoder().encode('cd'));
+      const consumed: unknown[] = [];
+      wasiState.consumeBody = (request) => {
+        consumed.push(request);
+        return [body.stream];
+      };
+      const seen: Array<{ method: string; body: unknown }> = [];
+      applicationState.current = (request) => {
+        seen.push({ method: request.method, body: request.body });
+        return new Response(null, { status: 204 });
+      };
+      const request = incoming({ method: { tag }, path: '/drain' });
+      const outgoing = (await handler.handle(request)) as Outgoing;
+      expect(outgoing.statusCode).toBe(204);
+      expect(consumed).toEqual([request]);
+      expect(body.state).toEqual({ reads: 2, done: true });
+      expect(seen).toEqual([{ method: tag.toUpperCase(), body: null }]);
+    });
+  }
+
+  it('drains the body on the hidden control-path 404 and the handler-throw 500', async () => {
+    process.env.DI_CONTROL_REJECT_FORWARDED = '1';
+    process.env.DI_CONTROL_HTTP_HOST = 'greeter';
+    const hidden = trackedBody(new TextEncoder().encode('x'));
+    wasiState.consumeBody = () => hidden.stream;
+    const notFound = (await handler.handle(
+      incoming({
+        method: { tag: 'get' },
+        authority: 'greeter',
+        path: '/_di/queues/',
+        headers: [['x-forwarded-for', new TextEncoder().encode('203.0.113.1')]],
+      }),
+    )) as Outgoing;
+    expect(notFound.statusCode).toBe(404);
+    expect(hidden.state.done).toBe(true);
+
+    const thrown = trackedBody(new TextEncoder().encode('y'));
+    wasiState.consumeBody = () => thrown.stream;
+    applicationState.current = () => {
+      throw new Error('handler failed');
+    };
+    const originalError = console.error;
+    console.error = () => undefined;
+    try {
+      const failure = (await handler.handle(
+        incoming({ method: { tag: 'get' }, path: '/boom' }),
+      )) as Outgoing;
+      expect(failure.statusCode).toBe(500);
+    } finally {
+      console.error = originalError;
+    }
+    expect(thrown.state.done).toBe(true);
+  });
+
+  it('drains the body even when WASI environment setup throws', async () => {
+    const body = trackedBody(new TextEncoder().encode('z'));
+    wasiState.consumeBody = () => body.stream;
+    runtimeState.ensureError = new Error('environment unavailable');
+    const originalError = console.error;
+    console.error = () => undefined;
+    try {
+      const failure = (await handler.handle(incoming({ method: { tag: 'get' } }))) as Outgoing;
+      expect(failure.statusCode).toBe(500);
+    } finally {
+      console.error = originalError;
+    }
+    expect(body.state.done).toBe(true);
+  });
+
   it('rejects a missing guests object', () => {
     expect(() => requireGuestsObject(null)).toThrow(TypeError);
     expect(() => requireGuestsObject('guests')).toThrow(
@@ -506,7 +602,10 @@ describe('http adapter', () => {
 
     const outgoing = (await handler.handle(incoming({ method: { tag: 'get' } }))) as Outgoing;
     expect(outgoing.trailers).toBe(fallbackReadable);
-    expect(written).toEqual([{ type: 'custom-type', value: { tag: 'ok', val: null } }]);
+    expect(written).toEqual([
+      { type: 'custom-type', value: { tag: 'ok', val: undefined } },
+      { type: 'custom-type', value: { tag: 'ok', val: null } },
+    ]);
 
     const FutureEmpty = Object.assign(
       (type: unknown) => ({
