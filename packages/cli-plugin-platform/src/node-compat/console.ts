@@ -8,8 +8,13 @@ export const CONSOLE_LOG_CONTEXT = 'console';
 
 /**
  * WIT s64/u64 values (SQLite integers, row counts, timestamps) arrive as BigInt since
- * componentize-qjs 0.4.4-di.5, and JSON.stringify throws on BigInt. Print them as
- * Node's console does (`42n`) instead of collapsing the object to `[object Object]`.
+ * componentize-qjs 0.4.4-di.5, and JSON.stringify throws on BigInt.
+ *
+ * Convention: a top-level BigInt prints as Node's console does (`42n`). A BigInt nested
+ * in an object or array prints as the JSON string `"42n"` (`{"id":"42n"}`, where Node
+ * would print `{ id: 42n }`), so each line stays valid JSON for log consumers. A JSON
+ * reader therefore cannot tell BigInt `42n` from the string `"42n"`; treat a string
+ * matching `/^-?\d+n$/` as a BigInt when that matters.
  */
 function bigintReplacer(_key: string, value: unknown): unknown {
   return typeof value === 'bigint' ? `${value}n` : value;
