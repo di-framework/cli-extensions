@@ -23,6 +23,7 @@ import {
 import { hostInterfacesFromRequirements, renderHostInterfacesYaml } from './host-interface';
 import { captureKubectl, runKubectl } from './kubernetes';
 import { applyManagedBindings, cleanupManagedBindings } from './managed-bindings';
+import { EXCLUSIVE_INSTANCE_KEY, PGLITE_DATA_DIR_ENV } from './pglite';
 import type { WasmcloudProject } from './project';
 import { asWitIdentifier } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
@@ -161,9 +162,12 @@ export function renderWorkloadManifest(
     queueHandlers.length > 0 ? queueHandlers : discoverQueueHandlers(project);
   const isWorker = isQueueWorkerProject(project, resolvedHandlers);
   const hasQueues = resolvedHandlers.length > 0;
+  const pglite = project.pglite;
+  // An embedded PostgreSQL data directory needs persistent storage whatever the caller says.
   const needsPersistentStorage =
-    opts.hasPersistentStorage ??
-    (hasActors || hasQueues || isWorker || project.persistentStorage === true);
+    pglite !== undefined ||
+    (opts.hasPersistentStorage ??
+      (hasActors || hasQueues || isWorker || project.persistentStorage === true));
   const needsControlHttp = hasActors || cronJobs.length > 0 || hasQueues || isWorker;
   const publicIngress = project.ingress !== false && !isWorker;
   // Cluster Service is required for cron invokers and queue/actor control even when
@@ -192,7 +196,20 @@ export function renderWorkloadManifest(
   const volumeName = opts.storageVolume?.volumeName ?? 'app-storage';
   const mountPath =
     opts.storageVolume?.mountPath ??
+    pglite?.storageMount ??
     (hasActors ? `${DEFAULT_STORAGE_MOUNT}/actors` : DEFAULT_STORAGE_MOUNT);
+  if (
+    pglite !== undefined &&
+    pglite.dataDir !== mountPath &&
+    !pglite.dataDir.startsWith(`${mountPath}/`)
+  ) {
+    throw new CommandFailure(
+      'WASMCLOUD_PGLITE_STORAGE_MISMATCH',
+      `pglite.dataDir ${pglite.dataDir} is outside the storage mount ${mountPath}`,
+      2,
+      { dataDir: pglite.dataDir, mountPath },
+    );
+  }
   const hostPath = opts.storageVolume?.hostPath ?? hostStoragePath(storageDirectoryName(project));
   const platformStorage = needsPersistentStorage && usesPlatformStorage(connection);
   if (platformStorage && !PLATFORM_STORAGE_MOUNTS.includes(mountPath)) {
@@ -218,6 +235,7 @@ export function renderWorkloadManifest(
     environment.DI_STORAGE_DIR = mountPath;
   }
   if (hasActors) environment.ACTOR_STORAGE_DIR = mountPath;
+  if (pglite !== undefined) environment[PGLITE_DATA_DIR_ENV] = pglite.dataDir;
   if (needsPersistentStorage && !hasActors) {
     environment.QUEUE_DB_PATH = `${mountPath}/queue.db`;
     environment.MIGRATION_DB_PATH = `${mountPath}/migrations.db`;
@@ -292,6 +310,13 @@ spec:
     }
   } else if (ipNameLookups !== undefined) {
     localResourcesLines.push('          localResources:');
+  }
+
+  // The component itself is the exclusive unit (#140): never the service, which admission
+  // rejects, and never a separately linked provider, which the host refuses to load.
+  if (pglite !== undefined) {
+    localResourcesLines.push('            config:');
+    localResourcesLines.push(`              ${EXCLUSIVE_INSTANCE_KEY}: "true"`);
   }
 
   if (needsPersistentStorage && !platformStorage) {
@@ -609,7 +634,10 @@ export async function applyWorkload(
   const hasActors = discoverActors(project).length > 0 || project.actors === true;
   const cronJobs = discoverScheduledJobs(project.projectRoot);
   const hasPersistentStorage =
-    hasActors || queueHandlers.length > 0 || project.persistentStorage === true;
+    hasActors ||
+    queueHandlers.length > 0 ||
+    project.persistentStorage === true ||
+    project.pglite !== undefined;
   const needsHttp =
     (project.ingress !== false && !isWorker) ||
     hasActors ||
