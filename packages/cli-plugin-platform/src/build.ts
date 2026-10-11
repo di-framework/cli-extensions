@@ -261,7 +261,7 @@ async function composeProvider(
   if (options.namedImports && !compiler)
     throw new CommandFailure(
       'WASMCLOUD_COMPILER_REQUIRED',
-      'Managed PostgreSQL requires componentize-qjs 0.4.4-di.3 or newer',
+      'Managed PostgreSQL requires componentize-qjs 0.4.4-di.5 or newer',
       3,
     );
   const result = await deps.runCaptured(
