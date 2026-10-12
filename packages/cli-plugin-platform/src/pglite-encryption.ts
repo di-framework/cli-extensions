@@ -97,7 +97,11 @@ export function interpositionProblem(
   layer: { imports: WitInterface[] },
   providerExports: WitInterface[],
 ): string | undefined {
-  const names = (items: WitInterface[]) => items.filter(isFilesystem).map(formatInterface).sort();
+  const names = (items: WitInterface[]) =>
+    items
+      .filter(isFilesystem)
+      .map(formatInterface)
+      .sort((a, b) => a.localeCompare(b));
   const left = names(composed.imports);
   const own = names(layer.imports);
   const stray = left.filter((name) => !own.includes(name));
