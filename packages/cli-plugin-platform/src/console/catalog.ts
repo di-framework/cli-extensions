@@ -1,3 +1,4 @@
+import { RENDERED_ENVIRONMENT_KEYS } from '../environment-names';
 import { STORAGE_HOSTGROUP } from '../workload';
 import { ConsoleError, platformSentence, sanitizePublicText } from './errors';
 
@@ -6,8 +7,9 @@ const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const HOST_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/i;
 const SENSITIVE_KEY = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|API_KEY|_KEY$)/i;
 const USERINFO = /:\/\/[^/\s:]+:[^/\s@]+@/;
-const HIDDEN_CONFIG =
-  /^(DI_CONTROL_|DI_QUEUE_|DI_CRON_|DI_SQLITE_|DI_STORAGE_)|^(ACTOR_STORAGE_DIR|QUEUE_DB_PATH|MIGRATION_DB_PATH)$/;
+const HIDDEN_CONFIG = new RegExp(
+  `^(DI_CONTROL_|DI_QUEUE_|DI_CRON_|DI_SQLITE_|DI_STORAGE_)|^(${RENDERED_ENVIRONMENT_KEYS.join('|')})$`,
+);
 const PLATFORM_CONTRACTS = new Set([
   'wasi:http',
   'wasi:cli',

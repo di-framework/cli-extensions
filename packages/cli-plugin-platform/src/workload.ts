@@ -617,25 +617,48 @@ export async function writeControlSecret(
       return rotated;
     }
 
+    /**
+     * Asks the `tenant-secret-update` policy, with a dry run that stores nothing, whether an
+     * update holding only `keys` would drop a key of the stored Secret. Values are placeholders:
+     * the policy compares key names only. True when the policy refuses it.
+     */
+    const dropsAKey = async (keys: readonly string[]): Promise<boolean> => {
+      const probe = controlSecretDocument(workloadName, connection.namespace, token);
+      const data: Record<string, string> = {};
+      for (const key of keys) data[key] = '';
+      probe.data = data;
+      const checked = await send('replace', probe, '?dryRun=All');
+      if (checked.exitCode === 0) return false;
+      if (checked.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) return true;
+      throw failed('kubectl replace --dry-run', checked);
+    };
+
+    // With app keys declared, a blind update must never be the one to find out that the policy
+    // does not protect them (a caller that is not `di-user-*`, a namespace outside the policy, an
+    // older platform): it would succeed and drop them. The policy must first refuse a dry run
+    // that keeps only DI_CONTROL_IDENTITY, which it does exactly when it applies and the Secret
+    // holds another key.
+    if (declared.length > 0 && !(await dropsAKey(['DI_CONTROL_IDENTITY']))) {
+      throw controlSecretUnguarded(name, connection);
+    }
     const replaced = await send('replace', document);
     if (replaced.exitCode === 0) return rotated;
     if (!replaced.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
       throw failed('kubectl replace', replaced);
     }
     if (declared.length === 0) throw controlSecretForeignKeys(name, connection);
-    // Values are placeholders: a dry run stores nothing, and the policy compares key names only.
-    const probe = controlSecretDocument(
-      workloadName,
-      connection.namespace,
-      token,
-      Object.fromEntries(declared.map((key) => [key, ''])),
-    );
-    const checked = await send('replace', probe, '?dryRun=All');
-    if (checked.exitCode === 0) return { name };
-    if (checked.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
+    if (await dropsAKey([...CONTROL_SECRET_CLI_KEYS, ...declared])) {
       throw controlSecretForeignKeys(name, connection);
     }
-    throw failed('kubectl replace --dry-run', checked);
+    // Kept as it is, so the CLI's keys must be there: a workload without its token would have
+    // no control credentials. Leaving one out must drop a key, which proves it is stored.
+    for (const key of CONTROL_SECRET_CLI_KEYS) {
+      const others = CONTROL_SECRET_CLI_KEYS.filter((other) => other !== key);
+      if (!(await dropsAKey([...others, ...declared]))) {
+        throw controlSecretIncomplete(name, connection, key);
+      }
+    }
+    return { name };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -684,13 +707,53 @@ async function readControlSecret(
   const data: Record<string, string> = {};
   if (stored.data !== null && typeof stored.data === 'object') {
     for (const [key, value] of Object.entries(stored.data as Record<string, unknown>)) {
-      if (typeof value !== 'string') continue;
+      // The API only returns strings. Anything else cannot be carried over, so fail closed.
+      if (typeof value !== 'string') {
+        throw new CommandFailure(
+          'WASMCLOUD_TOOL_FAILED',
+          `kubectl get returned a control Secret ${name} whose ${key} is not a string`,
+          3,
+          { command: 'kubectl get', name, key },
+        );
+      }
       data[key] = value;
       secrets.push(value, Buffer.from(value, 'base64').toString('utf8'));
     }
   }
   const resourceVersion = stored.metadata?.resourceVersion;
   return typeof resourceVersion === 'string' ? { data, resourceVersion } : { data };
+}
+
+/** The `tenant-secret-update` policy did not protect the Secret, so a blind update could drop keys. */
+function controlSecretUnguarded(name: string, connection: ClusterConnection): CommandFailure {
+  return new CommandFailure(
+    'WASMCLOUD_CONTROL_SECRET_UNGUARDED',
+    `Refusing to replace the control Secret ${name} blind: the platform accepted a dry-run ` +
+      'update that drops DI_CONTROL_TOKEN, so either its tenant-secret-update policy does not ' +
+      'apply to this caller or the Secret has no DI_CONTROL_TOKEN. A replace could then drop ' +
+      'the declared app keys, which this caller cannot read back. Deploy as a tenant developer ' +
+      '(di-user-*) or as a caller that may read Secrets, or have the app tooling write ' +
+      `DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY into ${name} in ${connection.namespace}`,
+    2,
+    { name, namespace: connection.namespace },
+  );
+}
+
+/** The Secret holds declared app keys but lacks one of the CLI's keys. */
+function controlSecretIncomplete(
+  name: string,
+  connection: ClusterConnection,
+  key: string,
+): CommandFailure {
+  return new CommandFailure(
+    'WASMCLOUD_CONTROL_SECRET_INCOMPLETE',
+    `The control Secret ${name} holds declared app keys but no ${key}, so the workload would ` +
+      'have no control credentials. The tooling that writes the app keys must also write ' +
+      'non-empty DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY (the workload name); fix the Secret, ' +
+      `or delete it with \`kubectl delete secret ${name} --namespace ${connection.namespace}\` and redeploy`,
+    2,
+    { name, namespace: connection.namespace, key },
+  );
 }
 
 /**
@@ -727,12 +790,15 @@ function controlSecretWriteFailed(
   result: { exitCode: number; stderr: string },
   secrets: readonly string[],
 ): CommandFailure {
-  const scrub = secrets
-    .flatMap((secret) => [secret, Buffer.from(secret, 'utf8').toString('base64')])
-    .filter((secret) => secret.length >= 4)
+  const scrub = [
+    ...new Set(
+      secrets.flatMap((secret) => [secret, Buffer.from(secret, 'utf8').toString('base64')]),
+    ),
+  ]
+    .filter((secret) => secret.length > 0)
     .sort((a, b) => b.length - a.length);
   const stderr = sanitizePublicText(
-    scrub.reduce((text, secret) => text.split(secret).join('[redacted]'), result.stderr).trim(),
+    scrub.reduce((text, secret) => redact(text, secret), result.stderr).trim(),
   );
   if (kubectlStatusReason(stderr) === 'Conflict') {
     return new CommandFailure(
@@ -748,6 +814,20 @@ function controlSecretWriteFailed(
     `${command} failed with exit code ${result.exitCode}${reason}`,
     3,
     { command, exitCode: result.exitCode, stderr },
+  );
+}
+
+/** Shorter values are only redacted as whole tokens, so `on` does not blank every `json`. */
+const SHORT_SECRET = 4;
+const TOKEN_CHARACTER = '[A-Za-z0-9+/=_.-]';
+
+/** `text` with every occurrence of `secret` replaced by `[redacted]`. */
+function redact(text: string, secret: string): string {
+  if (secret.length >= SHORT_SECRET) return text.split(secret).join('[redacted]');
+  const escaped = secret.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
+  return text.replace(
+    new RegExp(`(?<!${TOKEN_CHARACTER})${escaped}(?!${TOKEN_CHARACTER})`, 'g'),
+    '[redacted]',
   );
 }
 
