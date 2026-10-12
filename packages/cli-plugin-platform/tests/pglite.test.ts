@@ -22,12 +22,16 @@ import {
   cacheRoot,
   EXCLUSIVE_INSTANCE_KEY,
   isWithin,
+  PGLITE_ENCFS,
+  PGLITE_ENCFS_WASM_ENV,
+  PGLITE_ENCFS_WASM_FILE,
   PGLITE_WASM_ENV,
   PGLITE_WASM_FILE,
   parseDigestReference,
   parsePgliteConfig,
   pullPgliteComponent,
   resolvePgliteComponent,
+  resolvePgliteEncryption,
   STALE_STAGING_MS,
   verifyLayer,
   verifyManifest,
@@ -1019,5 +1023,304 @@ describe('pglite deploy', () => {
     const path = join(greeter, 'vendor', 'pglite.wasm');
     expect(result.data.pglite).toEqual({ source: 'local', path });
     expect(result.text).toContain(` PGlite: local ${path} (unverified).`);
+  });
+});
+
+describe('pglite encryption', () => {
+  const ENC_REPOSITORY = 'ghcr.io/di-framework/pglite-encfs';
+  const LAYER = Buffer.from('\0asm\x01\0\0\0pglite-encfs');
+  const ENC_MANIFEST = manifestFor(LAYER);
+  const ENC_IMAGE = `${ENC_REPOSITORY}@${digestOf(ENC_MANIFEST)}`;
+  const GUEST =
+    'import { open } from "di-framework:pglite/database@0.2.0";\nexport default open;\n';
+  const WIT = 'world application {\n  export wasi:http/handler@0.3.0;\n}\n';
+  const parse = (value: unknown) => parsePgliteConfig(value, CONFIG_PATH, toProject);
+
+  /** oras serving the provider and the encryption layer, each by its own pin. */
+  function twoImageRegistry(
+    invocations: RunnerInvocation[],
+  ): (args: readonly string[]) => { exitCode: number; stdout: string; stderr: string } {
+    const blobs = new Map<string, Buffer>([
+      [IMAGE, MANIFEST],
+      [ENC_IMAGE, ENC_MANIFEST],
+      [`${REPOSITORY}@${digestOf(PROVIDER)}`, PROVIDER],
+      [`${ENC_REPOSITORY}@${digestOf(LAYER)}`, LAYER],
+    ]);
+    return (args) => {
+      invocations.push({ command: 'oras', args: [...args], cwd: '', captured: true });
+      const output = args[args.indexOf('--output') + 1] as string;
+      const bytes = blobs.get(args[args.length - 1] as string);
+      if (bytes === undefined) return { exitCode: 1, stdout: '', stderr: 'not found' };
+      mkdirSync(dirname(output), { recursive: true });
+      writeFileSync(output, bytes);
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+  }
+
+  function project(
+    pglite: Record<string, unknown>,
+    controlSecretKeys: string[] | null = ['ISSUER_URL', 'DI_PGLITE_KEY'],
+  ): string {
+    const root = makeProject({
+      name: 'Orders',
+      entry: 'src/app.ts',
+      pglite,
+      ...(controlSecretKeys === null ? {} : { controlSecretKeys }),
+    });
+    mkdirSync(join(root, 'vendor'), { recursive: true });
+    writeFileSync(join(root, 'vendor', 'pglite.wasm'), PROVIDER);
+    writeFileSync(join(root, 'vendor', 'encfs.wasm'), LAYER);
+    return root;
+  }
+
+  function buildDeps(
+    root: string,
+    options: {
+      invocations?: RunnerInvocation[];
+      env?: Record<string, string>;
+      exitCodes?: Record<string, number>;
+      cache?: string;
+    } = {},
+  ): WasmcloudDeps {
+    const invocations = options.invocations ?? [];
+    const base = fakeDeps({
+      cwd: root,
+      assets: makeAssets(),
+      invocations,
+      env: {
+        [CACHE_DIR_ENV]: options.cache ?? mkdtempSync(join(tmpdir(), 'pglite-cache-')),
+        ...options.env,
+      },
+      exitCodes: options.exitCodes,
+      bundleContents: GUEST,
+      componentOutput: () => '\0asm pglite-import',
+      capturedStdout: { wit: WIT },
+      captures: { oras: 'Version: 1.3.4' },
+    });
+    const oras = twoImageRegistry(invocations);
+    return {
+      ...base,
+      runCaptured: async (command, args, runOptions) =>
+        command === 'oras' ? oras(args) : base.runCaptured(command, args, runOptions),
+    };
+  }
+
+  it('parses a digest-pinned or local encryption layer and rejects anything else', () => {
+    expect(parse({ image: IMAGE, encryption: { image: ENC_IMAGE } })?.encryption).toEqual({
+      image: ENC_IMAGE,
+    });
+    expect(
+      parse({ image: IMAGE, encryption: { image: ENC_IMAGE, wasm: 'vendor/encfs.wasm' } })
+        ?.encryption,
+    ).toEqual({ image: ENC_IMAGE, wasm: '/project/vendor/encfs.wasm' });
+    expect(parse({ image: IMAGE })).not.toHaveProperty('encryption');
+    for (const encryption of [
+      null,
+      [],
+      'on',
+      {},
+      { image: 1 },
+      { image: `${ENC_REPOSITORY}:0.1.0` },
+      { wasm: '' },
+      { image: ENC_IMAGE, mode: 'required' },
+    ]) {
+      expectFailure(() => parse({ image: IMAGE, encryption }), 'WASMCLOUD_CONFIG_INVALID', 2);
+    }
+    expect(() => parse({ image: IMAGE, encryption: {} })).toThrow(
+      `pglite.encryption needs "image" (${ENC_REPOSITORY}@sha256:<digest>) or a local "wasm" path`,
+    );
+    expect(() => parse({ image: IMAGE, encryption: { image: `${ENC_REPOSITORY}:0.1.0` } })).toThrow(
+      `pglite.encryption.image: "${ENC_REPOSITORY}:0.1.0" is not pinned by digest. Use ${ENC_REPOSITORY}@sha256`,
+    );
+    expect(() => parse({ image: IMAGE, encryption: { image: ENC_IMAGE, mode: 'x' } })).toThrow(
+      'pglite.encryption has unsupported fields: mode. Use image, wasm',
+    );
+    expect(() => parse({ image: IMAGE, encryption: null })).toThrow(
+      'pglite.encryption must be an object',
+    );
+  });
+
+  it('pulls and verifies the layer by digest, plugs it into the provider, then the provider into the guest', async () => {
+    const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
+    const invocations: RunnerInvocation[] = [];
+    const cache = mkdtempSync(join(tmpdir(), 'pglite-cache-'));
+    const { io, stdout } = captureIo();
+    const summary = await buildComponent(
+      loadProject(root),
+      io,
+      buildDeps(root, { invocations, cache }),
+    );
+    expect(summary.pglite).toEqual({
+      source: 'registry',
+      image: IMAGE,
+      encryption: { source: 'registry', image: ENC_IMAGE },
+    });
+    const generated = join(root, '.di-framework');
+    const provider = join(generated, PGLITE_WASM_FILE);
+    const layer = join(generated, PGLITE_ENCFS_WASM_FILE);
+    const plugs = invocations.filter((entry) => entry.args[0] === 'plug');
+    expect(plugs.map((entry) => entry.args)).toEqual([
+      ['plug', '--plug', layer, provider, '-o', `${provider}.encrypted`],
+      [
+        'plug',
+        '--plug',
+        provider,
+        join(root, 'dist', 'orders.wasm'),
+        '-o',
+        `${join(root, 'dist', 'orders.wasm')}.composed`,
+      ],
+    ]);
+    expect(readFileSync(layer).equals(LAYER)).toBe(true);
+    // The provider the guest got is the encrypted composition, not the pulled bytes.
+    expect(readFileSync(provider, 'utf8')).toBe('composed-sqlite-component');
+    expect(existsSync(`${provider}.encrypted`)).toBe(false);
+    // The layer is cached under its own digest and file name.
+    const entry = cacheEntry({ [CACHE_DIR_ENV]: cache }, digestOf(ENC_MANIFEST));
+    expect(readFileSync(join(entry, PGLITE_ENCFS_WASM_FILE)).equals(LAYER)).toBe(true);
+    expect(stdout.join('')).toContain('Composing the PGlite encryption layer into the provider...');
+    const build = JSON.parse(readFileSync(join(generated, 'build.json'), 'utf8'));
+    expect(build.pglite.encryption).toEqual({ source: 'registry', image: ENC_IMAGE });
+
+    // The layer is part of the rollout key: the same guest without it deploys differently.
+    const plain = project({ image: IMAGE });
+    const unencrypted = await buildComponent(loadProject(plain), captureIo().io, buildDeps(plain));
+    expect(unencrypted.pglite).toEqual({ source: 'registry', image: IMAGE });
+    expect(unencrypted.deploymentDigest).not.toBe(summary.deploymentDigest);
+  });
+
+  it('fails the build when DI_PGLITE_KEY is not a declared control Secret key', async () => {
+    for (const keys of [null, ['ISSUER_URL']]) {
+      const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } }, keys);
+      const invocations: RunnerInvocation[] = [];
+      await expect(
+        buildComponent(loadProject(root), captureIo().io, buildDeps(root, { invocations })),
+      ).rejects.toMatchObject({
+        code: 'WASMCLOUD_PGLITE_KEY_UNDECLARED',
+        exitCode: 2,
+        message:
+          'Orders turns on "pglite.encryption", whose layer reads its key from DI_PGLITE_KEY in ' +
+          'the workload\'s control Secret; add "DI_PGLITE_KEY" to "controlSecretKeys" in di-framework.config.json',
+      });
+      // Nothing was pulled for the layer.
+      expect(
+        invocations.some((entry) => entry.args.some((arg) => arg.includes(ENC_REPOSITORY))),
+      ).toBe(false);
+    }
+  });
+
+  it('uses a local layer only outside deploys and CI unless opted in', async () => {
+    const root = project({
+      image: IMAGE,
+      encryption: { image: ENC_IMAGE, wasm: 'vendor/encfs.wasm' },
+    });
+    const local = join(root, 'vendor', 'encfs.wasm');
+    await expect(
+      buildComponent(loadProject(root), captureIo().io, buildDeps(root), { deploy: true }),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_LOCAL_REFUSED',
+      message:
+        `Refusing the unverified local PGlite encryption layer ${local} (from pglite.encryption.wasm) in deploy; ` +
+        `pin "pglite.encryption.image" by digest, or set ${ALLOW_LOCAL_PGLITE_ENV}=1 to use it anyway`,
+    });
+    const { io, stderr } = captureIo();
+    const summary = await buildComponent(
+      loadProject(root),
+      io,
+      buildDeps(root, { env: { [ALLOW_LOCAL_PGLITE_ENV]: '1' } }),
+      { deploy: true },
+    );
+    expect(summary.pglite?.encryption).toEqual({ source: 'local', path: local });
+    expect(stderr.join('')).toContain(
+      `Warning: using the local, unverified PGlite encryption layer ${local} (from pglite.encryption.wasm) instead of the pinned ${ENC_IMAGE}`,
+    );
+  });
+
+  it('prefers the environment override for the layer', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pglite-encfs-'));
+    writeFileSync(join(dir, 'env.wasm'), LAYER);
+    const { io, stderr } = captureIo();
+    const resolved = await resolvePgliteEncryption(
+      { image: ENC_IMAGE },
+      io,
+      { ...registryDeps({ cwd: dir }), env: { [PGLITE_ENCFS_WASM_ENV]: 'env.wasm' } },
+      dir,
+    );
+    expect(resolved).toMatchObject({ source: 'local', path: join(dir, 'env.wasm') });
+    expect(stderr.join('')).toContain(`(from ${PGLITE_ENCFS_WASM_ENV}) instead of the pinned`);
+    await expect(
+      resolvePgliteEncryption({ wasm: join(dir, 'missing.wasm') }, io, registryDeps(), dir),
+    ).rejects.toThrow(
+      `PGlite encryption layer ${join(dir, 'missing.wasm')} (from pglite.encryption.wasm) does not exist`,
+    );
+    await expect(
+      pullPgliteComponent(
+        ENC_IMAGE,
+        captureIo().io,
+        registryDeps({ oras: undefined }),
+        dir,
+        PGLITE_ENCFS,
+      ),
+    ).rejects.toThrow(`set ${PGLITE_ENCFS_WASM_ENV} to a local build`);
+    await expect(
+      pullPgliteComponent(
+        ENC_IMAGE,
+        captureIo().io,
+        registryDeps({ exitCodes: { 'manifest fetch': 1 } }),
+        dir,
+        PGLITE_ENCFS,
+      ),
+    ).rejects.toThrow(`offline, set ${PGLITE_ENCFS_WASM_ENV} or pglite.encryption.wasm`);
+  });
+
+  it('reports a failed encryption composition', async () => {
+    const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
+    await expect(
+      buildComponent(
+        loadProject(root),
+        captureIo().io,
+        buildDeps(root, { exitCodes: { '--plug': 1 } }),
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_PGLITE_ENCRYPTION_COMPOSE_FAILED', exitCode: 3 });
+
+    // wac exiting 0 without writing the component is a failure too.
+    const deps = buildDeps(root);
+    const runCaptured = deps.runCaptured;
+    deps.runCaptured = async (command, args, options) =>
+      args[0] === 'plug' && args.includes(join(root, '.di-framework', PGLITE_ENCFS_WASM_FILE))
+        ? { exitCode: 0, stdout: '', stderr: '' }
+        : runCaptured(command, args, options);
+    await expect(buildComponent(loadProject(root), captureIo().io, deps)).rejects.toThrow(
+      'Composition of the PGlite encryption layer into the provider failed: wac wrote no component',
+    );
+  });
+
+  it('reports the layer in the deploy result', async () => {
+    const { greeter } = makeWorkspace();
+    const configPath = join(greeter, 'di-framework.config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        ...config,
+        controlSecretKeys: ['DI_PGLITE_KEY'],
+        pglite: { image: IMAGE, encryption: { wasm: 'vendor/encfs.wasm' } },
+      })}\n`,
+    );
+    mkdirSync(join(greeter, 'vendor'), { recursive: true });
+    writeFileSync(join(greeter, 'vendor', 'encfs.wasm'), LAYER);
+    const result = await runWasmcloudDeploy(
+      ['--target', 'development'],
+      captureIo().io,
+      buildDeps(greeter, { env: { [ALLOW_LOCAL_PGLITE_ENV]: '1' } }),
+    );
+    const layer = join(greeter, 'vendor', 'encfs.wasm');
+    expect(result.data.pglite).toEqual({
+      source: 'registry',
+      image: IMAGE,
+      encryption: { source: 'local', path: layer },
+    });
+    expect(result.text).toContain(
+      ` PGlite: ${IMAGE}, encrypted at rest by local ${layer} (unverified).`,
+    );
   });
 });
