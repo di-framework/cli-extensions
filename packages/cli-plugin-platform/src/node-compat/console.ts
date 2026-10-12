@@ -6,12 +6,27 @@ type LogWriter = (level: Level, context: string, message: string) => void;
 /** Context passed with every guest console line; the host tags it with the workload. */
 export const CONSOLE_LOG_CONTEXT = 'console';
 
+/**
+ * WIT s64/u64 values (SQLite integers, row counts, timestamps) arrive as BigInt since
+ * componentize-qjs 0.4.4-di.5, and JSON.stringify throws on BigInt.
+ *
+ * Convention: a top-level BigInt prints as Node's console does (`42n`). A BigInt nested
+ * in an object or array prints as the JSON string `"42n"` (`{"id":"42n"}`, where Node
+ * would print `{ id: 42n }`), so each line stays valid JSON for log consumers. A JSON
+ * reader therefore cannot tell BigInt `42n` from the string `"42n"`; treat a string
+ * matching `/^-?\d+n$/` as a BigInt when that matters.
+ */
+function bigintReplacer(_key: string, value: unknown): unknown {
+  return typeof value === 'bigint' ? `${value}n` : value;
+}
+
 function formatValue(value: unknown): string {
   if (typeof value === 'string') return value;
   if (value instanceof Error) return value.stack ?? `${value.name}: ${value.message}`;
+  if (typeof value === 'bigint') return `${value}n`;
   if (typeof value !== 'object' || value === null) return String(value);
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(value, bigintReplacer);
   } catch {
     return String(value);
   }

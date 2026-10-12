@@ -1,7 +1,8 @@
 import { toBytes, toNodeBuffer } from './bytes';
 import { createHash, createHmac, Hash, Hmac } from './crypto-hash';
 import { getRandomValues, randomUUID, subtle, webcrypto } from './crypto-subtle';
-import { getRandomBytes } from './wasi-random';
+import { invalidArgType, outOfRange } from './node-errors';
+import { fillRandom, getRandomBytes, RANDOM_SIZE_MAX } from './wasi-random';
 
 export { createHash, createHmac, getRandomValues, Hash, Hmac, randomUUID, subtle, webcrypto };
 
@@ -23,6 +24,9 @@ export function randomBytes(
   size: number,
   callback?: (error: Error | null, buffer: Uint8Array) => void,
 ): Uint8Array | undefined {
+  if (callback !== undefined && typeof callback !== 'function') {
+    throw invalidArgType('callback', 'of type function', callback);
+  }
   const bytes = toNodeBuffer(getRandomBytes(size));
   if (typeof callback === 'function') {
     queueMicrotask(() => callback(null, bytes));
@@ -31,42 +35,90 @@ export function randomBytes(
   return bytes;
 }
 
-export function randomFillSync<T extends ArrayBufferView>(
+type RandomTarget = ArrayBufferView | ArrayBuffer;
+
+function randomTargetBytes(buffer: unknown): { view: Uint8Array; elementSize: number } {
+  if (ArrayBuffer.isView(buffer)) {
+    return {
+      view: new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength),
+      elementSize: (buffer as { BYTES_PER_ELEMENT?: number }).BYTES_PER_ELEMENT || 1,
+    };
+  }
+  if (buffer instanceof ArrayBuffer) return { view: new Uint8Array(buffer), elementSize: 1 };
+  throw invalidArgType('buf', 'an instance of ArrayBuffer or ArrayBufferView', buffer);
+}
+
+/** Node v22 `assertOffset`: offsets count elements, are bounded by the byte length, and truncate. */
+function randomOffset(offset: unknown, elementSize: number, byteLength: number): number {
+  if (typeof offset !== 'number') throw invalidArgType('offset', 'of type number', offset);
+  const bytes = offset * elementSize;
+  const max = Math.min(byteLength, RANDOM_SIZE_MAX);
+  if (Number.isNaN(bytes) || bytes > max || bytes < 0) {
+    throw outOfRange('offset', `>= 0 && <= ${max}`, bytes);
+  }
+  return Math.trunc(bytes);
+}
+
+/** Node v22 `assertSize`: sizes count elements and must fit after the offset. */
+function randomSize(size: unknown, elementSize: number, offset: number, byteLength: number) {
+  if (typeof size !== 'number') throw invalidArgType('size', 'of type number', size);
+  const bytes = size * elementSize;
+  if (Number.isNaN(bytes) || bytes > RANDOM_SIZE_MAX || bytes < 0) {
+    throw outOfRange('size', `>= 0 && <= ${RANDOM_SIZE_MAX}`, bytes);
+  }
+  if (bytes + offset > byteLength)
+    throw outOfRange('size + offset', `<= ${byteLength}`, bytes + offset);
+  return Math.trunc(bytes);
+}
+
+function fillRange(view: Uint8Array, offset: number, size: number): void {
+  if (size > 0) fillRandom(view.subarray(offset, offset + size));
+}
+
+export function randomFillSync<T extends RandomTarget>(
   buffer: T,
-  offset?: number,
+  offset: number = 0,
   size?: number,
 ): T {
-  const view = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  const start = offset ?? 0;
-  const length = size ?? view.length - start;
-  view.set(getRandomBytes(length), start);
+  const { view, elementSize } = randomTargetBytes(buffer);
+  const start = randomOffset(offset, elementSize, view.byteLength);
+  const length =
+    size === undefined
+      ? view.byteLength - start
+      : randomSize(size, elementSize, start, view.byteLength);
+  fillRange(view, start, length);
   return buffer;
 }
 
-export function randomFill<T extends ArrayBufferView>(
+export function randomFill<T extends RandomTarget>(
   buffer: T,
   offset?: number | ((error: Error | null, buffer: T) => void),
   size?: number | ((error: Error | null, buffer: T) => void),
   callback?: (error: Error | null, buffer: T) => void,
 ): undefined | T {
+  const { view, elementSize } = randomTargetBytes(buffer);
   let start = 0;
-  let length: number | undefined;
+  let length = view.byteLength;
   let cb: ((error: Error | null, buffer: T) => void) | undefined;
   if (typeof offset === 'function') cb = offset;
-  else {
-    start = offset ?? 0;
-    if (typeof size === 'function') cb = size;
-    else {
-      length = size;
-      cb = callback;
-    }
+  else if (typeof size === 'function') {
+    cb = size;
+    start = randomOffset(offset, elementSize, view.byteLength);
+    length = view.byteLength - start;
+  } else {
+    cb = callback;
+    start = randomOffset(offset ?? 0, elementSize, view.byteLength);
+    length =
+      size === undefined
+        ? view.byteLength - start
+        : randomSize(size, elementSize, start, view.byteLength);
   }
-  const filled = randomFillSync(buffer, start, length);
+  fillRange(view, start, length);
   if (cb !== undefined) {
-    queueMicrotask(() => cb(null, filled));
+    queueMicrotask(() => cb(null, buffer));
     return undefined;
   }
-  return filled;
+  return buffer;
 }
 
 export function randomInt(

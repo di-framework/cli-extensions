@@ -172,6 +172,14 @@ declares an unnamed `wasi:logging` host interface (`interfaces: [logging]`). `pl
 links it only for `wash`; wasmtime and jco cannot provide it, so those builds keep a
 console that discards output.
 
+Guest console lines format values the way Node's console does where JSON allows it.
+WIT `s64`/`u64` values (SQLite integers, row counts, timestamps) reach JavaScript as
+BigInt. A top-level BigInt prints as `42n`, as in Node, so `console.log(3n)` writes `3n`
+rather than `3`. A BigInt nested in an object or array prints as the JSON string `"42n"`
+(`{"id":"42n"}`, where Node prints `{ id: 42n }`) so the line stays valid JSON. Log
+tooling cannot tell that value from the string `"42n"`; treat a string field matching
+`^-?\d+n$` as a BigInt where the difference matters.
+
 Logs are on by default. Set `"logs": false` in `di-framework.config.json` to opt a project out:
 
 ```json

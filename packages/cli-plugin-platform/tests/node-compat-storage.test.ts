@@ -23,7 +23,21 @@ function wasi<T>(run: () => T): T {
   }
 }
 
-/** A wasi:filesystem@0.2.12 descriptor over a real directory, as the host preopens it. */
+/** Lower a WIT u64 argument the way componentize-qjs 0.4.4-di.5 does, trapping otherwise. */
+function u64(value: number | bigint): number {
+  const valid =
+    typeof value === 'bigint'
+      ? value >= 0n && value <= 0xffff_ffff_ffff_ffffn
+      : Number.isSafeInteger(value) && value >= 0;
+  if (!valid) throw new Error(`u64 lowering trap: ${String(value)}`);
+  return Number(value);
+}
+
+/**
+ * A wasi:filesystem@0.2.12 descriptor over a real directory, as the host preopens it.
+ * `filesize` (u64) arguments and results follow componentize-qjs 0.4.4-di.5: BigInt
+ * results, BigInt or safe-integer arguments.
+ */
 class HostDescriptor implements WasiDescriptor {
   constructor(readonly path: string) {}
   openAt(
@@ -39,14 +53,17 @@ class HostDescriptor implements WasiDescriptor {
       return new HostDescriptor(path);
     });
   }
-  read(length: number, offset: number): [Uint8Array, boolean] {
+  read(lengthArg: number, offsetArg: number | bigint): [Uint8Array, boolean] {
+    const length = u64(lengthArg);
+    const offset = u64(offsetArg);
     const data = host.readFileSync(this.path).subarray(offset, offset + length);
     return [new Uint8Array(data), offset + data.byteLength >= host.statSync(this.path).size];
   }
-  write(buffer: Uint8Array, offset: number): number {
+  write(buffer: Uint8Array, offset: number): bigint {
+    const position = u64(offset);
     const fd = host.openSync(this.path, 'r+');
     try {
-      return host.writeSync(fd, buffer, 0, buffer.byteLength, offset);
+      return BigInt(host.writeSync(fd, buffer, 0, buffer.byteLength, position));
     } finally {
       host.closeSync(fd);
     }
@@ -210,6 +227,126 @@ describe('guest storage under /data', () => {
     expect(new TextDecoder().decode(buffer)).toBe('Jello');
     expect(fs.readSync(reader, buffer, 0, 5, 6)).toBe(5);
     expect(new TextDecoder().decode(buffer)).toBe('world');
+    // u64 offsets/lengths never reach the descriptor unless they are valid.
+    // Every expectation below was checked against Node v22.23.2's fs.readSync/writeSync.
+    expect(fs.readSync(reader, buffer, 0, 1, 6n)).toBe(1);
+    expect(new TextDecoder().decode(buffer.subarray(0, 1))).toBe('w');
+    expect(fs.readSync(reader, buffer, 0, 1, -1)).toBe(1);
+    expect(new TextDecoder().decode(buffer.subarray(0, 1))).toBe(' ');
+    // A BigInt position past MAX_SAFE_INTEGER reaches the descriptor as a BigInt: EOF.
+    expect(fs.readSync(reader, buffer, 0, 1, 2n ** 60n)).toBe(0);
+    // Node truncates length with `| 0` and returns 0 before any other check.
+    for (const [offset, length, position] of [
+      [6, 0, 0],
+      [0, 0.5, 0],
+      [0, 0, -2],
+      [0, 0, 1.5],
+      [0, undefined, 0],
+    ] as const) {
+      expect(fs.readSync(reader, buffer, offset, length, position)).toBe(0);
+    }
+    expect(fs.readSync(999, buffer, 0, 0, 0)).toBe(0);
+    expect(fs.readSync(reader, buffer, 0, 1.5, 0)).toBe(1);
+    expect(fs.readSync(reader, buffer, { offset: 1, length: 2, position: 6 })).toBe(2);
+    expect(new TextDecoder().decode(buffer.subarray(1, 3))).toBe('wo');
+    const max = Number.MAX_SAFE_INTEGER;
+    for (const [offset, length, position, message] of [
+      [
+        0,
+        1,
+        -2,
+        `The value of "position" is out of range. It must be >= -1 && <= ${max}. Received -2`,
+      ],
+      [0, 1, 1.5, 'The value of "position" is out of range. It must be an integer. Received 1.5'],
+      [
+        0,
+        1,
+        2 ** 60,
+        `The value of "position" is out of range. It must be >= -1 && <= ${max}. Received 1_152_921_504_606_847_000`,
+      ],
+      [
+        0,
+        1,
+        2n ** 63n,
+        'The value of "position" is out of range. It must be >= -1 && <= 9223372036854775806. Received 9_223_372_036_854_775_808n',
+      ],
+      [
+        0,
+        1,
+        -2n,
+        'The value of "position" is out of range. It must be >= -1 && <= 9223372036854775806. Received -2n',
+      ],
+      [0, -1, 0, 'The value of "length" is out of range. It must be >= 0. Received -1'],
+      [0, 6, 0, 'The value of "length" is out of range. It must be <= 5. Received 6'],
+      [6, 1, 0, 'The value of "length" is out of range. It must be <= -1. Received 1'],
+      [
+        -1,
+        1,
+        0,
+        `The value of "offset" is out of range. It must be >= 0 && <= ${max}. Received -1`,
+      ],
+      [1.5, 1, 0, 'The value of "offset" is out of range. It must be an integer. Received 1.5'],
+    ] as const) {
+      expect(() => fs.readSync(reader, buffer, offset, length, position)).toThrow(
+        expect.objectContaining({ code: 'ERR_OUT_OF_RANGE', message }),
+      );
+    }
+    for (const [args, message] of [
+      [[1], 'The "options" argument must be of type object. Received type number (1)'],
+      [['1', 1, 0], `The "offset" argument must be of type number. Received type string ('1')`],
+      [
+        [0, 1, '1'],
+        `The "position" argument must be of type bigint or integer. Received type string ('1')`,
+      ],
+    ] as const) {
+      expect(() => fs.readSync(reader, buffer, ...(args as unknown as [number]))).toThrow(
+        expect.objectContaining({ code: 'ERR_INVALID_ARG_TYPE', message }),
+      );
+    }
+    expect(() => fs.readSync(reader, 'x' as never, 0, 1, 0)).toThrow(
+      expect.objectContaining({ code: 'ERR_INVALID_ARG_TYPE' }),
+    );
+    expect(() => fs.readSync(reader, new Uint8Array(), 0, 1, 0)).toThrow(
+      expect.objectContaining({ code: 'ERR_INVALID_ARG_VALUE' }),
+    );
+    fs.closeSync(reader);
+
+    // Strings use Node's `writeSync(fd, string, position, encoding)` form.
+    const positioned = fs.openSync('/data/log', 'r+');
+    expect(fs.writeSync(positioned, 'H', 0)).toBe(1);
+    expect(fs.writeSync(positioned, '6565', 1, 'hex')).toBe(2);
+    expect(fs.readFileSync('/data/log', 'utf8')).toBe('Heelo world!');
+    // A position that is not a non-negative safe integer writes at the current
+    // position (still 0 here), BigInt and fractions included.
+    expect(fs.writeSync(positioned, 'J', 5n as unknown as number)).toBe(1);
+    expect(fs.writeSync(positioned, new TextEncoder().encode('e'), 0, 1, 1.5)).toBe(1);
+    expect(fs.writeSync(positioned, 'l', Number.NaN)).toBe(1);
+    expect(fs.writeSync(positioned, 'l', -2)).toBe(1);
+    expect(fs.readFileSync('/data/log', 'utf8')).toBe('Jello world!');
+    const bytes = new TextEncoder().encode('xHy');
+    expect(fs.writeSync(positioned, bytes, { offset: 1, length: 1, position: 0 })).toBe(1);
+    expect(fs.writeSync(positioned, bytes, 2, undefined, 4)).toBe(1);
+    expect(fs.writeSync(positioned, bytes, 3, 0, 0)).toBe(0);
+    expect(fs.readFileSync('/data/log', 'utf8')).toBe('Helly world!');
+    for (const [offset, length, message] of [
+      [-1, 1, `The value of "offset" is out of range. It must be >= 0 && <= ${max}. Received -1`],
+      [1.5, 1, 'The value of "offset" is out of range. It must be an integer. Received 1.5'],
+      [4, 0, 'The value of "offset" is out of range. It must be <= 3. Received 4'],
+      [0, 4, 'The value of "length" is out of range. It must be <= 3. Received 4'],
+      [0, -1, 'The value of "length" is out of range. It must be >= 0. Received -1'],
+      [0, 0.5, 'The value of "length" is out of range. It must be an integer. Received 0.5'],
+    ] as const) {
+      expect(() => fs.writeSync(positioned, bytes, offset, length, 0)).toThrow(
+        expect.objectContaining({ code: 'ERR_OUT_OF_RANGE', message }),
+      );
+    }
+    expect(() => fs.writeSync(positioned, 'abc', 0, 'hex')).toThrow(
+      expect.objectContaining({ code: 'ERR_INVALID_ARG_VALUE' }),
+    );
+    expect(() => fs.writeSync(positioned, 5 as never)).toThrow(
+      expect.objectContaining({ code: 'ERR_INVALID_ARG_TYPE' }),
+    );
+    fs.closeSync(positioned);
     const created = fs.openSync('/data/new', 'a+');
     fs.closeSync(created);
     expect(fs.readFileSync('/data/new', 'utf8')).toBe('');
@@ -292,8 +429,8 @@ describe('guest storage under /data', () => {
           },
         });
       }
-      override write(): number {
-        return 0;
+      override write(): bigint {
+        return 0n;
       }
       override read(length: number, offset: number): [Uint8Array, boolean] {
         const [data] = super.read(length, offset);

@@ -1,3 +1,4 @@
+import { invalidArgType, invalidArgValue, outOfRange, validateInteger } from './node-errors';
 import { nodeCompatSeed } from './seed-virtual';
 import { type Storage, storage as wasiStorage } from './storage';
 
@@ -272,55 +273,198 @@ export function closeSync(fd: number): void {
   if (!openHandles.delete(fd)) throw errno('EBADF', 'close', String(fd), -9);
 }
 
+type ReadOptions = {
+  offset?: number;
+  length?: number;
+  position?: number | bigint | null;
+};
+
+type WriteOptions = {
+  offset?: number;
+  length?: number;
+  position?: number | null;
+};
+
+function validateView(buffer: unknown): asserts buffer is ArrayBufferView {
+  if (!ArrayBuffer.isView(buffer)) {
+    throw invalidArgType('buffer', 'an instance of Buffer, TypedArray, or DataView', buffer);
+  }
+}
+
+function viewBytes(buffer: ArrayBufferView): Uint8Array {
+  return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+}
+
+/**
+ * Node v22 `fs.readSync` argument handling, so only valid u64 lengths and offsets reach
+ * the stored descriptor (componentize-qjs 0.4.4-di.5+ traps on any other Number):
+ * three arguments (or an object) are options; `length` is truncated with `| 0` and a
+ * zero length returns before any other check; `position` `null`/`-1`/`-1n` means the
+ * current position. Returns `null` for a zero-length read.
+ */
+function readRange(
+  buffer: ArrayBufferView,
+  args: readonly unknown[],
+): { offset: number; length: number; position: number | bigint | null } | null {
+  let offset = args[0];
+  let length = args[1];
+  let position = args[2];
+  if (args.length <= 1 || typeof offset === 'object') {
+    if (offset !== undefined && offset !== null && typeof offset !== 'object') {
+      throw invalidArgType('options', 'of type object', offset);
+    }
+    const options = (offset ?? {}) as ReadOptions;
+    offset = options.offset ?? 0;
+    length = options.length ?? buffer.byteLength - (offset as number);
+    position = options.position ?? null;
+  }
+  const start = offset === undefined ? 0 : validateInteger(offset, 'offset', 0);
+  const count = (length as number) | 0;
+  if (count === 0) return null;
+  if (buffer.byteLength === 0) {
+    throw invalidArgValue('buffer', 'is empty and cannot be written', '<Buffer >');
+  }
+  if (count < 0) throw outOfRange('length', '>= 0', count);
+  if (start + count > buffer.byteLength) {
+    throw outOfRange('length', `<= ${buffer.byteLength - start}`, count);
+  }
+  if (position === null || position === undefined)
+    return { offset: start, length: count, position: null };
+  if (typeof position === 'number') {
+    validateInteger(position, 'position', -1);
+    return { offset: start, length: count, position: position === -1 ? null : position };
+  }
+  if (typeof position === 'bigint') {
+    const max = 2n ** 63n - 1n - BigInt(count);
+    if (!(position >= -1n && position <= max)) {
+      throw outOfRange('position', `>= -1 && <= ${max}`, position);
+    }
+    return { offset: start, length: count, position: position === -1n ? null : position };
+  }
+  throw invalidArgType('position', 'of type bigint or integer', position);
+}
+
 export function readSync(
   fd: number,
-  buffer: Uint8Array,
-  offset = 0,
-  length = buffer.byteLength - offset,
-  position: number | null = null,
+  buffer: ArrayBufferView,
+  ...args: [
+    offsetOrOptions?: number | ReadOptions | null,
+    length?: number,
+    position?: number | bigint | null,
+  ]
 ): number {
+  validateView(buffer);
+  const range = readRange(buffer, args);
+  if (range === null) return 0;
   const handle = openHandles.get(fd);
   if (handle === undefined) throw errno('EBADF', 'read', String(fd), -9);
-  const start = position === null ? handle.position : position;
+  const { offset, length, position } = range;
+  const start = position ?? handle.position;
   const slice = handle.stored
     ? storage.readAt(handle.path, length, start)
-    : asBytes(nodeCompatSeed.files[handle.path] ?? '').subarray(start, start + length);
-  buffer.set(slice, offset);
-  if (position === null) handle.position = start + slice.byteLength;
+    : (() => {
+        const content = asBytes(nodeCompatSeed.files[handle.path] ?? '');
+        // A BigInt position beyond MAX_SAFE_INTEGER is past the end of any in-memory file.
+        if (typeof start === 'bigint' && start > BigInt(content.byteLength))
+          return new Uint8Array();
+        const from = Number(start);
+        return content.subarray(from, from + length);
+      })();
+  viewBytes(buffer).set(slice, offset);
+  if (position === null) handle.position = handle.position + slice.byteLength;
   return slice.byteLength;
 }
 
+/** Node's `validateOffsetLengthWrite` plus `validateInt32(length)`. */
+function writeRange(
+  buffer: ArrayBufferView,
+  offsetArg: unknown,
+  lengthArg: unknown,
+  positionArg: unknown,
+) {
+  let offset = offsetArg;
+  let length = lengthArg;
+  let position = positionArg;
+  if (typeof offset === 'object') {
+    const options = (offset ?? {}) as WriteOptions;
+    offset = options.offset ?? 0;
+    length = options.length ?? buffer.byteLength - (offset as number);
+    position = options.position ?? null;
+  }
+  const start = offset === undefined || offset === null ? 0 : validateInteger(offset, 'offset', 0);
+  const count = typeof length === 'number' ? length : buffer.byteLength - start;
+  if (start > buffer.byteLength) throw outOfRange('offset', `<= ${buffer.byteLength}`, start);
+  if (count > buffer.byteLength - start) {
+    throw outOfRange('length', `<= ${buffer.byteLength - start}`, count);
+  }
+  if (count < 0) throw outOfRange('length', '>= 0', count);
+  if (!Number.isInteger(count)) throw outOfRange('length', 'an integer', count);
+  return { bytes: viewBytes(buffer).subarray(start, start + count), position };
+}
+
+function encodeString(data: string, encoding: unknown): Uint8Array {
+  if (encoding === 'hex' && data.length % 2 !== 0) {
+    throw invalidArgValue('encoding', `is invalid for data of length ${data.length}`, "'hex'");
+  }
+  if (
+    typeof encoding === 'string' &&
+    typeof Buffer !== 'undefined' &&
+    Buffer.isEncoding(encoding)
+  ) {
+    const encoded = Buffer.from(data, encoding as BufferEncoding);
+    return new Uint8Array(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+  }
+  return new TextEncoder().encode(data);
+}
+
+/**
+ * Node v22 `fs.writeSync`, in both forms:
+ * - `writeSync(fd, buffer, offset?, length?, position?)` (or an options object), and
+ * - `writeSync(fd, string, position?, encoding?)`.
+ * Like Node (and libuv), a position that is not a non-negative safe-integer Number
+ * (BigInt, NaN, 1.5, -1, ...) writes at the current position, so it never reaches the
+ * stored descriptor's u64 offset.
+ */
 export function writeSync(
   fd: number,
-  data: string | Uint8Array,
-  offset?: number,
-  length?: number,
-  position?: number | null,
+  data: string | ArrayBufferView,
+  offsetOrPosition?: number | WriteOptions | null,
+  lengthOrEncoding?: number | string | null,
+  requestedPosition?: number | bigint | null,
 ): number {
+  let bytes: Uint8Array;
+  let position: unknown;
+  if (ArrayBuffer.isView(data)) {
+    ({ bytes, position } = writeRange(data, offsetOrPosition, lengthOrEncoding, requestedPosition));
+  } else if (typeof data === 'string') {
+    bytes = encodeString(data, lengthOrEncoding);
+    position = offsetOrPosition;
+  } else {
+    throw invalidArgType(
+      'buffer',
+      'of type string or an instance of Buffer, TypedArray, or DataView',
+      data,
+    );
+  }
   const handle = openHandles.get(fd);
   if (handle === undefined) throw errno('EBADF', 'write', String(fd), -9);
-  const bytes = asBytes(data).subarray(
-    offset ?? 0,
-    (offset ?? 0) + (length ?? asBytes(data).byteLength),
-  );
+  const explicit =
+    typeof position === 'number' && Number.isSafeInteger(position) && position >= 0
+      ? position
+      : null;
   if (handle.stored) {
-    const target = position ?? (handle.flags.includes('a') ? 'end' : handle.position);
+    const target = explicit ?? (handle.flags.includes('a') ? 'end' : handle.position);
     const end = storage.writeAt(handle.path, bytes, target);
-    if (position == null) handle.position = end;
+    if (explicit === null) handle.position = end;
     return bytes.byteLength;
   }
   const existing = asBytes(nodeCompatSeed.files[handle.path] ?? '');
-  const start =
-    position == null
-      ? handle.flags.includes('a')
-        ? existing.byteLength
-        : handle.position
-      : position;
+  const start = explicit ?? (handle.flags.includes('a') ? existing.byteLength : handle.position);
   const next = new Uint8Array(Math.max(existing.byteLength, start + bytes.byteLength));
   next.set(existing, 0);
   next.set(bytes, start);
   nodeCompatSeed.files[handle.path] = new TextDecoder().decode(next);
-  if (position == null) handle.position = start + bytes.byteLength;
+  if (explicit === null) handle.position = start + bytes.byteLength;
   return bytes.byteLength;
 }
 

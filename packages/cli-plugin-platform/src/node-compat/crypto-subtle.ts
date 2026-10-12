@@ -5,7 +5,7 @@ import { hmac } from '@noble/hashes/hmac.js';
 import { sha256, sha384, sha512 } from '@noble/hashes/sha2.js';
 import { toArrayBuffer, toBytes } from './bytes';
 import { digestSync, hashFunction, normalizeHashName } from './crypto-hash';
-import { getRandomBytes } from './wasi-random';
+import { fillRandom, getRandomBytes } from './wasi-random';
 
 type AlgorithmIdentifier = string | { name: string; [parameter: string]: unknown };
 type BufferSource = ArrayBufferView | ArrayBuffer;
@@ -79,10 +79,53 @@ function algorithmParams(algorithm: AlgorithmIdentifier): Record<string, unknown
   return typeof algorithm === 'string' ? { name: algorithm } : { ...algorithm };
 }
 
+/** Web Crypto's per-call `getRandomValues` quota, in bytes. */
+export const GET_RANDOM_VALUES_MAX = 65_536;
+
+const INTEGER_ARRAYS = [
+  'Int8Array',
+  'Uint8Array',
+  'Uint8ClampedArray',
+  'Int16Array',
+  'Uint16Array',
+  'Int32Array',
+  'Uint32Array',
+  'BigInt64Array',
+  'BigUint64Array',
+] as const;
+
+function isIntegerTypedArray(value: unknown): value is ArrayBufferView {
+  if (!ArrayBuffer.isView(value)) return false;
+  return INTEGER_ARRAYS.some((name) => {
+    const ctor = (globalThis as Record<string, unknown>)[name];
+    return typeof ctor === 'function' && value instanceof (ctor as new () => unknown);
+  });
+}
+
+/** A Web Crypto `DOMException`, or an Error with the same name and legacy code without one. */
+function domException(message: string, name: string, code: number): Error {
+  const DOMExceptionCtor = (globalThis as { DOMException?: new (m: string, n: string) => Error })
+    .DOMException;
+  if (typeof DOMExceptionCtor === 'function') return new DOMExceptionCtor(message, name);
+  return Object.assign(new Error(message), { name, code });
+}
+
+/**
+ * Like Node v22's `crypto.getRandomValues`: integer-type typed arrays only
+ * (`TypeMismatchError`), at most 65,536 bytes (`QuotaExceededError`).
+ */
 export function getRandomValues<T extends ArrayBufferView>(array: T): T {
-  const view = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
-  const random = getRandomBytes(view.length);
-  view.set(random);
+  if (!isIntegerTypedArray(array)) {
+    throw domException(
+      'The data argument must be an integer-type TypedArray',
+      'TypeMismatchError',
+      17,
+    );
+  }
+  if (array.byteLength > GET_RANDOM_VALUES_MAX) {
+    throw domException('The requested length exceeds 65,536 bytes', 'QuotaExceededError', 22);
+  }
+  fillRandom(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
   return array;
 }
 

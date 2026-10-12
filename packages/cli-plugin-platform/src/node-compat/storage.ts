@@ -8,8 +8,8 @@ export type WasiDescriptor = {
     openFlags: { create?: boolean; directory?: boolean; exclusive?: boolean; truncate?: boolean },
     flags: { read?: boolean; write?: boolean; mutateDirectory?: boolean },
   ): WasiDescriptor;
-  read(length: number, offset: number): [Uint8Array | number[], boolean];
-  write(buffer: Uint8Array, offset: number): number;
+  read(length: number, offset: number | bigint): [Uint8Array | number[], boolean];
+  write(buffer: Uint8Array, offset: number): number | bigint;
   setSize(size: number): void;
   stat(): WasiStat;
   statAt(pathFlags: { symlinkFollow?: boolean }, path: string): WasiStat;
@@ -263,7 +263,7 @@ export function createStorage(preopens: () => Preopen[], prefixes = defaultPrefi
         writeAll(file, bytes, toNumber(file.stat().size)),
       );
     },
-    readAt(path: string, length: number, offset: number): Uint8Array {
+    readAt(path: string, length: number, offset: number | bigint): Uint8Array {
       return withFile(path, 'read', {}, { read: true }, (file) => {
         const [data] = file.read(length, offset);
         return data instanceof Uint8Array ? data : Uint8Array.from(data);

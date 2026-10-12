@@ -62,7 +62,11 @@ describe('wasi:logging guest console', () => {
     const bare = new Error('boom');
     bare.stack = undefined;
     guest.log({ topic: 'maps' }, [1, 2], null, undefined, 3n, circular, bare);
-    expect(lines).toEqual(['{"topic":"maps"} [1,2] null undefined 3 [object Object] Error: boom']);
+    expect(lines).toEqual(['{"topic":"maps"} [1,2] null undefined 3n [object Object] Error: boom']);
+    lines.length = 0;
+    // s64/u64 WIT results (e.g. a SQLite row) arrive as BigInt under componentize-qjs di.5.
+    guest.log({ id: 9007199254740993n, changes: 1n, name: 'a' }, [2n]);
+    expect(lines).toEqual(['{"id":"9007199254740993n","changes":"1n","name":"a"} ["2n"]']);
     lines.length = 0;
     guest.error(new Error('with stack'));
     expect(lines[0]).toBe('Error: with stack');
