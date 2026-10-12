@@ -30,7 +30,7 @@ import {
   warnIfHostIgnoresExclusive,
 } from './pglite';
 import type { WasmcloudProject } from './project';
-import { asWitIdentifier } from './project';
+import { asWitIdentifier, CONFIG_FILE_NAME } from './project';
 import { type DiscoveredQueueHandler, discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { kubectlStatusReason, SECRET_UPDATE_KEYS_MESSAGE } from './secret-admission';
 import type { ClusterConnection } from './target';
@@ -481,14 +481,26 @@ ${labels.replace(/^/gm, '        ')}
 export const CONTROL_TOKEN_ROTATED_NOTICE =
   'the control token was rotated; re-run deploy to roll the workload onto it';
 
-/** Control Secret written on deploy: its name and a digest that identifies the token. */
-export type ControlSecretWrite = { name: string; revision: string };
+/**
+ * The control Secret after a deploy: its name and, when deploy wrote a new token, a digest that
+ * identifies it. `revision` is undefined when deploy kept the Secret as it was.
+ */
+export type ControlSecretWrite = { name: string; revision?: string };
 
-/** The full control Secret the CLI owns; nothing in it is read back from the cluster. */
+/** The keys the CLI owns in every control Secret. */
+export const CONTROL_SECRET_CLI_KEYS = ['DI_CONTROL_TOKEN', 'DI_CONTROL_IDENTITY'] as const;
+
+/**
+ * The control Secret document. The CLI's keys hold `token` and the workload name; `appData`
+ * (already base64, as in a Secret's `data`) carries app-owned keys over, and `resourceVersion`
+ * makes the update conditional.
+ */
 export function controlSecretDocument(
   workloadName: string,
   namespace: string,
   token: string,
+  appData: Readonly<Record<string, string>> = {},
+  resourceVersion?: string,
 ): Record<string, unknown> {
   const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
   return {
@@ -501,9 +513,11 @@ export function controlSecretDocument(
         'app.kubernetes.io/managed-by': MANAGED_BY_LABEL,
         'app.kubernetes.io/name': workloadName,
       },
+      ...(resourceVersion === undefined ? {} : { resourceVersion }),
     },
     type: 'Opaque',
     data: {
+      ...appData,
       DI_CONTROL_TOKEN: encode(token),
       DI_CONTROL_IDENTITY: encode(workloadName),
     },
@@ -515,14 +529,29 @@ function secretsPath(namespace: string, name?: string): string {
   return name === undefined ? collection : `${collection}/${encodeURIComponent(name)}`;
 }
 
+type KubectlResult = { exitCode: number; stdout: string; stderr: string };
+
 /**
- * Tenant developers may create, update and delete Secrets but never get, list, watch or
- * patch them (platform#112). The control Secret is therefore written blind: POST the full
- * document and, if it already exists, PUT the same document without a resourceVersion. A
- * Secret allows such an unconditional update, so no read is needed to learn the version,
- * and the Secret never disappears the way delete-then-create would make it. Both requests
- * go through `--raw` because `kubectl replace -f` GETs the object first to fill in its
- * resourceVersion. The token is regenerated on every deploy since the old one cannot be read.
+ * Writes the workload's control Secret on deploy and returns whether the token rotated.
+ *
+ * The Secret holds the CLI's `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY` plus the app-owned keys
+ * the project declares in `controlSecretKeys` (cli-extensions#69). Any other key is refused: the
+ * Secret is injected whole into the workload's environment, so an undeclared key is either a
+ * mistake or a value nobody vouched for.
+ *
+ * - A new Secret is created with the CLI's keys and a fresh token.
+ * - An existing Secret the caller may read (an admin) is read, checked for undeclared keys, and
+ *   updated with a fresh token and its declared keys carried over, conditional on the
+ *   `resourceVersion` that was read.
+ * - Tenant developers may create, update and delete Secrets but never get, list, watch or patch
+ *   them (platform#112), and the platform's `tenant-secret-update` admission policy refuses an
+ *   update that drops a key. So an existing Secret is replaced blind with the CLI's keys and a
+ *   fresh token. When that is refused because the Secret holds more keys, a dry-run update that
+ *   also names every declared key asks the same policy whether all of the extra keys are
+ *   declared. If they are, the Secret is kept as it is, token included, since a blind writer
+ *   cannot carry over values it cannot read; otherwise deploy stops.
+ *
+ * Every request goes through `--raw`: `kubectl replace -f` would GET the object first.
  */
 export async function writeControlSecret(
   project: WasmcloudProject,
@@ -531,66 +560,251 @@ export async function writeControlSecret(
 ): Promise<ControlSecretWrite> {
   const workloadName = deploymentResourceName(project);
   const name = controlSecretResourceName(workloadName);
+  const declared = project.controlSecretKeys ?? [];
   const token = randomBytes(32).toString('base64url');
+  const rotated = { name, revision: createHash('sha256').update(token).digest('hex').slice(0, 16) };
+  /** Values that must never appear in an error: the token and any value read from the cluster. */
+  const secrets = [token];
   const directory = mkdtempSync(join(tmpdir(), 'di-control-secret-'));
-  try {
-    const path = join(directory, 'secret.json');
-    writeFileSync(
-      path,
-      JSON.stringify(controlSecretDocument(workloadName, connection.namespace, token)),
-      { mode: 0o600 },
-    );
-    const created = await captureKubectl(
+  let written = 0;
+  const send = async (
+    verb: 'create' | 'replace',
+    document: Record<string, unknown>,
+    query = '',
+  ): Promise<KubectlResult> => {
+    const path = join(directory, `secret-${written++}.json`);
+    writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
+    const target =
+      verb === 'create'
+        ? secretsPath(connection.namespace)
+        : secretsPath(connection.namespace, name);
+    return captureKubectl(
       deps,
       connection,
-      ['create', '--raw', secretsPath(connection.namespace), '-f', path],
+      [verb, '--raw', `${target}${query}`, '-f', path],
       project.projectRoot,
     );
-    if (created.exitCode !== 0) {
-      if (kubectlStatusReason(created.stderr) !== 'AlreadyExists') {
-        throw controlSecretWriteFailed('kubectl create', name, connection, created, token);
-      }
-      const replaced = await captureKubectl(
-        deps,
-        connection,
-        ['replace', '--raw', secretsPath(connection.namespace, name), '-f', path],
-        project.projectRoot,
+  };
+  const failed = (command: string, result: KubectlResult) =>
+    controlSecretWriteFailed(command, name, connection, result, secrets);
+  try {
+    const document = controlSecretDocument(workloadName, connection.namespace, token);
+    const created = await send('create', document);
+    if (created.exitCode === 0) return rotated;
+    if (kubectlStatusReason(created.stderr) !== 'AlreadyExists') {
+      throw failed('kubectl create', created);
+    }
+
+    const stored = await readControlSecret(project, connection, deps, name, secrets);
+    if (stored !== undefined) {
+      const undeclared = Object.keys(stored.data).filter(
+        (key) =>
+          !(CONTROL_SECRET_CLI_KEYS as readonly string[]).includes(key) && !declared.includes(key),
       );
-      if (replaced.exitCode !== 0) {
-        throw controlSecretWriteFailed('kubectl replace', name, connection, replaced, token);
+      if (undeclared.length > 0) throw controlSecretForeignKeys(name, connection, undeclared);
+      const appData = Object.fromEntries(
+        Object.entries(stored.data).filter(([key]) => declared.includes(key)),
+      );
+      const merged = controlSecretDocument(
+        workloadName,
+        connection.namespace,
+        token,
+        appData,
+        stored.resourceVersion,
+      );
+      const updated = await send('replace', merged);
+      if (updated.exitCode !== 0) throw failed('kubectl replace', updated);
+      return rotated;
+    }
+
+    /**
+     * Asks the `tenant-secret-update` policy, with a dry run that stores nothing, whether an
+     * update holding only `keys` would drop a key of the stored Secret. Values are placeholders:
+     * the policy compares key names only. True when the policy refuses it.
+     */
+    const dropsAKey = async (keys: readonly string[]): Promise<boolean> => {
+      const probe = controlSecretDocument(workloadName, connection.namespace, token);
+      const data: Record<string, string> = {};
+      for (const key of keys) data[key] = '';
+      probe.data = data;
+      const checked = await send('replace', probe, '?dryRun=All');
+      if (checked.exitCode === 0) return false;
+      if (checked.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) return true;
+      throw failed('kubectl replace --dry-run', checked);
+    };
+
+    // With app keys declared, a blind update must never be the one to find out that the policy
+    // does not protect them (a caller that is not `di-user-*`, a namespace outside the policy, an
+    // older platform): it would succeed and drop them. The policy must first refuse a dry run
+    // that keeps only DI_CONTROL_IDENTITY, which it does exactly when it applies and the Secret
+    // holds another key.
+    if (declared.length > 0 && !(await dropsAKey(['DI_CONTROL_IDENTITY']))) {
+      throw controlSecretUnguarded(name, connection);
+    }
+    const replaced = await send('replace', document);
+    if (replaced.exitCode === 0) return rotated;
+    if (!replaced.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
+      throw failed('kubectl replace', replaced);
+    }
+    if (declared.length === 0) throw controlSecretForeignKeys(name, connection);
+    if (await dropsAKey([...CONTROL_SECRET_CLI_KEYS, ...declared])) {
+      throw controlSecretForeignKeys(name, connection);
+    }
+    // Kept as it is, so the CLI's keys must be there: a workload without its token would have
+    // no control credentials. Leaving one out must drop a key, which proves it is stored.
+    for (const key of CONTROL_SECRET_CLI_KEYS) {
+      const others = CONTROL_SECRET_CLI_KEYS.filter((other) => other !== key);
+      if (!(await dropsAKey([...others, ...declared]))) {
+        throw controlSecretIncomplete(name, connection, key);
       }
     }
+    return { name };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
-  return { name, revision: createHash('sha256').update(token).digest('hex').slice(0, 16) };
 }
 
 /**
- * A failed control Secret write, with kubectl's reason. Kubernetes errors for these requests
- * name the object, not its data, but the stderr is still scrubbed of the token (raw and
- * base64) and of credential-shaped text before it is shown, in case a response echoes the body.
+ * The stored control Secret's keys (base64 values) and `resourceVersion` when the caller may read
+ * it, or undefined when it may not. `kubectl auth can-i` asks first, so a tenant developer never
+ * sends a Secret read the platform forbids. Values read here are added to `secrets` so no error
+ * can show them; nothing read is ever printed.
+ */
+async function readControlSecret(
+  project: WasmcloudProject,
+  connection: ClusterConnection,
+  deps: WasmcloudDeps,
+  name: string,
+  secrets: string[],
+): Promise<{ data: Record<string, string>; resourceVersion?: string } | undefined> {
+  const allowed = await captureKubectl(
+    deps,
+    connection,
+    ['auth', 'can-i', 'get', `secrets/${name}`],
+    project.projectRoot,
+  );
+  if (allowed.exitCode !== 0 || allowed.stdout.trim() !== 'yes') return undefined;
+  const read = await captureKubectl(
+    deps,
+    connection,
+    ['get', '--raw', secretsPath(connection.namespace, name)],
+    project.projectRoot,
+  );
+  if (read.exitCode !== 0) {
+    throw controlSecretWriteFailed('kubectl get', name, connection, read, secrets);
+  }
+  let stored: { metadata?: { resourceVersion?: unknown }; data?: unknown };
+  try {
+    stored = JSON.parse(read.stdout) as typeof stored;
+  } catch {
+    throw new CommandFailure(
+      'WASMCLOUD_TOOL_FAILED',
+      `kubectl get returned a control Secret ${name} that is not JSON`,
+      3,
+      { command: 'kubectl get', name },
+    );
+  }
+  const data: Record<string, string> = {};
+  if (stored.data !== null && typeof stored.data === 'object') {
+    for (const [key, value] of Object.entries(stored.data as Record<string, unknown>)) {
+      // The API only returns strings. Anything else cannot be carried over, so fail closed.
+      if (typeof value !== 'string') {
+        throw new CommandFailure(
+          'WASMCLOUD_TOOL_FAILED',
+          `kubectl get returned a control Secret ${name} whose ${key} is not a string`,
+          3,
+          { command: 'kubectl get', name, key },
+        );
+      }
+      data[key] = value;
+      secrets.push(value, Buffer.from(value, 'base64').toString('utf8'));
+    }
+  }
+  const resourceVersion = stored.metadata?.resourceVersion;
+  return typeof resourceVersion === 'string' ? { data, resourceVersion } : { data };
+}
+
+/** The `tenant-secret-update` policy did not protect the Secret, so a blind update could drop keys. */
+function controlSecretUnguarded(name: string, connection: ClusterConnection): CommandFailure {
+  return new CommandFailure(
+    'WASMCLOUD_CONTROL_SECRET_UNGUARDED',
+    `Refusing to replace the control Secret ${name} blind: the platform accepted a dry-run ` +
+      'update that drops DI_CONTROL_TOKEN, so either its tenant-secret-update policy does not ' +
+      'apply to this caller or the Secret has no DI_CONTROL_TOKEN. A replace could then drop ' +
+      'the declared app keys, which this caller cannot read back. Deploy as a tenant developer ' +
+      '(di-user-*) or as a caller that may read Secrets, or have the app tooling write ' +
+      `DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY into ${name} in ${connection.namespace}`,
+    2,
+    { name, namespace: connection.namespace },
+  );
+}
+
+/** The Secret holds declared app keys but lacks one of the CLI's keys. */
+function controlSecretIncomplete(
+  name: string,
+  connection: ClusterConnection,
+  key: string,
+): CommandFailure {
+  return new CommandFailure(
+    'WASMCLOUD_CONTROL_SECRET_INCOMPLETE',
+    `The control Secret ${name} holds declared app keys but no ${key}, so the workload would ` +
+      'have no control credentials. The tooling that writes the app keys must also write ' +
+      'non-empty DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY (the workload name); fix the Secret, ' +
+      `or delete it with \`kubectl delete secret ${name} --namespace ${connection.namespace}\` and redeploy`,
+    2,
+    { name, namespace: connection.namespace, key },
+  );
+}
+
+/**
+ * The control Secret holds keys that are neither the CLI's nor declared in `controlSecretKeys`.
+ * `keys` names them when the Secret could be read; a tenant developer only learns that some exist.
+ */
+function controlSecretForeignKeys(
+  name: string,
+  connection: ClusterConnection,
+  keys?: readonly string[],
+): CommandFailure {
+  const which =
+    keys === undefined ? "keys this CLI didn't write" : `undeclared keys ${keys.join(', ')}`;
+  return new CommandFailure(
+    'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+    `The control Secret ${name} has ${which}; declare app-owned keys in "controlSecretKeys" ` +
+      `of ${CONFIG_FILE_NAME}, or delete the Secret with ` +
+      `\`kubectl delete secret ${name} --namespace ${connection.namespace}\` and redeploy`,
+    2,
+    { name, namespace: connection.namespace, ...(keys === undefined ? {} : { keys: [...keys] }) },
+  );
+}
+
+/**
+ * A failed control Secret request, with kubectl's reason. Kubernetes errors for these requests
+ * name the object, not its data, but the stderr is still scrubbed of `secrets` (the token raw and
+ * base64, and any value read from the cluster) and of credential-shaped text before it is shown,
+ * in case a response echoes the body.
  */
 function controlSecretWriteFailed(
   command: string,
   name: string,
   connection: ClusterConnection,
   result: { exitCode: number; stderr: string },
-  token: string,
+  secrets: readonly string[],
 ): CommandFailure {
+  const scrub = [
+    ...new Set(
+      secrets.flatMap((secret) => [secret, Buffer.from(secret, 'utf8').toString('base64')]),
+    ),
+  ]
+    .filter((secret) => secret.length > 0)
+    .sort((a, b) => b.length - a.length);
   const stderr = sanitizePublicText(
-    [token, Buffer.from(token, 'utf8').toString('base64')]
-      .reduce((text, secret) => text.split(secret).join('[redacted]'), result.stderr)
-      .trim(),
+    scrub.reduce((text, secret) => redact(text, secret), result.stderr).trim(),
   );
-  if (stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
-    // The platform's `tenant-secret-update` policy refuses a replace that drops a key, so a
-    // control Secret someone added keys to can no longer be rotated in place.
+  if (kubectlStatusReason(stderr) === 'Conflict') {
     return new CommandFailure(
-      'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
-      `The control Secret ${name} has keys this CLI didn't write; delete it with ` +
-        `\`kubectl delete secret ${name} --namespace ${connection.namespace}\` and redeploy`,
-      2,
+      'WASMCLOUD_CONTROL_SECRET_CHANGED',
+      `The control Secret ${name} in ${connection.namespace} changed while deploy was updating it; re-run deploy`,
+      3,
       { name, namespace: connection.namespace, command, exitCode: result.exitCode, stderr },
     );
   }
@@ -600,6 +814,20 @@ function controlSecretWriteFailed(
     `${command} failed with exit code ${result.exitCode}${reason}`,
     3,
     { command, exitCode: result.exitCode, stderr },
+  );
+}
+
+/** Shorter values are only redacted as whole tokens, so `on` does not blank every `json`. */
+const SHORT_SECRET = 4;
+const TOKEN_CHARACTER = '[A-Za-z0-9+/=_.-]';
+
+/** `text` with every occurrence of `secret` replaced by `[redacted]`. */
+function redact(text: string, secret: string): string {
+  if (secret.length >= SHORT_SECRET) return text.split(secret).join('[redacted]');
+  const escaped = secret.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
+  return text.replace(
+    new RegExp(`(?<!${TOKEN_CHARACTER})${escaped}(?!${TOKEN_CHARACTER})`, 'g'),
+    '[redacted]',
   );
 }
 
@@ -677,6 +905,11 @@ export async function applyWorkload(
     hasPersistentStorage,
   });
   const controlSecret = needsHttp ? await writeControlSecret(project, connection, deps) : undefined;
+  if (controlSecret !== undefined && controlSecret.revision === undefined) {
+    io.stdout.write(
+      `Kept control Secret ${controlSecret.name}: it holds declared app keys this deploy cannot read, so the control token was not rotated\n`,
+    );
+  }
   // From here on the cron invokers already use the new token, which the running workload
   // rejects until it rolls out with this manifest.
   let path: string;
@@ -704,7 +937,7 @@ export async function applyWorkload(
     await runKubectl(deps, connection, ['apply', '-f', path], project.projectRoot);
     await waitForReady(project, connection, deps, io);
   } catch (error) {
-    throw controlSecret === undefined ? error : withRotatedTokenNotice(error);
+    throw controlSecret?.revision === undefined ? error : withRotatedTokenNotice(error);
   }
   await cleanupManagedBindings(project, connection, associations, deps);
   if (egress === undefined) await removeWorkloadEgress(project, connection, deps);

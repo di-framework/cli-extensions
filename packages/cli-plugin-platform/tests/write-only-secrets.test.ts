@@ -21,9 +21,14 @@ import { captureIo, fakeDeps, makeWorkspace, type RunnerInvocation } from './hel
  * updated (PUT) and deleted, while get, list, watch and patch answer 403. Every kubectl call
  * that touches Secrets is translated into the API requests kubectl would send.
  */
-type ApiRequest = { verb: string; path: string; status: number };
+type ApiRequest = { verb: string; path: string; status: number; dryRun?: true };
 type StoredSecret = {
-  metadata: { name: string; namespace?: string; labels?: Record<string, string> };
+  metadata: {
+    name: string;
+    namespace?: string;
+    labels?: Record<string, string>;
+    resourceVersion?: string;
+  };
   type?: string;
   data?: Record<string, string>;
 };
@@ -54,17 +59,30 @@ function updateDenial(name: string, old: StoredSecret, next: StoredSecret): stri
   return undefined;
 }
 
-function writeOnlySecretsApi(namespace = 'wasmcloud') {
+/**
+ * `admin: true` answers as a cluster admin instead: Secrets can be read, the admission policy
+ * does not apply, and an update that names a `resourceVersion` must match the stored one.
+ */
+/**
+ * `unguarded: true` keeps Secrets write-only but without the `tenant-secret-update` policy, as for
+ * a write-only caller that is not `di-user-*` or a namespace outside the policy's binding.
+ */
+function writeOnlySecretsApi(
+  namespace = 'wasmcloud',
+  options: { admin?: boolean; unguarded?: boolean } = {},
+) {
   const requests: ApiRequest[] = [];
   const secrets = new Map<string, StoredSecret>();
   const collection = `/api/v1/namespaces/${namespace}/secrets`;
+  let version = 0;
 
   let denied = '';
-  const request = (verb: string, name?: string, body?: StoredSecret) => {
+  const request = (verb: string, name?: string, body?: StoredSecret, dryRun = false) => {
     const path = name === undefined ? collection : `${collection}/${name}`;
     let status = 200;
     denied = '';
-    if (FORBIDDEN_SECRET_VERBS.has(verb)) status = 403;
+    if (FORBIDDEN_SECRET_VERBS.has(verb) && !options.admin) status = 403;
+    else if (verb === 'get' && name !== undefined) status = secrets.has(name) ? 200 : 404;
     else if (verb === 'create' && body !== undefined) {
       if (secrets.has(body.metadata.name)) status = 409;
       else {
@@ -74,17 +92,32 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
     } else if (verb === 'update' && name !== undefined && body !== undefined) {
       // Secrets are not created by an update.
       const existing = secrets.get(name);
-      const denial = existing === undefined ? undefined : updateDenial(name, existing, body);
+      const denial =
+        existing === undefined || options.admin || options.unguarded
+          ? undefined
+          : updateDenial(name, existing, body);
+      const expected = body.metadata.resourceVersion;
       if (existing === undefined) status = 404;
       else if ((existing.type ?? 'Opaque') !== (body.type ?? 'Opaque')) status = 422;
       else if (denial !== undefined) {
         status = 403;
         denied = admissionDenial(name, 'tenant-secret-update', denial);
-      } else secrets.set(name, body);
+      } else if (expected !== undefined && expected !== existing.metadata.resourceVersion)
+        status = 410;
+      else if (!dryRun) {
+        version += 1;
+        // Only the admin tests look at versions; the others compare stored metadata exactly.
+        secrets.set(
+          name,
+          options.admin
+            ? { ...body, metadata: { ...body.metadata, resourceVersion: String(version) } }
+            : body,
+        );
+      }
     } else if (verb === 'delete' && name !== undefined) {
       if (!secrets.delete(name)) status = 404;
     }
-    requests.push({ verb, path, status });
+    requests.push({ verb, path, status, ...(dryRun ? { dryRun: true as const } : {}) });
     return status;
   };
 
@@ -96,6 +129,12 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
         exitCode: 1,
         stdout: '',
         stderr: `The ${typeImmutable(name)}`,
+      };
+    if (status === 410)
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `Error from server (Conflict): Operation cannot be fulfilled on secrets "${name}": the object has been modified; please apply your changes to the latest version and try again`,
       };
     const reason =
       status === 403
@@ -110,6 +149,13 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
   const kubectl = (
     args: readonly string[],
   ): { exitCode: number; stdout: string; stderr: string } | undefined => {
+    if (args.includes('auth') && args.includes('can-i')) {
+      return {
+        exitCode: options.admin ? 0 : 1,
+        stdout: options.admin ? 'yes\n' : 'no\n',
+        stderr: '',
+      };
+    }
     const verbIndex = args.findIndex((token) =>
       ['apply', 'create', 'replace', 'delete', 'get', 'label', 'patch', 'annotate'].includes(token),
     );
@@ -119,10 +165,18 @@ function writeOnlySecretsApi(namespace = 'wasmcloud') {
     const raw = rest.includes('--raw') ? rest[rest.indexOf('--raw') + 1] : undefined;
     if (raw !== undefined) {
       if (!raw.startsWith(collection)) return undefined;
+      const [rawPath = '', query = ''] = raw.split('?');
+      const name = rawPath.slice(collection.length + 1) || undefined;
+      if (verb === 'get') {
+        const status = request('get', name);
+        return status < 300
+          ? { ...ok, stdout: JSON.stringify(secrets.get(name ?? '')) }
+          : failure(status, name);
+      }
       const file = rest[rest.indexOf('-f') + 1] ?? '';
       const body = JSON.parse(readFileSync(file, 'utf8')) as StoredSecret;
-      const name = raw.slice(collection.length + 1) || undefined;
-      const status = request(verb === 'create' ? 'create' : 'update', name, body);
+      const dryRun = new URLSearchParams(query).get('dryRun') === 'All';
+      const status = request(verb === 'create' ? 'create' : 'update', name, body, dryRun);
       return status < 300 ? ok : failure(status, name ?? body.metadata.name);
     }
     if (verb === 'apply') {
@@ -350,7 +404,7 @@ describe('write-only Secrets (platform#112)', () => {
     }
   });
 
-  it('tells the user to delete a control Secret that has keys the CLI did not write', async () => {
+  it('refuses a control Secret with keys the CLI did not write and the project did not declare', async () => {
     const { greeter } = makeWorkspace();
     const project = loadProject(greeter);
     const api = writeOnlySecretsApi();
@@ -368,9 +422,10 @@ describe('write-only Secrets (platform#112)', () => {
     ).rejects.toMatchObject({
       code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
       message:
-        "The control Secret greeter-control has keys this CLI didn't write; delete it with " +
+        "The control Secret greeter-control has keys this CLI didn't write; declare app-owned " +
+        'keys in "controlSecretKeys" of di-framework.config.json, or delete the Secret with ' +
         '`kubectl delete secret greeter-control --namespace wasmcloud` and redeploy',
-      details: { name: 'greeter-control', command: 'kubectl replace' },
+      details: { name: 'greeter-control', namespace: 'wasmcloud' },
     });
     // The denied replace left the Secret as it was.
     expect(decoded(api.secrets.get('greeter-control'), 'EXTRA')).toBe('hand-added');
@@ -378,6 +433,454 @@ describe('write-only Secrets (platform#112)', () => {
       'create 409',
       'update 403',
     ]);
+  });
+
+  describe('app-owned keys declared in controlSecretKeys (cli-extensions#69)', () => {
+    /** A Secret read, not the `kubectl auth can-i get` question before it. */
+    const reads = (args: readonly string[]) => args.includes('get') && !args.includes('can-i');
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    const APP_KEYS = ['ISSUER_URL', 'AUTH_ACTIVE_PRIVATE_JWK', 'DI_PGLITE_KEY'];
+    const declare = (root: string, keys: string[] = APP_KEYS) => {
+      const path = join(root, 'di-framework.config.json');
+      const config = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+      writeFileSync(path, `${JSON.stringify({ ...config, controlSecretKeys: keys })}\n`);
+    };
+    /** The Secret as the app's own tooling writes it: its own token plus its values. */
+    const appWritten = (extra: Record<string, string> = {}): StoredSecret => ({
+      metadata: { name: 'greeter-control', resourceVersion: '7' },
+      data: {
+        DI_CONTROL_TOKEN: encode('app-token'),
+        DI_CONTROL_IDENTITY: encode('greeter'),
+        ISSUER_URL: encode('https://id.example.com'),
+        AUTH_ACTIVE_PRIVATE_JWK: encode('{"kty":"RSA","d":"private-exponent"}'),
+        DI_PGLITE_KEY: encode('cGdsaXRlLWtleS1tYXRlcmlhbA=='),
+        ...extra,
+      },
+    });
+
+    it('a tenant developer keeps a Secret whose extra keys are all declared, without reading it', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const api = writeOnlySecretsApi();
+      api.secrets.set('greeter-control', appWritten());
+      const before = JSON.stringify(api.secrets.get('greeter-control'));
+      const io = captureIo();
+      await runWasmcloudDeploy(['--target', 'development'], io.io, depsWithApi(greeter, api));
+
+      // Nothing was written, so every app value (and the app's token) is intact.
+      expect(JSON.stringify(api.secrets.get('greeter-control'))).toBe(before);
+      expect(
+        api.requests.map((entry) => `${entry.verb} ${entry.status}${entry.dryRun ? ' dry' : ''}`),
+      ).toEqual([
+        'create 409',
+        // The policy protects this Secret: dropping DI_CONTROL_TOKEN is refused.
+        'update 403 dry',
+        'update 403',
+        // Every extra key is declared ...
+        'update 200 dry',
+        // ... and both CLI keys are stored: leaving either out drops a key.
+        'update 403 dry',
+        'update 403 dry',
+      ]);
+      // Nothing was read and nothing written.
+      expect(api.forbidden().every((entry) => entry.verb === 'update')).toBe(true);
+      expect(io.stdout.join('')).toContain(
+        'Kept control Secret greeter-control: it holds declared app keys this deploy cannot read, so the control token was not rotated',
+      );
+      const yaml = readFileSync(join(greeter, '.di-framework', 'deploy', 'workload.yaml'), 'utf8');
+      expect(yaml).toContain('- name: greeter-control');
+      expect(yaml).not.toContain('DI_CONTROL_TOKEN_REVISION');
+      for (const value of ['app-token', 'https://id.example.com', 'private-exponent']) {
+        expect(yaml).not.toContain(value);
+        expect(io.stdout.join('')).not.toContain(value);
+      }
+    });
+
+    it('a tenant developer still rotates a Secret that holds only the CLI keys', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const api = writeOnlySecretsApi();
+      const deps = depsWithApi(greeter, api);
+      await runWasmcloudDeploy(['--target', 'development'], captureIo().io, deps);
+      const first = decoded(api.secrets.get('greeter-control'), 'DI_CONTROL_TOKEN');
+      await runWasmcloudDeploy(['--target', 'development'], captureIo().io, deps);
+      expect(decoded(api.secrets.get('greeter-control'), 'DI_CONTROL_TOKEN')).not.toBe(first);
+      expect(
+        api.requests.map((entry) => `${entry.verb} ${entry.status}${entry.dryRun ? ' dry' : ''}`),
+      ).toEqual(['create 201', 'create 409', 'update 403 dry', 'update 200']);
+    });
+
+    it('a tenant developer is refused when an extra key is not declared', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const api = writeOnlySecretsApi();
+      api.secrets.set('greeter-control', appWritten({ STRAY: encode('nobody vouched for this') }));
+      const before = JSON.stringify(api.secrets.get('greeter-control'));
+      await expect(
+        writeControlSecret(loadProject(greeter), CONNECTION, depsWithApi(greeter, api)),
+      ).rejects.toMatchObject({
+        code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+        exitCode: 2,
+        message: expect.stringContaining("has keys this CLI didn't write"),
+      });
+      expect(JSON.stringify(api.secrets.get('greeter-control'))).toBe(before);
+      expect(
+        api.requests.map((entry) => `${entry.verb} ${entry.status}${entry.dryRun ? ' dry' : ''}`),
+      ).toEqual(['create 409', 'update 403 dry', 'update 403', 'update 403 dry']);
+    });
+
+    for (const [caller, story] of [
+      ['a write-only caller that is not di-user-*', 'a CI ServiceAccount bound to di-developer'],
+      ['a namespace outside the policy', 'a namespace the binding does not select'],
+    ] as const) {
+      it(`refuses to replace blind for ${caller} (${story}), instead of dropping the app keys`, async () => {
+        // Secrets are write-only, and no admission policy refuses a dropped key.
+        const { greeter } = makeWorkspace();
+        declare(greeter);
+        const api = writeOnlySecretsApi('wasmcloud', { unguarded: true });
+        api.secrets.set('greeter-control', appWritten());
+        const before = JSON.stringify(api.secrets.get('greeter-control'));
+        await expect(
+          writeControlSecret(loadProject(greeter), CONNECTION, depsWithApi(greeter, api)),
+        ).rejects.toMatchObject({
+          code: 'WASMCLOUD_CONTROL_SECRET_UNGUARDED',
+          exitCode: 2,
+          message: expect.stringContaining(
+            'Refusing to replace the control Secret greeter-control blind: the platform accepted a dry-run update that drops DI_CONTROL_TOKEN',
+          ),
+        });
+        // Only the dry run was sent; every app key is still there.
+        expect(JSON.stringify(api.secrets.get('greeter-control'))).toBe(before);
+        expect(
+          api.requests.map((entry) => `${entry.verb} ${entry.status}${entry.dryRun ? ' dry' : ''}`),
+        ).toEqual(['create 409', 'update 200 dry']);
+      });
+    }
+
+    it('without declared keys an unguarded caller replaces the Secret as before', async () => {
+      const { greeter } = makeWorkspace();
+      const api = writeOnlySecretsApi('wasmcloud', { unguarded: true });
+      api.secrets.set('greeter-control', {
+        metadata: { name: 'greeter-control' },
+        data: { DI_CONTROL_TOKEN: encode('old'), DI_CONTROL_IDENTITY: encode('greeter') },
+      });
+      const written = await writeControlSecret(
+        loadProject(greeter),
+        CONNECTION,
+        depsWithApi(greeter, api),
+      );
+      expect(written.revision).toMatch(/^[0-9a-f]{16}$/);
+      expect(api.requests.map((entry) => `${entry.verb} ${entry.status}`)).toEqual([
+        'create 409',
+        'update 200',
+      ]);
+    });
+
+    for (const missing of ['DI_CONTROL_TOKEN', 'DI_CONTROL_IDENTITY']) {
+      it(`refuses to keep a Secret whose app tooling left out ${missing}`, async () => {
+        const { greeter } = makeWorkspace();
+        declare(greeter);
+        const api = writeOnlySecretsApi();
+        const secret = appWritten();
+        delete secret.data?.[missing];
+        api.secrets.set('greeter-control', secret);
+        const before = JSON.stringify(api.secrets.get('greeter-control'));
+        await expect(
+          writeControlSecret(loadProject(greeter), CONNECTION, depsWithApi(greeter, api)),
+        ).rejects.toMatchObject({
+          code: 'WASMCLOUD_CONTROL_SECRET_INCOMPLETE',
+          exitCode: 2,
+          details: { key: missing },
+          message: expect.stringContaining(
+            `holds declared app keys but no ${missing}, so the workload would have no control credentials`,
+          ),
+        });
+        expect(JSON.stringify(api.secrets.get('greeter-control'))).toBe(before);
+      });
+    }
+
+    it('a tenant developer sees other dry-run failures as they are', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const deps = fakeDeps({ cwd: greeter });
+      let replaces = 0;
+      deps.runCaptured = async (_command, args) => {
+        if (args.includes('create'))
+          return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+        if (args.includes('can-i')) return { exitCode: 1, stdout: 'no\n', stderr: '' };
+        replaces += 1;
+        return replaces < 3
+          ? {
+              exitCode: 1,
+              stdout: '',
+              stderr: `Error from server (Forbidden): ${admissionDenial('greeter-control', 'tenant-secret-update', KEYS_DENIAL)}`,
+            }
+          : { exitCode: 1, stdout: '', stderr: 'Error from server (InternalError): etcd' };
+      };
+      await expect(
+        writeControlSecret(loadProject(greeter), CONNECTION, deps),
+      ).rejects.toMatchObject({
+        code: 'WASMCLOUD_TOOL_FAILED',
+        message:
+          'kubectl replace --dry-run failed with exit code 1: Error from server (InternalError): etcd',
+      });
+    });
+
+    it('an admin rotates the token and carries every declared value over', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const api = writeOnlySecretsApi('wasmcloud', { admin: true });
+      api.secrets.set('greeter-control', {
+        ...appWritten(),
+        metadata: { ...appWritten().metadata, labels: { team: 'identity' } },
+      });
+      const io = captureIo();
+      await runWasmcloudDeploy(['--target', 'development'], io.io, depsWithApi(greeter, api));
+
+      const stored = api.secrets.get('greeter-control');
+      const token = decoded(stored, 'DI_CONTROL_TOKEN') ?? '';
+      expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(decoded(stored, 'DI_CONTROL_IDENTITY')).toBe('greeter');
+      expect(decoded(stored, 'ISSUER_URL')).toBe('https://id.example.com');
+      expect(decoded(stored, 'AUTH_ACTIVE_PRIVATE_JWK')).toBe(
+        '{"kty":"RSA","d":"private-exponent"}',
+      );
+      expect(decoded(stored, 'DI_PGLITE_KEY')).toBe('cGdsaXRlLWtleS1tYXRlcmlhbA==');
+      expect(Object.keys(stored?.data ?? {}).sort()).toEqual(
+        ['DI_CONTROL_IDENTITY', 'DI_CONTROL_TOKEN', ...APP_KEYS].sort(),
+      );
+      expect(api.requests.map((entry) => `${entry.verb} ${entry.status}`)).toEqual([
+        'create 409',
+        'get 200',
+        'update 200',
+      ]);
+      const yaml = readFileSync(join(greeter, '.di-framework', 'deploy', 'workload.yaml'), 'utf8');
+      const revision = createHash('sha256').update(token).digest('hex').slice(0, 16);
+      expect(yaml).toContain(`DI_CONTROL_TOKEN_REVISION: "${revision}"`);
+      expect(io.stdout.join('')).not.toContain('Kept control Secret');
+      expect(io.stdout.join('')).not.toContain('private-exponent');
+    });
+
+    it('an admin is refused, by key name, when a key is not declared, instead of dropping it', async () => {
+      const { greeter } = makeWorkspace();
+      const api = writeOnlySecretsApi('wasmcloud', { admin: true });
+      api.secrets.set('greeter-control', appWritten());
+      const before = JSON.stringify(api.secrets.get('greeter-control'));
+      const failure = await writeControlSecret(
+        loadProject(greeter),
+        CONNECTION,
+        depsWithApi(greeter, api),
+      ).then(
+        () => undefined,
+        (error: unknown) => error as { code: string; message: string; details: unknown },
+      );
+      expect(failure).toMatchObject({
+        code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+        message:
+          'The control Secret greeter-control has undeclared keys ISSUER_URL, AUTH_ACTIVE_PRIVATE_JWK, ' +
+          'DI_PGLITE_KEY; declare app-owned keys in "controlSecretKeys" of di-framework.config.json, ' +
+          'or delete the Secret with `kubectl delete secret greeter-control --namespace wasmcloud` and redeploy',
+        details: { keys: ['ISSUER_URL', 'AUTH_ACTIVE_PRIVATE_JWK', 'DI_PGLITE_KEY'] },
+      });
+      expect(JSON.stringify(failure)).not.toContain('private-exponent');
+      expect(JSON.stringify(api.secrets.get('greeter-control'))).toBe(before);
+      expect(api.requests.map((entry) => `${entry.verb} ${entry.status}`)).toEqual([
+        'create 409',
+        'get 200',
+      ]);
+    });
+
+    it('an admin without declarations rotates a Secret that holds only the CLI keys', async () => {
+      const { greeter } = makeWorkspace();
+      const api = writeOnlySecretsApi('wasmcloud', { admin: true });
+      api.secrets.set('greeter-control', {
+        metadata: { name: 'greeter-control' },
+        data: { DI_CONTROL_TOKEN: encode('old'), DI_CONTROL_IDENTITY: encode('greeter') },
+      });
+      const written = await writeControlSecret(
+        loadProject(greeter),
+        CONNECTION,
+        depsWithApi(greeter, api),
+      );
+      expect(written.revision).toMatch(/^[0-9a-f]{16}$/);
+      expect(decoded(api.secrets.get('greeter-control'), 'DI_CONTROL_TOKEN')).not.toBe('old');
+    });
+
+    it('an admin update that lost a race is reported as a changed Secret, scrubbed of values', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const api = writeOnlySecretsApi('wasmcloud', { admin: true });
+      api.secrets.set('greeter-control', appWritten());
+      const deps = depsWithApi(greeter, api);
+      const runCaptured = deps.runCaptured;
+      deps.runCaptured = async (command, args, options) => {
+        const result = await runCaptured(command, args, options);
+        // Someone else writes the Secret between this deploy's read and its update.
+        if (reads(args)) {
+          const current = api.secrets.get('greeter-control') as StoredSecret;
+          api.secrets.set('greeter-control', {
+            ...current,
+            metadata: { ...current.metadata, resourceVersion: '8' },
+          });
+        }
+        return result;
+      };
+      await expect(
+        writeControlSecret(loadProject(greeter), CONNECTION, deps),
+      ).rejects.toMatchObject({
+        code: 'WASMCLOUD_CONTROL_SECRET_CHANGED',
+        message:
+          'The control Secret greeter-control in wasmcloud changed while deploy was updating it; re-run deploy',
+        exitCode: 3,
+      });
+      expect(decoded(api.secrets.get('greeter-control'), 'DI_CONTROL_TOKEN')).toBe('app-token');
+    });
+
+    it('an admin read failure never shows a value read or the token', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const jwk = '{"kty":"RSA","d":"private-exponent"}';
+      const stored = JSON.stringify(appWritten());
+      const answer = (args: readonly string[]) => {
+        if (args.includes('create'))
+          return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+        if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+        if (reads(args)) return { exitCode: 0, stdout: stored, stderr: '' };
+        const body = readFileSync(args[args.indexOf('-f') + 1] ?? '', 'utf8');
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: `Error from server (BadRequest): ${body} ${jwk}`,
+        };
+      };
+      const deps = fakeDeps({ cwd: greeter });
+      deps.runCaptured = async (_command, args) => answer(args);
+      const failure = await writeControlSecret(loadProject(greeter), CONNECTION, deps).then(
+        () => undefined,
+        (error: unknown) => error as { code: string; message: string },
+      );
+      expect(failure?.code).toBe('WASMCLOUD_TOOL_FAILED');
+      expect(failure?.message).toContain('Error from server (BadRequest)');
+      for (const secret of [jwk, encode(jwk), 'https://id.example.com', 'app-token']) {
+        expect(failure?.message).not.toContain(secret);
+      }
+
+      const unreadable = fakeDeps({ cwd: greeter });
+      unreadable.runCaptured = async (_command, args) =>
+        reads(args) ? { exitCode: 0, stdout: 'not json', stderr: '' } : answer(args);
+      await expect(
+        writeControlSecret(loadProject(greeter), CONNECTION, unreadable),
+      ).rejects.toMatchObject({
+        code: 'WASMCLOUD_TOOL_FAILED',
+        message: 'kubectl get returned a control Secret greeter-control that is not JSON',
+      });
+
+      const forbidden = fakeDeps({ cwd: greeter });
+      forbidden.runCaptured = async (_command, args) =>
+        reads(args)
+          ? { exitCode: 1, stdout: '', stderr: 'Error from server (Forbidden): no' }
+          : answer(args);
+      await expect(
+        writeControlSecret(loadProject(greeter), CONNECTION, forbidden),
+      ).rejects.toMatchObject({
+        code: 'WASMCLOUD_TOOL_FAILED',
+        message: 'kubectl get failed with exit code 1: Error from server (Forbidden): no',
+      });
+
+      const odd = (data: Record<string, unknown>) => {
+        const deps = fakeDeps({ cwd: greeter });
+        deps.runCaptured = async (_command, args) =>
+          reads(args)
+            ? { exitCode: 0, stdout: JSON.stringify({ metadata: {}, data }), stderr: '' }
+            : args.includes('replace')
+              ? { exitCode: 0, stdout: '', stderr: '' }
+              : answer(args);
+        return deps;
+      };
+      // A value the API would never return is not skipped: declared or not, it fails closed.
+      for (const key of ['ISSUER_URL', 'STRAY']) {
+        await expect(
+          writeControlSecret(loadProject(greeter), CONNECTION, odd({ [key]: 7 })),
+        ).rejects.toMatchObject({
+          code: 'WASMCLOUD_TOOL_FAILED',
+          message: `kubectl get returned a control Secret greeter-control whose ${key} is not a string`,
+        });
+      }
+      expect(
+        (await writeControlSecret(loadProject(greeter), CONNECTION, odd({}))).revision,
+      ).toMatch(/^[0-9a-f]{16}$/);
+    });
+
+    it('redacts short values read from the cluster as whole tokens only', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter, ['SHORT', 'TINY']);
+      const stored = JSON.stringify({
+        metadata: { resourceVersion: '1' },
+        data: { SHORT: encode('ok'), TINY: encode('7') },
+      });
+      const deps = fakeDeps({ cwd: greeter });
+      deps.runCaptured = async (_command, args) => {
+        if (args.includes('create'))
+          return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+        if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+        if (reads(args)) return { exitCode: 0, stdout: stored, stderr: '' };
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            'Error from server (BadRequest): value ok rejected (7), token "ok"; looks okay, 17',
+        };
+      };
+      await expect(
+        writeControlSecret(loadProject(greeter), CONNECTION, deps),
+      ).rejects.toMatchObject({
+        message:
+          'kubectl replace failed with exit code 1: Error from server (BadRequest): value [redacted] rejected ([redacted]), token "[redacted]"; looks okay, 17',
+      });
+    });
+
+    it('rejects controlSecretKeys that are not declarable', () => {
+      const { greeter } = makeWorkspace();
+      for (const [keys, message] of [
+        ['ISSUER_URL', '"controlSecretKeys" must be an array of names'],
+        [
+          ['ISSUER-URL'],
+          '"controlSecretKeys"[0]: "ISSUER-URL" is not an environment variable name',
+        ],
+        [[7], '"controlSecretKeys"[0]: 7 is not an environment variable name'],
+        [
+          ['DI_CONTROL_TOKEN'],
+          '"controlSecretKeys"[0]: DI_CONTROL_TOKEN is reserved for the framework; of the DI_* names only DI_PGLITE_KEY and DI_PGLITE_KEY_PREVIOUS may be declared',
+        ],
+        [['A', 'QUEUE_DB_PATH'], '"controlSecretKeys"[1]: QUEUE_DB_PATH is rendered by the CLI'],
+        [['A', 'B', 'A'], '"controlSecretKeys" repeats A'],
+      ] as const) {
+        declare(greeter, keys as unknown as string[]);
+        expect(() => loadProject(greeter)).toThrow(message);
+      }
+      declare(greeter, []);
+      expect(loadProject(greeter).controlSecretKeys).toBeUndefined();
+      declare(greeter, ['DI_PGLITE_KEY', 'DI_PGLITE_KEY_PREVIOUS', 'issuer_url']);
+      expect(loadProject(greeter).controlSecretKeys).toEqual([
+        'DI_PGLITE_KEY',
+        'DI_PGLITE_KEY_PREVIOUS',
+        'issuer_url',
+      ]);
+    });
+
+    it('a deploy that kept the Secret does not claim the token rotated when it fails', async () => {
+      const { greeter } = makeWorkspace();
+      declare(greeter);
+      const api = writeOnlySecretsApi();
+      api.secrets.set('greeter-control', appWritten());
+      const applyFails = depsWithApi(greeter, api, [], { exitCodes: { 'kubectl apply': 1 } });
+      await expect(
+        runWasmcloudDeploy(['--target', 'development'], captureIo().io, applyFails),
+      ).rejects.toMatchObject({
+        message: 'kubectl apply failed with exit code 1',
+        details: { command: 'kubectl apply', exitCode: 1 },
+      });
+    });
   });
 
   it('says the token was rotated when the deploy fails after the control Secret write', async () => {
@@ -653,8 +1156,22 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
             ],
           });
         }
+        if (url.pathname === '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews') {
+          requests.push(`${incoming.method} ${url.pathname}`);
+          // A tenant developer may not get Secrets (platform#112). kubectl may send protobuf,
+          // so the review is answered without reading it.
+          return Response.json(
+            {
+              apiVersion: 'authorization.k8s.io/v1',
+              kind: 'SelfSubjectAccessReview',
+              spec: {},
+              status: { allowed: false },
+            },
+            { status: 201 },
+          );
+        }
         if (match === null) return new Response('not found', { status: 404 });
-        requests.push(`${incoming.method} ${url.pathname}`);
+        requests.push(`${incoming.method} ${url.pathname}${url.search}`);
         const name = match[2];
         if (incoming.method === 'GET' || incoming.method === 'PATCH') {
           return status(403, 'Forbidden', 'secrets is forbidden');
@@ -703,8 +1220,14 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
           const denial = name.startsWith('future-managed-')
             ? MANAGED_DENIAL
             : updateDenial(name, existing, body);
+          const dryRun = url.searchParams.get('dryRun') === 'All';
           if (denial !== undefined) {
+            if (dryRun) requests.push('  dry run refused');
             return status(403, 'Forbidden', admissionDenial(name, 'tenant-secret-update', denial));
+          }
+          if (dryRun) {
+            requests.push('  dry run accepted');
+            return Response.json(body);
           }
           secrets.set(name, body);
           return Response.json(body);
@@ -812,6 +1335,8 @@ current-context: fake
     expect(requests).toEqual([
       `POST ${collection}`,
       `POST ${collection}`,
+      // Asks whether it may read the Secret; a tenant developer may not, so it never tries.
+      'POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
       `PUT ${collection}/greeter-control`,
       `DELETE ${collection}/greeter-control`,
       `DELETE ${collection}/greeter-control`,
@@ -819,6 +1344,44 @@ current-context: fake
       `PUT ${collection}/db-login`,
       `PUT ${collection}/future-managed-creds`,
       `PUT ${collection}/registry-creds`,
+    ]);
+  }, 30_000);
+  it('keeps a Secret with declared app keys using a dry-run PUT, never a GET', async () => {
+    const { greeter } = makeWorkspace();
+    const configPath = join(greeter, 'di-framework.config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    writeFileSync(configPath, JSON.stringify({ ...config, controlSecretKeys: ['ISSUER_URL'] }));
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+    const stored = {
+      metadata: { name: 'greeter-control' },
+      data: {
+        DI_CONTROL_TOKEN: encode('app-token'),
+        DI_CONTROL_IDENTITY: encode('greeter'),
+        ISSUER_URL: encode('https://id.example.com'),
+      },
+    };
+    secrets.set('greeter-control', stored);
+    const start = requests.length;
+    const written = await writeControlSecret(loadProject(greeter), connection, realDeps(greeter));
+    expect(written).toEqual({ name: 'greeter-control' });
+    expect(secrets.get('greeter-control')).toBe(stored);
+    const collection = '/api/v1/namespaces/wasmcloud/secrets';
+    expect(requests.slice(start)).toEqual([
+      `POST ${collection}`,
+      'POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
+      // Dropping DI_CONTROL_TOKEN is refused, so the policy guards the Secret.
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run refused',
+      // The real replace with only the CLI keys is refused: the Secret holds more.
+      `PUT ${collection}/greeter-control`,
+      // Every extra key is declared.
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run accepted',
+      // Leaving out DI_CONTROL_TOKEN, then DI_CONTROL_IDENTITY, is refused: both are stored.
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run refused',
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run refused',
     ]);
   }, 30_000);
 });

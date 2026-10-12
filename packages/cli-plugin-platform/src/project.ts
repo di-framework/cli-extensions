@@ -2,6 +2,7 @@ import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'n
 import { isIP } from 'node:net';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { CommandFailure } from '@di-framework/cli-extension';
+import { RENDERED_ENVIRONMENT_KEYS } from './environment-names';
 import { type PgliteConfig, parsePgliteConfig } from './pglite';
 import { discoverWorkloadEntry, type WorkloadEntry } from './workload-members';
 
@@ -48,7 +49,45 @@ export type WasmcloudProject = {
    * component is exclusive and gets persistent storage at `storageMount`.
    */
   pglite?: PgliteConfig;
+  /**
+   * App-owned keys of the `<workload>-control` Secret, from `"controlSecretKeys"`. Deploy keeps
+   * them and refuses any other key besides the CLI's own `DI_CONTROL_*` (`writeControlSecret`).
+   */
+  controlSecretKeys?: string[];
 };
+
+/** A key the control Secret may carry for the app: an environment variable name. */
+const CONTROL_SECRET_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,252}$/;
+/**
+ * The `DI_*` keys a project may declare. Every other `DI_*` name belongs to the framework: the CLI
+ * owns it in the control Secret or renders it into the workload's environment config, and a
+ * Secret key must not shadow either.
+ */
+const DECLARABLE_DI_KEYS = ['DI_PGLITE_KEY', 'DI_PGLITE_KEY_PREVIOUS'];
+
+/** Why `name` cannot be declared in `controlSecretKeys`, or undefined when it can. */
+export function controlSecretKeyProblem(name: unknown): string | undefined {
+  if (typeof name !== 'string' || !CONTROL_SECRET_KEY.test(name))
+    return `${JSON.stringify(name)} is not an environment variable name`;
+  if (name.startsWith('DI_') && !DECLARABLE_DI_KEYS.includes(name))
+    return `${name} is reserved for the framework; of the DI_* names only ${DECLARABLE_DI_KEYS.join(' and ')} may be declared`;
+  if (RENDERED_ENVIRONMENT_KEYS.includes(name)) return `${name} is rendered by the CLI`;
+  return undefined;
+}
+
+function parseControlSecretKeys(value: unknown, configPath: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value))
+    configInvalid(`${CONFIG_FILE_NAME} "controlSecretKeys" must be an array of names`, configPath);
+  for (const [index, name] of value.entries()) {
+    const problem = controlSecretKeyProblem(name);
+    if (problem !== undefined)
+      configInvalid(`${CONFIG_FILE_NAME} "controlSecretKeys"[${index}]: ${problem}`, configPath);
+    if (value.indexOf(name) !== index)
+      configInvalid(`${CONFIG_FILE_NAME} "controlSecretKeys" repeats ${name}`, configPath);
+  }
+  return value.length > 0 ? [...(value as string[])] : undefined;
+}
 
 export function findUp(startDirectory: string, fileName: string): string | undefined {
   let previous = '';
@@ -216,6 +255,7 @@ export function loadProject(startDirectory: string): WasmcloudProject {
   const pglite = parsePgliteConfig(config.pglite, configPath, (path) =>
     resolveRealInside(projectRoot, path, 'pglite.wasm', configPath),
   );
+  const controlSecretKeys = parseControlSecretKeys(config.controlSecretKeys, configPath);
 
   return {
     applicationName: config.name,
@@ -225,6 +265,7 @@ export function loadProject(startDirectory: string): WasmcloudProject {
     ...(persistentStorage ? { persistentStorage: true } : {}),
     ...(config.logs === false ? { logs: false as const } : {}),
     ...(pglite ? { pglite } : {}),
+    ...(controlSecretKeys ? { controlSecretKeys } : {}),
     ...(config.allowedIpNameLookups === undefined
       ? {}
       : { allowedIpNameLookups: config.allowedIpNameLookups as string[] }),

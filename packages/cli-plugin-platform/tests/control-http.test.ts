@@ -26,6 +26,28 @@ afterEach(() => {
 });
 
 describe('control auth', () => {
+  it('fails closed in a deployed workload whose control Secret lost its token', () => {
+    const request = new Request('http://localhost/_di/cron/nightly/invoke', { method: 'POST' });
+    for (const [name, value] of [
+      ['DI_CONTROL_REJECT_FORWARDED', '1'],
+      ['DI_CONTROL_HTTP_HOST', 'greeter,greeter.wasmcloud.svc.cluster.local'],
+      ['DI_CONTROL_IDENTITY', 'greeter'],
+      ['DI_CONTROL_TOKEN', ''],
+    ] as const) {
+      process.env[name] = value;
+      expect(authorizeControlRequest(request)).toEqual({
+        ok: false,
+        status: 401,
+        error: 'Missing control credentials',
+      });
+      delete process.env[name];
+    }
+    // Neither a blank host list nor another value of the forwarded flag marks a deployment.
+    process.env.DI_CONTROL_HTTP_HOST = ' ';
+    process.env.DI_CONTROL_REJECT_FORWARDED = '0';
+    expect(authorizeControlRequest(request).ok).toBe(true);
+  });
+
   it('allows anonymous invoke without admin when no credentials are configured', () => {
     const result = authorizeControlRequest(new Request('http://local/'));
     expect(result).toEqual({
