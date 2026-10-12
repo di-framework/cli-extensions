@@ -348,7 +348,10 @@ on every deploy.
      must be refused. If it is accepted, the policy does not apply to this caller (a write-only
      identity that is not `di-user-*`, or a namespace outside the policy), or the Secret has no
      token. A blind replace could then drop the app keys for good, so deploy stops with
-     `WASMCLOUD_CONTROL_SECRET_UNGUARDED` and writes nothing.
+     `WASMCLOUD_CONTROL_SECRET_UNGUARDED` and writes nothing. As a result, a write-only caller
+     outside `di-user-*` (for example a CI ServiceAccount bound to the developer role) cannot
+     deploy a project that declares app keys. Deploy it as a tenant developer, or with an
+     identity that may read Secrets.
   2. Replaces the whole Secret with the CLI's keys and a new token. That succeeds, and rotates
      the token, only while the Secret holds nothing else.
   3. If the replace is refused, sends a dry run with the CLI's keys and every declared key. If
@@ -358,8 +361,10 @@ on every deploy.
   4. Leaves out `DI_CONTROL_TOKEN`, then `DI_CONTROL_IDENTITY`, in two more dry runs. Each must
      be refused, which proves the key is stored. Otherwise the app tooling dropped it, and
      deploy stops with `WASMCLOUD_CONTROL_SECRET_INCOMPLETE` rather than run a workload
-     without control credentials. (A deployed workload without a token refuses every control
-     request.)
+     without control credentials. The checks see key names only, so a present but empty
+     `DI_CONTROL_TOKEN` passes them. The deployed workload then has no usable token and
+     answers every control request (cron, queue and actor endpoints) with 401; it never falls
+     back to unauthenticated access. Make sure the tooling writes a non-empty token.
   5. Keeps the Secret as it is, token included, says "Kept control Secret
      `<deployment>-control`", and renders no `DI_CONTROL_TOKEN_REVISION`.
 
