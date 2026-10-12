@@ -19,21 +19,42 @@ const WORLD_ITEM =
   /^\s*(import|export)\s+([a-z][a-z0-9-]*:[a-z][a-z0-9-]*\/[a-z][a-z0-9-]*)(?:@([^;\s]+))?;\s*$/;
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
 
-/** The interfaces a component's world imports and exports, from `jco wit` output. */
-export function worldInterfaces(wit: string): { imports: WitInterface[]; exports: WitInterface[] } {
+const WORLD_LINE = /^\s*(import|export)\s/;
+
+/**
+ * The interfaces a component's world imports and exports, from `jco wit` output. `unrecognized`
+ * holds every other `import`/`export` line, such as a plain-named `import fs: interface {` or a
+ * bare function, which the wiring cannot reason about.
+ */
+export function worldInterfaces(wit: string): {
+  imports: WitInterface[];
+  exports: WitInterface[];
+  unrecognized: string[];
+} {
   const imports: WitInterface[] = [];
   const exports: WitInterface[] = [];
+  const unrecognized: string[] = [];
   for (const line of wit.split('\n')) {
     const match = WORLD_ITEM.exec(line);
-    if (match === null) continue;
+    if (match === null) {
+      if (WORLD_LINE.test(line)) unrecognized.push(line.trim());
+      continue;
+    }
     const item = {
       name: match[2] as string,
       ...(match[3] === undefined ? {} : { version: match[3] }),
     };
     (match[1] === 'import' ? imports : exports).push(item);
   }
-  return { imports, exports };
+  return { imports, exports, unrecognized };
 }
+
+/**
+ * Interfaces the provider may take straight from the host. Everything else it imports must be
+ * wired to the layer, so a provider that reached storage some other way (another filesystem
+ * package, a plain-named interface) stops the build instead of bypassing the layer.
+ */
+export const HOST_PASS_THROUGH = ['wasi:io/', 'wasi:clocks/', 'wasi:random/', 'wasi:cli/'];
 
 export function formatInterface(item: WitInterface): string {
   return item.version === undefined ? item.name : `${item.name}@${item.version}`;
@@ -73,9 +94,14 @@ export type Wire = { providerImport: string; layerExport: string };
  * types refer to them.
  */
 export function planWiring(
-  provider: { imports: WitInterface[] },
+  provider: { imports: WitInterface[]; exports?: WitInterface[]; unrecognized?: string[] },
   layer: { exports: WitInterface[] },
 ): { wires: Wire[]; problem?: string } {
+  if (provider.unrecognized !== undefined && provider.unrecognized.length > 0)
+    return {
+      wires: [],
+      problem: `the provider's world has items the build cannot wire: ${provider.unrecognized.join('; ')}`,
+    };
   const required = provider.imports.filter(isFilesystem);
   if (required.length === 0)
     return {
@@ -98,7 +124,13 @@ export function planWiring(
       });
       continue;
     }
-    if (!isFilesystem(wanted)) continue;
+    if (!isFilesystem(wanted)) {
+      if (!HOST_PASS_THROUGH.some((prefix) => wanted.name.startsWith(prefix)))
+        missing.push(
+          `${formatInterface(wanted)} (neither exported by the layer nor allowed from the host)`,
+        );
+      continue;
+    }
     const found = layer.exports
       .filter((item) => item.name === wanted.name)
       .map((item) => `@${item.version ?? 'unversioned'}`);
@@ -139,4 +171,48 @@ export function encryptionComposition(
     ...providerExports.map((item) => `export provider[${quote(formatInterface(item))}];`),
     '',
   ].join('\n');
+}
+
+/** Custom section the platform's encryption layer carries (`format=1 codec=aes-256-xts`). */
+export const ENCFS_SECTION = 'di-framework:pglite-encfs';
+
+/**
+ * The contents of the `di-framework:pglite-encfs` custom section anywhere in a core module or
+ * component binary, including nested modules and components, or undefined when there is none.
+ */
+export function encfsSection(bytes: Uint8Array): string | undefined {
+  const decoder = new TextDecoder();
+  const walk = (start: number, end: number): string | undefined => {
+    if (end - start < 8 || bytes[start] !== 0 || bytes[start + 1] !== 0x61) return undefined;
+    const component = bytes[start + 6] === 1;
+    let offset = start + 8;
+    const leb = (): number => {
+      let result = 0;
+      let shift = 0;
+      for (;;) {
+        const byte = bytes[offset++] as number;
+        result += (byte & 0x7f) * 2 ** shift;
+        if ((byte & 0x80) === 0 || offset >= end) return result;
+        shift += 7;
+      }
+    };
+    while (offset < end) {
+      const id = bytes[offset++] as number;
+      const size = leb();
+      const body = offset;
+      const next = Math.min(end, body + size);
+      if (id === 0) {
+        offset = body;
+        const length = leb();
+        const name = decoder.decode(bytes.subarray(offset, offset + length));
+        if (name === ENCFS_SECTION) return decoder.decode(bytes.subarray(offset + length, next));
+      } else if (component && (id === 1 || id === 4)) {
+        const found = walk(body, next);
+        if (found !== undefined) return found;
+      }
+      offset = next;
+    }
+    return undefined;
+  };
+  return walk(0, bytes.length);
 }

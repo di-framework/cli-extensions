@@ -40,6 +40,7 @@ import {
   warnIfHostIgnoresExclusive,
 } from '../src/pglite';
 import {
+  encfsSection,
   encryptionComposition,
   planWiring,
   semverCompatible,
@@ -61,6 +62,23 @@ import {
 
 const REPOSITORY = 'ghcr.io/di-framework/pglite-component';
 const PROVIDER = Buffer.from('\0asm\x01\0\0\0pglite-provider');
+
+/** A component binary with only custom sections: the pglite-encfs marker and `extra`. */
+const marked = (extra: string, marker = true): Buffer => {
+  const section = (name: string, contents: string) => {
+    const body = Buffer.concat([
+      Buffer.from([name.length]),
+      Buffer.from(name),
+      Buffer.from(contents),
+    ]);
+    return Buffer.concat([Buffer.from([0, body.length]), body]);
+  };
+  return Buffer.concat([
+    Buffer.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 0x01, 0]),
+    ...(marker ? [section('di-framework:pglite-encfs', 'format=1 codec=aes-256-xts')] : []),
+    section('extra', extra),
+  ]);
+};
 
 function digestOf(bytes: Uint8Array): string {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -1036,7 +1054,7 @@ describe('pglite deploy', () => {
 
 describe('pglite encryption', () => {
   const ENC_REPOSITORY = 'ghcr.io/di-framework/pglite-encfs';
-  const LAYER = Buffer.from('\0asm\x01\0\0\0pglite-encfs');
+  const LAYER = marked('pglite-encfs');
   const ENC_MANIFEST = manifestFor(LAYER);
   const ENC_IMAGE = `${ENC_REPOSITORY}@${digestOf(ENC_MANIFEST)}`;
   const GUEST =
@@ -1454,6 +1472,70 @@ describe('pglite encryption', () => {
     expect(invocations.some((entry) => entry.args[0] === 'compose')).toBe(false);
   });
 
+  it('names the missing tool when wac or jco is not installed', async () => {
+    const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
+    const throwing = (error: unknown, when: (args: readonly string[]) => boolean) => {
+      const deps = buildDeps(root);
+      const runCaptured = deps.runCaptured;
+      deps.runCaptured = async (command, args, options) => {
+        if (when(args)) throw error;
+        return runCaptured(command, args, options);
+      };
+      return deps;
+    };
+    const missing = new Error('ENOENT: Executable not found in $PATH: "wac"');
+    await expect(
+      buildComponent(
+        loadProject(root),
+        captureIo().io,
+        throwing(missing, (args) => args[0] === 'compose'),
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_WAC_REQUIRED',
+      exitCode: 3,
+      message: expect.stringContaining('wac is required to compose components'),
+    });
+    // The guest's own provider plug maps the same way, and a spawn code is enough to tell.
+    const plain = project({ image: IMAGE });
+    const coded = Object.assign(new Error('spawn failed'), { code: 'ENOENT' });
+    await expect(
+      buildComponent(
+        loadProject(plain),
+        captureIo().io,
+        throwing(coded, (args) => args[0] === 'plug'),
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_WAC_REQUIRED' });
+    // Anything else wac throws is left as it is.
+    const other = new Error('interrupted');
+    await expect(
+      buildComponent(
+        loadProject(plain),
+        captureIo().io,
+        throwing(other, (args) => args[0] === 'plug'),
+      ),
+    ).rejects.toBe(other);
+    await expect(
+      buildComponent(
+        loadProject(plain),
+        captureIo().io,
+        throwing(null, (args) => args[0] === 'plug'),
+      ),
+    ).rejects.toBeNull();
+
+    const noJco = buildDeps(root);
+    const runCaptured = noJco.runCaptured;
+    noJco.runCaptured = async (command, args, options) =>
+      args[1] === 'wit'
+        ? { exitCode: 1, stdout: '', stderr: "Error: Cannot find module '/fake/jco.js'" }
+        : runCaptured(command, args, options);
+    await expect(buildComponent(loadProject(root), captureIo().io, noJco)).rejects.toMatchObject({
+      code: 'WASMCLOUD_JCO_REQUIRED',
+      message: expect.stringContaining(
+        'jco is required to read the WIT world of the PGlite provider',
+      ),
+    });
+  });
+
   it('reports a WIT world it cannot read', async () => {
     const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
     const deps = buildDeps(root);
@@ -1473,7 +1555,7 @@ describe('pglite encryption', () => {
     const build = () => buildComponent(loadProject(root), captureIo().io, buildDeps(root));
     const layerA = await build();
     expect(await build()).toMatchObject({ deploymentDigest: layerA.deploymentDigest });
-    writeFileSync(join(root, 'vendor', 'encfs.wasm'), Buffer.from('\0asm\x01\0\0\0layer-b'));
+    writeFileSync(join(root, 'vendor', 'encfs.wasm'), marked('layer-b'));
     const layerB = await build();
     expect(layerB.deploymentDigest).not.toBe(layerA.deploymentDigest);
 
@@ -1504,7 +1586,55 @@ describe('pglite encryption interface checks', () => {
         { name: 'di-framework:pglite/database', version: '0.2.0' },
         { name: 'local:pkg/iface' },
       ],
+      unrecognized: ['import x: func();'],
     });
+  });
+
+  it('finds the pglite-encfs marker at any depth of a component, and nowhere else', () => {
+    expect(encfsSection(marked('a'))).toBe('format=1 codec=aes-256-xts');
+    expect(encfsSection(marked('a', false))).toBeUndefined();
+    expect(encfsSection(Buffer.from('not wasm at all'))).toBeUndefined();
+    // A core module nested in a component, as Rust's #[link_section] places it.
+    const inner = marked('core');
+    inner[4] = 1;
+    inner[6] = 0;
+    const nested = Buffer.concat([
+      Buffer.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 0x01, 0]),
+      Buffer.from([1, inner.length]),
+      inner,
+    ]);
+    expect(encfsSection(nested)).toBe('format=1 codec=aes-256-xts');
+    // A section larger than 127 bytes has a multi-byte LEB128 size.
+    const big = Buffer.concat([Buffer.from([3]), Buffer.from('big'), Buffer.alloc(200, 0x61)]);
+    const large = Buffer.concat([
+      Buffer.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 0x01, 0]),
+      Buffer.from([0, 0x80 | (big.length & 0x7f), big.length >> 7]),
+      big,
+      marked('after').subarray(8),
+    ]);
+    expect(encfsSection(large)).toBe('format=1 codec=aes-256-xts');
+  });
+
+  it('refuses unrecognized world items and imports outside the host allowlist', () => {
+    const layer = { exports: [{ name: 'wasi:filesystem/types', version: '0.2.9' }] };
+    const fs = { name: 'wasi:filesystem/types', version: '0.2.9' };
+    expect(
+      planWiring({ imports: [fs], unrecognized: ['import fs: interface {'] }, layer).problem,
+    ).toBe("the provider's world has items the build cannot wire: import fs: interface {");
+    expect(
+      planWiring(
+        {
+          imports: [
+            fs,
+            { name: 'wasi:random/random', version: '0.2.3' },
+            { name: 'wasix:filesystem/types', version: '0.2.9' },
+          ],
+        },
+        layer,
+      ).problem,
+    ).toBe(
+      'the layer does not export what the provider imports: wasix:filesystem/types@0.2.9 (neither exported by the layer nor allowed from the host)',
+    );
   });
 
   it('matches versions the way wac does (wac-types are_semver_compatible)', () => {
@@ -1662,6 +1792,33 @@ describe.skipIf(!hasWac || DEFAULT_DEPS.nodeBinaryPath() === undefined)(
       });
       await expect(compose('layer-typemismatch')).rejects.toThrow(
         'mismatched instantiation argument `wasi:filesystem/types@0.2.9`',
+      );
+    }, 30_000);
+
+    it('refuses a layer without the pglite-encfs marker, even one that wires like layer-full', async () => {
+      await expect(compose('layer-rawpass')).rejects.toMatchObject({
+        code: 'WASMCLOUD_PGLITE_ENCRYPTION_LAYER_UNMARKED',
+        exitCode: 3,
+        message: expect.stringContaining('has no di-framework:pglite-encfs custom section'),
+      });
+      expect(await compose('layer-full')).toEndWith('encrypted.wasm');
+    }, 30_000);
+
+    it('fails closed on provider imports it cannot wire or allow', async () => {
+      await expect(compose('layer-full', 'provider-plain')).rejects.toMatchObject({
+        code: 'WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED',
+        message: expect.stringContaining(
+          "the provider's world has items the build cannot wire: import fs: interface {",
+        ),
+      });
+      await expect(compose('layer-full', 'provider-extrafs')).rejects.toThrow(
+        'wasi:filesystem/extra@0.2.9 (not exported)',
+      );
+      await expect(compose('layer-full', 'provider-altpkg')).rejects.toThrow(
+        'wasix:filesystem/types@0.2.9 (neither exported by the layer nor allowed from the host)',
+      );
+      await expect(compose('layer-full', 'provider-twover')).rejects.toThrow(
+        'wasi:filesystem/types@0.3.0 (the layer exports @0.2.9)',
       );
     }, 30_000);
 

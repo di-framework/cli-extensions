@@ -37,6 +37,8 @@ import {
   resolvePgliteEncryption,
 } from './pglite';
 import {
+  ENCFS_SECTION,
+  encfsSection,
   encryptionComposition,
   LAYER_PACKAGE,
   PROVIDER_PACKAGE,
@@ -262,10 +264,6 @@ async function composeComponentProvider(
   });
 }
 
-/**
- * Plugs one provider component into the built guest: `wac plug`, or the
- * componentize-qjs composer when the guest has named imports to preserve.
- */
 /** `wac` on PATH, else the SQLite toolchain's, and the PATH to run it with. */
 function wacTool(deps: WasmcloudDeps): { wac: string; envPath: string } {
   const toolsBin = sqliteToolsBin();
@@ -279,6 +277,44 @@ function wacTool(deps: WasmcloudDeps): { wac: string; envPath: string } {
   return { wac, envPath };
 }
 
+/** Whether `error` is a spawn failure because the executable does not exist. */
+function isMissingExecutable(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return (
+    code === 'ENOENT' ||
+    (error instanceof Error && /ENOENT|Executable not found/i.test(error.message))
+  );
+}
+
+/** Runs `wac` (or `command`), mapping a missing `wac` binary to `WASMCLOUD_WAC_REQUIRED`. */
+async function runWac(
+  project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
+  deps: WasmcloudDeps,
+  args: string[],
+  command?: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const { wac, envPath } = wacTool(deps);
+  try {
+    return await deps.runCaptured(command ?? wac, args, {
+      cwd: project.projectRoot,
+      env: { ...process.env, PATH: envPath },
+    });
+  } catch (error) {
+    // A missing componentize-qjs compiler surfaces as it is; only wac has an install hint here.
+    if (command !== undefined || !isMissingExecutable(error)) throw error;
+    throw new CommandFailure(
+      'WASMCLOUD_WAC_REQUIRED',
+      'wac is required to compose components; install it (https://github.com/bytecodealliance/wac/releases, or `scripts/install-tools.sh --wac-only` in di-framework/platform `platform/sqlite-component`) and put it on PATH',
+      3,
+      { application: project.applicationName, tool: 'wac' },
+    );
+  }
+}
+
+/**
+ * Plugs one provider component into the built guest: `wac plug`, or the
+ * componentize-qjs composer when the guest has named imports to preserve.
+ */
 async function composeProvider(
   project: WasmcloudProject,
   deps: WasmcloudDeps,
@@ -286,7 +322,6 @@ async function composeProvider(
   options: { label: string; wasm: string; namedImports: boolean; failureCode: string },
 ): Promise<void> {
   const composed = `${project.outputPath}.composed`;
-  const { wac, envPath } = wacTool(deps);
   io.stdout.write(`Composing ${options.label} provider...\n`);
   const compiler = options.namedImports ? deps.componentizeQjsPath() : undefined;
   if (options.namedImports && !compiler)
@@ -295,12 +330,13 @@ async function composeProvider(
       'Managed PostgreSQL needs componentize-qjs 0.4.4-di.3 or newer for named-import composition',
       3,
     );
-  const result = await deps.runCaptured(
-    compiler ?? wac,
+  const result = await runWac(
+    project,
+    deps,
     compiler
       ? ['compose', project.outputPath, '--definition', options.wasm, '-o', composed]
       : ['plug', '--plug', options.wasm, project.outputPath, '-o', composed],
-    { cwd: project.projectRoot, env: { ...process.env, PATH: envPath } },
+    compiler,
   );
   if (result.exitCode !== 0) {
     throw new CommandFailure(
@@ -373,6 +409,14 @@ async function componentWorld(
     [deps.jcoCliPath(), 'wit', path],
     { cwd: project.projectRoot },
   );
+  if (captured.exitCode !== 0 && /Cannot find module/.test(captured.stderr)) {
+    throw new CommandFailure(
+      'WASMCLOUD_JCO_REQUIRED',
+      `jco is required to read the WIT world of the ${label}, but ${deps.jcoCliPath()} could not be loaded; reinstall @di-framework/cli-plugin-platform (it depends on @bytecodealliance/jco)`,
+      3,
+      { application: project.applicationName, tool: 'jco' },
+    );
+  }
   if (captured.exitCode !== 0) {
     throw new CommandFailure(
       'WASMCLOUD_COMPONENT_IMPORTS_UNREADABLE',
@@ -409,6 +453,11 @@ function notInterposed(
  * document that passes each of them as a named instantiation argument (`wac compose`). wac
  * type-checks every argument, so a layer that does not fit fails the build here rather than
  * being bypassed. The document is kept at `.di-framework/pglite-encryption.wac`.
+ *
+ * Wiring cannot show that the layer encrypts: a pass-through layer wires the same way. So the
+ * layer must also carry the platform's `di-framework:pglite-encfs` custom section. That marker
+ * catches the wrong artifact (a no-op or debug layer, a stale local build); it is forgeable, so
+ * what the layer actually does rests on the digest pin.
  */
 export async function encryptProvider(
   project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
@@ -418,6 +467,15 @@ export async function encryptProvider(
   layer: string,
   output: string,
 ): Promise<void> {
+  if (encfsSection(readFileSync(layer)) === undefined) {
+    throw new CommandFailure(
+      'WASMCLOUD_PGLITE_ENCRYPTION_LAYER_UNMARKED',
+      `The PGlite encryption layer ${layer} has no ${ENCFS_SECTION} custom section, so it is not ` +
+        "the platform's pglite-encfs component; pin the published ghcr.io/di-framework/pglite-encfs image",
+      3,
+      { application: project.applicationName, path: layer },
+    );
+  }
   const providerWorld = await componentWorld(project, deps, provider, 'PGlite provider');
   const layerWorld = await componentWorld(project, deps, layer, 'PGlite encryption layer');
   const plan = planWiring(providerWorld, layerWorld);
@@ -426,22 +484,17 @@ export async function encryptProvider(
   const document = join(dirname(output), 'pglite-encryption.wac');
   writeFileSync(document, encryptionComposition(plan.wires, providerWorld.exports));
   rmSync(output, { force: true });
-  const { wac, envPath } = wacTool(deps);
   io.stdout.write('Composing the PGlite encryption layer into the provider...\n');
-  const result = await deps.runCaptured(
-    wac,
-    [
-      'compose',
-      document,
-      '--dep',
-      `${LAYER_PACKAGE}=${layer}`,
-      '--dep',
-      `${PROVIDER_PACKAGE}=${provider}`,
-      '-o',
-      output,
-    ],
-    { cwd: project.projectRoot, env: { ...process.env, PATH: envPath } },
-  );
+  const result = await runWac(project, deps, [
+    'compose',
+    document,
+    '--dep',
+    `${LAYER_PACKAGE}=${layer}`,
+    '--dep',
+    `${PROVIDER_PACKAGE}=${provider}`,
+    '-o',
+    output,
+  ]);
   if (result.exitCode !== 0 || !existsSync(output)) {
     const reason = (result.stderr || result.stdout).trim() || 'wac wrote no component';
     throw notInterposed(project, `wac compose refused the wiring: ${reason}`);

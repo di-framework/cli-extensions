@@ -1,6 +1,8 @@
 ;; Right names and versions, wrong types: its filesystem functions return u64 where the
 ;; provider expects u32. `wac plug` skips such an export silently; `wac compose` refuses it.
 (component
+  ;; The marker the platform pglite-encfs component carries; these stand-ins pass data through.
+  (@custom "di-framework:pglite-encfs" "format=1 codec=test-passthrough")
   (import "wasi:filesystem/types@0.2.9" (instance $host-types (export "stat" (func (result u32)))))
   (import "wasi:filesystem/preopens@0.2.9" (instance $host-preopens (export "get-directories" (func (result u32)))))
   (import "wasi:cli/environment@0.2.9" (instance $host-env (export "get-environment" (func (result u32)))))

@@ -720,10 +720,24 @@ host.
      and passes each of those exports to the provider as a named instantiation argument.
   4. Composes it with `wac compose`, which type-checks every argument.
 
-  A layer that misses a filesystem interface, is on another version track, or exports a type
-  the provider cannot use stops the build with `WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED`,
-  carrying `wac`'s message. Build the layer for the WASI versions the pinned provider imports
-  (`wasi:filesystem/*@0.2.9` for provider 6.0.11).
+  The build stops with `WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED`, carrying `wac`'s message
+  when there is one, if any of these holds:
+  - the layer misses a filesystem interface, is on another version track, or exports a type
+    the provider cannot use;
+  - the provider's world has an item the build cannot read as a versioned interface (such as a
+    plain-named `import fs: interface { … }`);
+  - the provider imports something that is neither wired to the layer nor on the host
+    pass-through allowlist (`wasi:io/*`, `wasi:clocks/*`, `wasi:random/*`, `wasi:cli/*`).
+
+  Build the layer for the WASI versions the pinned provider imports (`wasi:filesystem/*@0.2.9`
+  for provider 6.0.11). A missing `wac` or `jco` fails with `WASMCLOUD_WAC_REQUIRED` or
+  `WASMCLOUD_JCO_REQUIRED`.
+- The layer must carry the platform's `di-framework:pglite-encfs` custom section
+  (`format=1 codec=aes-256-xts`). Without it the build stops with
+  `WASMCLOUD_PGLITE_ENCRYPTION_LAYER_UNMARKED`, which catches a no-op or debug layer pinned by
+  mistake or a stale local build. The build proves the wiring and the layer's identity, not the
+  cipher: the marker can be forged, so trust in what the layer actually does comes from the
+  digest pin of `encryption.image`.
 - Only the engine has `DI_PGLITE_KEY` hidden. The layer filters it from the provider's
   environment, but the guest's own `wasi:cli/environment` still comes from the host, so your
   application code can read the key.

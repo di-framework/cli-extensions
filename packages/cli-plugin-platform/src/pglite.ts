@@ -43,8 +43,9 @@ export const DEFAULT_PGLITE_STORAGE_MOUNT = '/data';
 export const PGLITE_WASM_FILE = 'di-framework-pglite.wasm';
 /**
  * Encrypting `wasi:filesystem` layer for the provider (`pglite.encryption`), published by
- * di-framework/platform. It is plugged into the provider (`wac plug --plug encfs pglite`) before
- * the provider is plugged into the guest, so only the engine sees the encrypted view.
+ * di-framework/platform. The build composes it into the provider with an explicit `wac compose`
+ * document (`.di-framework/pglite-encryption.wac`, see `encryptProvider`) before the provider is
+ * plugged into the guest, so only the engine sees the encrypted view.
  */
 export const PGLITE_ENCFS_REPOSITORY = 'ghcr.io/di-framework/pglite-encfs';
 /** Absolute (or cwd-relative) path of a local encryption layer build; wins over the config. */
