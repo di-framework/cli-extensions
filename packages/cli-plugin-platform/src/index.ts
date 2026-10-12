@@ -168,6 +168,7 @@ export {
 } from './wit';
 export {
   applyWorkload,
+  CONTROL_SECRET_CLI_KEYS,
   type ControlSecretWrite,
   CRON_INVOKER_IMAGE,
   controlSecretDocument,

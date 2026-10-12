@@ -306,18 +306,44 @@ Application `destroy` never runs `pulumi destroy`.
 ### Control Secret
 
 An application that serves HTTP, cron, queues or actors gets a Secret
-`<deployment>-control` holding `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. Tenant
-developers may create, update and delete Secrets but not read, list, watch or patch them,
-so the CLI never reads it back:
+`<deployment>-control` holding `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. The workload gets
+the whole Secret as environment variables, and a workload without an environment label may
+reference no other Secret, so it is also where an app keeps its own runtime secrets. Declare
+those keys in `di-framework.config.json`:
 
-- `deploy` writes a new random token every time: it creates the Secret and, if it already
-  exists, replaces the whole Secret with an unconditional update. If keys were added to it
-  by hand, the platform's `tenant-secret-update` admission policy denies that update (it
-  refuses any update that drops a key), and deploy stops with "the control Secret
-  `<deployment>-control` has keys this CLI didn't write"; delete it with
-  `kubectl delete secret <deployment>-control` and redeploy. Other failed writes show
-  kubectl's reason, scrubbed of the token.
-- The token rotates at that Secret write, before `kubectl apply`. The WorkloadDeployment
+```json
+{
+  "controlSecretKeys": ["ISSUER_URL", "AUTH_ACTIVE_PRIVATE_JWK", "DI_PGLITE_KEY"]
+}
+```
+
+A declared key must be an environment variable name. `DI_*` names belong to the framework, so
+of those only `DI_PGLITE_KEY` and `DI_PGLITE_KEY_PREVIOUS` may be declared, and so may none of
+the names the CLI renders into the workload's environment (`ACTOR_STORAGE_DIR`,
+`QUEUE_DB_PATH`, `MIGRATION_DB_PATH`). Deploy never writes values for these keys; the app's own
+tooling does, with an update of the whole Secret that keeps the CLI's two keys. Deploy keeps
+declared keys and refuses any other key:
+
+- A new Secret is created with the CLI's keys and a new random token.
+- Tenant developers may create, update and delete Secrets but not read, list, watch or patch
+  them, so the CLI never reads the Secret back for them (`kubectl auth can-i get` decides,
+  without sending a read). It replaces the whole Secret with an unconditional update that
+  holds the CLI's keys and a new token. The platform's `tenant-secret-update` admission policy
+  refuses an update that drops a key, so when the Secret holds other keys the update is
+  denied and nothing changes. Deploy then sends a dry-run update that also names every
+  declared key. If the policy accepts it, every extra key is declared, and deploy keeps the
+  Secret as it is, token included: it cannot carry over values it cannot read. It says
+  "Kept control Secret `<deployment>-control`" and renders no `DI_CONTROL_TOKEN_REVISION`.
+  Otherwise deploy stops with "the control Secret `<deployment>-control` has keys this CLI
+  didn't write". Declare the keys, or delete the Secret with
+  `kubectl delete secret <deployment>-control` and redeploy.
+- A caller who may read Secrets (a cluster admin) gets the Secret read. Deploy stops, naming
+  the keys, when one is neither the CLI's nor declared, instead of dropping it. Otherwise it
+  writes a new token with the declared keys carried over, conditional on the version it read,
+  and a concurrent change stops deploy with "changed while deploy was updating it; re-run
+  deploy". Nothing read is printed, and failures are scrubbed of every value read.
+- Other failed writes show kubectl's reason, scrubbed of the token.
+- When deploy writes a token, it rotates at that Secret write, before `kubectl apply`. The WorkloadDeployment
   carries `DI_CONTROL_TOKEN_REVISION` (a digest of the token), so the deploy rolls the
   workload onto the new token, but not at the same moment as its cron invokers: a CronJob
   pod reads the Secret when it starts, so the invokers switch first and can get 401 from
