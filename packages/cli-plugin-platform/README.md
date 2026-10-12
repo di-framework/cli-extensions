@@ -640,6 +640,7 @@ const db = open(process.env.DI_PGLITE_DATA_DIR ?? '/data/pglite', undefined);
 | `wasm` | none | A local provider build inside the project (symlinks resolved), used instead of `image` for offline development. Unverified; see below. |
 | `storageMount` | `/data` | Guest preopen of the workload's persistent directory. Tenant targets accept `/data` or `/data/actors`. |
 | `dataDir` | `<storageMount>/pglite` | Database root, at or under `storageMount`. The guest receives it as `DI_PGLITE_DATA_DIR`. |
+| `encryption` | none | `{ "image": "ghcr.io/di-framework/pglite-encfs@sha256:<digest>" }` (or a local `wasm`): encrypt the data directory at rest; see [Encryption at rest](#encryption-at-rest). |
 
 The build pulls the provider with `oras`: `oras manifest fetch`, then `oras blob fetch` of the
 manifest's single `application/wasm` layer. It checks that the manifest hashes to the pinned
@@ -675,6 +676,76 @@ entry has no matching import, because the deploy renders the following from the 
   `di-framework.dev/persistent-storage: "true"` annotation, plus `di-framework.dev/storage-mount`
   when `storageMount` is not `/data`. Other targets get a host path volume on the `storage` pool.
 - `replicas: 1` and `deployPolicy: Recreate`. Other replica counts are refused.
+
+#### Encryption at rest
+
+`pglite.encryption` plugs an encrypting `wasi:filesystem` layer between the provider and the
+host, so the data directory holds only ciphertext. The layer is composed into the provider
+first, with an explicit `wac compose` (see below). That result is then plugged into the guest
+exactly as an unencrypted provider is. The guest's own WASI imports still go straight to the
+host.
+
+```json
+{
+  "controlSecretKeys": ["DI_PGLITE_KEY"],
+  "pglite": {
+    "image": "ghcr.io/di-framework/pglite-component@sha256:<64 hex>",
+    "encryption": { "image": "ghcr.io/di-framework/pglite-encfs@sha256:<64 hex>" }
+  }
+}
+```
+
+- `encryption.image` is pinned by digest and pulled, verified and cached like the provider
+  (`oci/sha256/<digest>/di-framework-pglite-encfs.wasm`); the build plugs a private copy,
+  `.di-framework/di-framework-pglite-encfs.wasm`. `encryption.wasm` (a local build inside the
+  project) and `DI_FRAMEWORK_PGLITE_ENCFS_WASM` override it under the same rules as a local
+  provider: unverified, warned about, and refused by `platform deploy` and on CI unless
+  `DI_FRAMEWORK_ALLOW_LOCAL_PGLITE=1`.
+- The layer reads its master key from `DI_PGLITE_KEY` (and, while rotating,
+  `DI_PGLITE_KEY_PREVIOUS`). The key reaches the guest only through the workload's control
+  Secret, so the build fails with `WASMCLOUD_PGLITE_KEY_UNDECLARED` unless `DI_PGLITE_KEY` is in
+  `controlSecretKeys` (see [Control Secret](#control-secret)). That check runs first, before
+  bundling or any pull. The CLI never writes or reads the
+  key: put it in `<deployment>-control` with your own tooling, and keep a copy, since losing it
+  loses the database.
+- The layer must sit between the provider and the host, and `wac plug` cannot prove that.
+  `wac plug` silently skips an export whose type does not fit, and it exits 0 as long as
+  anything plugged. So the build does this instead:
+  1. Reads both worlds with `jco wit`.
+  2. Takes, for each provider import the layer exports, the export with the same name and
+     version, or else one on the same semver track the way `wac` matches them. That means the
+     same major from 1.0 on, the same minor for 0.x, and an exact match for 0.0.z and
+     pre-releases. Every `wasi:filesystem/*` import must get one.
+  3. Writes `.di-framework/pglite-encryption.wac`. It instantiates the layer against the host
+     and passes each of those exports to the provider as a named instantiation argument.
+  4. Composes it with `wac compose`, which type-checks every argument.
+
+  The build stops with `WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED`, carrying `wac`'s message
+  when there is one, if any of these holds:
+  - the layer misses a filesystem interface, is on another version track, or exports a type
+    the provider cannot use;
+  - the provider's world has an item the build cannot read as a versioned interface (such as a
+    plain-named `import fs: interface { … }`);
+  - the provider imports something that is neither wired to the layer nor on the host
+    pass-through allowlist (`wasi:io/*`, `wasi:clocks/*`, `wasi:random/*`, `wasi:cli/*`).
+
+  Build the layer for the WASI versions the pinned provider imports (`wasi:filesystem/*@0.2.9`
+  for provider 6.0.11). A missing `wac` or `jco` fails with `WASMCLOUD_WAC_REQUIRED` or
+  `WASMCLOUD_JCO_REQUIRED`.
+- The layer must carry the platform's `di-framework:pglite-encfs` custom section
+  (`format=1 codec=aes-256-xts`). Without it the build stops with
+  `WASMCLOUD_PGLITE_ENCRYPTION_LAYER_UNMARKED`, which catches a no-op or debug layer pinned by
+  mistake or a stale local build. The build proves the wiring and the layer's identity, not the
+  cipher: the marker can be forged, so trust in what the layer actually does comes from the
+  digest pin of `encryption.image`.
+- Only the engine has `DI_PGLITE_KEY` hidden. The layer filters it from the provider's
+  environment, but the guest's own `wasi:cli/environment` still comes from the host, so your
+  application code can read the key.
+- The composed provider is `.di-framework/di-framework-pglite.encrypted.wasm`. The deployment
+  digest hashes the raw provider and layer bytes, not `wac`'s output, so changing either one
+  redeploys. The build and deploy results report the layer
+  (`PGlite: <image>, encrypted at rest by <layer>`).
+- `encryption.image` must not pin the provider's repository or digest.
 
 Give each database one owner. Members of one implicit workload share one storage directory,
 mounted at each member's own `storageMount`. So `/data/pglite` under a `/data` mount and

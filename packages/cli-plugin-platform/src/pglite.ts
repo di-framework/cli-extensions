@@ -41,11 +41,67 @@ export const EXCLUSIVE_INSTANCE_KEY = 'di-framework.dev/exclusive-instance';
 export const DEFAULT_PGLITE_STORAGE_MOUNT = '/data';
 /** File name of the provider inside a cache entry. */
 export const PGLITE_WASM_FILE = 'di-framework-pglite.wasm';
+/**
+ * Encrypting `wasi:filesystem` layer for the provider (`pglite.encryption`), published by
+ * di-framework/platform. The build composes it into the provider with an explicit `wac compose`
+ * document (`.di-framework/pglite-encryption.wac`, see `encryptProvider`) before the provider is
+ * plugged into the guest, so only the engine sees the encrypted view.
+ */
+export const PGLITE_ENCFS_REPOSITORY = 'ghcr.io/di-framework/pglite-encfs';
+/** Absolute (or cwd-relative) path of a local encryption layer build; wins over the config. */
+export const PGLITE_ENCFS_WASM_ENV = 'DI_FRAMEWORK_PGLITE_ENCFS_WASM';
+/** File name of the encryption layer inside a cache entry. */
+export const PGLITE_ENCFS_WASM_FILE = 'di-framework-pglite-encfs.wasm';
+/** The provider with the encryption layer plugged in, as the build plugs it into the guest. */
+export const PGLITE_ENCRYPTED_WASM_FILE = 'di-framework-pglite.encrypted.wasm';
+/**
+ * The guest environment variable the encryption layer reads its master key from. It must come
+ * from the control Secret, so the project declares it in `controlSecretKeys`.
+ */
+export const PGLITE_KEY_ENV = 'DI_PGLITE_KEY';
 
 const WASM_LAYER_MEDIA_TYPE = 'application/wasm';
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
 const DIGEST_REFERENCE = /^([a-z0-9]+(?:[.:-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)+)@(.+)$/;
-const CONFIG_KEYS = ['image', 'wasm', 'storageMount', 'dataDir'];
+const CONFIG_KEYS = ['image', 'wasm', 'storageMount', 'dataDir', 'encryption'];
+const ENCRYPTION_KEYS = ['image', 'wasm'];
+
+/** A digest-pinned component the CLI pulls: the provider or its encryption layer. */
+export type PinnedComponent = {
+  /** How messages name it. */
+  label: string;
+  /** The config object that pins it: `pglite` or `pglite.encryption`. */
+  field: string;
+  repository: string;
+  /** Environment variable naming a local build. */
+  localEnv: string;
+  /** File name inside a cache entry. */
+  file: string;
+};
+
+export const PGLITE_PROVIDER: PinnedComponent = {
+  label: 'PGlite provider',
+  field: 'pglite',
+  repository: PGLITE_REPOSITORY,
+  localEnv: PGLITE_WASM_ENV,
+  file: PGLITE_WASM_FILE,
+};
+
+export const PGLITE_ENCFS: PinnedComponent = {
+  label: 'PGlite encryption layer',
+  field: 'pglite.encryption',
+  repository: PGLITE_ENCFS_REPOSITORY,
+  localEnv: PGLITE_ENCFS_WASM_ENV,
+  file: PGLITE_ENCFS_WASM_FILE,
+};
+
+/** `pglite.encryption`, resolved: where the encryption layer comes from. */
+export type PgliteEncryptionConfig = {
+  /** `<repository>@sha256:<hex>` of the encryption layer. */
+  image?: string;
+  /** Absolute path of a local encryption layer build, used instead of `image`. */
+  wasm?: string;
+};
 
 /** `pglite` in di-framework.config.json, resolved. */
 export type PgliteConfig = {
@@ -57,6 +113,8 @@ export type PgliteConfig = {
   storageMount: string;
   /** Database root the guest opens; at or under `storageMount`. */
   dataDir: string;
+  /** Encrypt the data directory at rest with this layer, keyed by `DI_PGLITE_KEY`. */
+  encryption?: PgliteEncryptionConfig;
 };
 
 export type ResolvedPglite = {
@@ -73,12 +131,15 @@ function configInvalid(message: string, configPath: string): never {
   throw new CommandFailure('WASMCLOUD_CONFIG_INVALID', message, 2, { configPath });
 }
 
-export function parseDigestReference(reference: string): { repository: string; digest: string } {
+export function parseDigestReference(
+  reference: string,
+  repository = PGLITE_REPOSITORY,
+): { repository: string; digest: string } {
   const match = DIGEST_REFERENCE.exec(reference);
   const digest = match?.[2] ?? '';
   if (match === null || !SHA256_DIGEST.test(digest)) {
     throw new Error(
-      `"${reference}" is not pinned by digest. Use ${PGLITE_REPOSITORY}@sha256:<64 hex>; tags such as :${DI_PGLITE_VERSION} move`,
+      `"${reference}" is not pinned by digest. Use ${repository}@sha256:<64 hex>; tags such as :${DI_PGLITE_VERSION} move`,
     );
   }
   return { repository: match[1] as string, digest };
@@ -92,22 +153,50 @@ function absoluteGuestPath(value: unknown, label: string, configPath: string): s
 }
 
 /** `image` must be a digest pin and `wasm` a path; at least one of them is required. */
-function validateProviderSource(entry: Record<string, unknown>, configPath: string): void {
+function validateProviderSource(
+  entry: Record<string, unknown>,
+  configPath: string,
+  component: PinnedComponent = PGLITE_PROVIDER,
+): void {
+  const field = component.field;
   if (entry.image !== undefined) {
-    if (typeof entry.image !== 'string') configInvalid('pglite.image must be a string', configPath);
+    if (typeof entry.image !== 'string')
+      configInvalid(`${field}.image must be a string`, configPath);
     try {
-      parseDigestReference(entry.image);
+      parseDigestReference(entry.image, component.repository);
     } catch (error) {
-      configInvalid(`pglite.image: ${(error as Error).message}`, configPath);
+      configInvalid(`${field}.image: ${(error as Error).message}`, configPath);
     }
   }
   if (entry.wasm !== undefined && (typeof entry.wasm !== 'string' || entry.wasm.trim() === ''))
-    configInvalid('pglite.wasm must be a non-empty path', configPath);
+    configInvalid(`${field}.wasm must be a non-empty path`, configPath);
   if (entry.image === undefined && entry.wasm === undefined)
     configInvalid(
-      `pglite needs "image" (${PGLITE_REPOSITORY}@sha256:<digest>) or a local "wasm" path`,
+      `${field} needs "image" (${component.repository}@sha256:<digest>) or a local "wasm" path`,
       configPath,
     );
+}
+
+function parseEncryption(
+  value: unknown,
+  configPath: string,
+  resolveFile: (path: string) => string,
+): PgliteEncryptionConfig | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    configInvalid('pglite.encryption must be an object', configPath);
+  const entry = value as Record<string, unknown>;
+  const unknown = Object.keys(entry).filter((key) => !ENCRYPTION_KEYS.includes(key));
+  if (unknown.length > 0)
+    configInvalid(
+      `pglite.encryption has unsupported fields: ${unknown.join(', ')}. Use ${ENCRYPTION_KEYS.join(', ')}`,
+      configPath,
+    );
+  validateProviderSource(entry, configPath, PGLITE_ENCFS);
+  return {
+    ...(entry.image === undefined ? {} : { image: entry.image as string }),
+    ...(entry.wasm === undefined ? {} : { wasm: resolveFile(entry.wasm as string) }),
+  };
 }
 
 /** True when `path` is `directory` or below it (both normalized guest paths). */
@@ -145,11 +234,25 @@ export function parsePgliteConfig(
       `pglite.dataDir ${dataDir} must be inside storageMount ${storageMount}; only that directory is persistent`,
       configPath,
     );
+  const encryption = parseEncryption(entry.encryption, configPath, resolveFile);
+  if (encryption?.image !== undefined) {
+    const layer = parseDigestReference(encryption.image, PGLITE_ENCFS_REPOSITORY);
+    const provider =
+      entry.image === undefined ? undefined : parseDigestReference(entry.image as string);
+    if (layer.repository === PGLITE_REPOSITORY || layer.repository === provider?.repository)
+      configInvalid(
+        `pglite.encryption.image must pin the encryption layer (${PGLITE_ENCFS_REPOSITORY}), not the provider repository ${layer.repository}`,
+        configPath,
+      );
+    if (layer.digest === provider?.digest)
+      configInvalid('pglite.encryption.image pins the same digest as pglite.image', configPath);
+  }
   return {
     ...(entry.image === undefined ? {} : { image: entry.image as string }),
     ...(entry.wasm === undefined ? {} : { wasm: resolveFile(entry.wasm as string) }),
     storageMount,
     dataDir,
+    ...(encryption === undefined ? {} : { encryption }),
   };
 }
 
@@ -244,9 +347,9 @@ export function verifyLayer(bytes: Uint8Array, image: string, layerDigest: strin
 }
 
 /** The verified provider bytes of a cache entry, or undefined when it is absent or stale. */
-function readVerifiedEntry(directory: string, image: string): Buffer | undefined {
+function readVerifiedEntry(directory: string, image: string, file: string): Buffer | undefined {
   const manifestPath = join(directory, 'manifest.json');
-  const wasmPath = join(directory, PGLITE_WASM_FILE);
+  const wasmPath = join(directory, file);
   if (!existsSync(manifestPath) || !existsSync(wasmPath)) return undefined;
   try {
     const bytes = readFileSync(wasmPath);
@@ -278,6 +381,7 @@ async function oras(
   args: string[],
   image: string,
   cwd: string,
+  component: PinnedComponent,
 ): Promise<void> {
   const result = await deps.runCaptured('oras', args, { cwd });
   if (result.exitCode === 0) return;
@@ -286,7 +390,7 @@ async function oras(
   throw failure(
     'WASMCLOUD_PGLITE_PULL_FAILED',
     `oras ${args.slice(0, 2).join(' ')} failed for ${image}${detail}. ` +
-      `If the package is private, run \`oras login ghcr.io\`; offline, set ${PGLITE_WASM_ENV} or pglite.wasm`,
+      `If the package is private, run \`oras login ghcr.io\`; offline, set ${component.localEnv} or ${component.field}.wasm`,
     { image, exitCode: String(result.exitCode) },
   );
 }
@@ -295,13 +399,19 @@ async function oras(
  * Stores a verified staging directory as the cache entry. A concurrent build may have
  * stored the same digest first; its entry is used when it verifies.
  */
-function storeEntry(staging: string, entry: string, image: string, bytes: Buffer): Buffer {
+function storeEntry(
+  staging: string,
+  entry: string,
+  image: string,
+  bytes: Buffer,
+  file: string,
+): Buffer {
   mkdirSync(join(entry, '..'), { recursive: true });
   try {
     renameSync(staging, entry);
     return bytes;
   } catch (error) {
-    const winner = readVerifiedEntry(entry, image);
+    const winner = readVerifiedEntry(entry, image, file);
     if (winner !== undefined) return winner;
     throw failure(
       'WASMCLOUD_PGLITE_CACHE_CONFLICT',
@@ -322,10 +432,11 @@ export async function pullPgliteComponent(
   io: CliIo,
   deps: WasmcloudDeps,
   cwd: string,
+  component: PinnedComponent = PGLITE_PROVIDER,
 ): Promise<ResolvedPglite> {
-  const { repository, digest } = parseDigestReference(image);
+  const { repository, digest } = parseDigestReference(image, component.repository);
   const entry = cacheEntry(deps.env, digest);
-  const cached = readVerifiedEntry(entry, image);
+  const cached = readVerifiedEntry(entry, image, component.file);
   if (cached !== undefined) {
     io.stdout.write(`Using cached ${image}\n`);
     return { bytes: cached, source: 'cache', image };
@@ -337,7 +448,7 @@ export async function pullPgliteComponent(
   if (deps.capture('oras', ['version']) === undefined)
     throw failure(
       'WASMCLOUD_ORAS_REQUIRED',
-      `oras is required to pull ${image}; install it from https://oras.land or set ${PGLITE_WASM_ENV} to a local provider build`,
+      `oras is required to pull ${image}; install it from https://oras.land or set ${component.localEnv} to a local build`,
       { image, tool: 'oras' },
     );
   const root = cacheRoot(deps.env);
@@ -347,18 +458,23 @@ export async function pullPgliteComponent(
   try {
     io.stdout.write(`Pulling ${image}...\n`);
     const manifestPath = join(staging, 'manifest.json');
-    await oras(deps, ['manifest', 'fetch', '--output', manifestPath, image], image, cwd);
+    await oras(deps, ['manifest', 'fetch', '--output', manifestPath, image], image, cwd, component);
     const layerDigest = verifyManifest(readFileSync(manifestPath), image);
-    const stagedWasm = join(staging, PGLITE_WASM_FILE);
+    const stagedWasm = join(staging, component.file);
     await oras(
       deps,
       ['blob', 'fetch', '--output', stagedWasm, `${repository}@${layerDigest}`],
       image,
       cwd,
+      component,
     );
     const bytes = readFileSync(stagedWasm);
     verifyLayer(bytes, image, layerDigest);
-    return { bytes: storeEntry(staging, entry, image, bytes), source: 'registry', image };
+    return {
+      bytes: storeEntry(staging, entry, image, bytes, component.file),
+      source: 'registry',
+      image,
+    };
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
@@ -375,15 +491,16 @@ export type ResolvePgliteOptions = {
 function readLocalProvider(
   local: string,
   origin: string,
-  config: PgliteConfig,
+  config: { image?: string },
   io: CliIo,
   deps: WasmcloudDeps,
   options: ResolvePgliteOptions,
+  component: PinnedComponent = PGLITE_PROVIDER,
 ): ResolvedPglite {
   if (!existsSync(local))
     throw failure(
       'WASMCLOUD_PGLITE_PROVIDER_MISSING',
-      `PGlite provider ${local} (from ${origin}) does not exist`,
+      `${component.label} ${local} (from ${origin}) does not exist`,
       { path: local },
     );
   let context: string | undefined;
@@ -392,20 +509,20 @@ function readLocalProvider(
   if (context !== undefined && deps.env[ALLOW_LOCAL_PGLITE_ENV] !== '1')
     throw failure(
       'WASMCLOUD_PGLITE_LOCAL_REFUSED',
-      `Refusing the unverified local PGlite provider ${local} (from ${origin}) in ${context}; ` +
-        `pin "pglite.image" by digest, or set ${ALLOW_LOCAL_PGLITE_ENV}=1 to use it anyway`,
+      `Refusing the unverified local ${component.label} ${local} (from ${origin}) in ${context}; ` +
+        `pin "${component.field}.image" by digest, or set ${ALLOW_LOCAL_PGLITE_ENV}=1 to use it anyway`,
       { path: local, context },
     );
   const bytes = readFileSync(local);
   if (!isWasm(bytes))
     throw failure(
       'WASMCLOUD_PGLITE_PROVIDER_INVALID',
-      `PGlite provider ${local} (from ${origin}) is not a WebAssembly binary`,
+      `${component.label} ${local} (from ${origin}) is not a WebAssembly binary`,
       { path: local },
     );
   const replaced = config.image ? ` instead of the pinned ${config.image}` : '';
   io.stderr.write(
-    `Warning: using the local, unverified PGlite provider ${local} (from ${origin})${replaced}\n`,
+    `Warning: using the local, unverified ${component.label} ${local} (from ${origin})${replaced}\n`,
   );
   return { bytes, source: 'local', path: local };
 }
@@ -435,6 +552,42 @@ export async function resolvePgliteComponent(
   if (config.wasm !== undefined)
     return readLocalProvider(config.wasm, 'pglite.wasm', config, io, deps, options);
   return pullPgliteComponent(config.image as string, io, deps, projectRoot);
+}
+
+/**
+ * The encryption layer to plug into the provider, resolved like the provider:
+ * `DI_FRAMEWORK_PGLITE_ENCFS_WASM`, then `pglite.encryption.wasm`, then the digest-pinned
+ * `pglite.encryption.image`, with the same local-file refusal in a deploy or on CI.
+ */
+export async function resolvePgliteEncryption(
+  config: PgliteEncryptionConfig,
+  io: CliIo,
+  deps: WasmcloudDeps,
+  projectRoot: string,
+  options: ResolvePgliteOptions = {},
+): Promise<ResolvedPglite> {
+  const fromEnv = deps.env[PGLITE_ENCFS_WASM_ENV]?.trim();
+  if (fromEnv)
+    return readLocalProvider(
+      resolve(deps.cwd(), fromEnv),
+      PGLITE_ENCFS_WASM_ENV,
+      config,
+      io,
+      deps,
+      options,
+      PGLITE_ENCFS,
+    );
+  if (config.wasm !== undefined)
+    return readLocalProvider(
+      config.wasm,
+      'pglite.encryption.wasm',
+      config,
+      io,
+      deps,
+      options,
+      PGLITE_ENCFS,
+    );
+  return pullPgliteComponent(config.image as string, io, deps, projectRoot, PGLITE_ENCFS);
 }
 
 /**

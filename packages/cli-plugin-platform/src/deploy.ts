@@ -1,6 +1,6 @@
 import type { CliIo, CommandResult } from '@di-framework/cli-extension';
 import { parseAppCommandArgs } from './args';
-import { buildComponent } from './build';
+import { type BuildSummary, buildComponent, type ComponentOrigin } from './build';
 import { discoverScheduledJobs } from './cron';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { discoverProjects, resolveApplication } from './discovery';
@@ -25,8 +25,11 @@ export type WasmcloudDeployData = {
   service: string;
   http?: { url: string; host: string };
   endpoints?: Record<string, string>;
-  /** Where the composed PGlite provider came from: a digest pin or a local file. */
-  pglite?: { source: 'local' | 'cache' | 'registry'; image?: string; path?: string };
+  /**
+   * Where the composed PGlite provider came from (a digest pin or a local file) and, when
+   * `pglite.encryption` is set, its encryption layer.
+   */
+  pglite?: BuildSummary['pglite'];
 };
 
 export type WasmcloudDeployResult = Omit<CommandResult, 'data' | 'text'> & {
@@ -104,9 +107,15 @@ export async function runWasmcloudDeploy(
   };
 }
 
+function originText(origin: ComponentOrigin): string {
+  return origin.path === undefined ? `${origin.image}` : `local ${origin.path} (unverified)`;
+}
+
 function pgliteText(pglite: WasmcloudDeployData['pglite']): string {
   if (pglite === undefined) return '';
-  return pglite.path === undefined
-    ? ` PGlite: ${pglite.image}.`
-    : ` PGlite: local ${pglite.path} (unverified).`;
+  const encryption =
+    pglite.encryption === undefined
+      ? ''
+      : `, encrypted at rest by ${originText(pglite.encryption)}`;
+  return ` PGlite: ${originText(pglite)}${encryption}.`;
 }

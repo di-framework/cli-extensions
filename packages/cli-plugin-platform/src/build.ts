@@ -28,10 +28,23 @@ import { OCI_ARTIFACT_PLATFORM } from './oci';
 import {
   DI_PGLITE_PACKAGE,
   DI_PGLITE_VERSION,
+  PGLITE_ENCFS_WASM_FILE,
+  PGLITE_ENCRYPTED_WASM_FILE,
+  PGLITE_KEY_ENV,
   PGLITE_WASM_FILE,
   type ResolvedPglite,
   resolvePgliteComponent,
+  resolvePgliteEncryption,
 } from './pglite';
+import {
+  ENCFS_SECTION,
+  encfsSection,
+  encryptionComposition,
+  LAYER_PACKAGE,
+  PROVIDER_PACKAGE,
+  planWiring,
+  worldInterfaces,
+} from './pglite-encryption';
 import { loadProject, type WasmcloudProject } from './project';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { renderQueuesModule } from './queues-module';
@@ -67,8 +80,22 @@ export type BuildSummary = {
   profile: string;
   actors?: string[];
   /** The composed PGlite provider: where it came from and, when pulled, its pinned image. */
-  pglite?: { source: ResolvedPglite['source']; image?: string; path?: string };
+  pglite?: ComponentOrigin & {
+    /** The encryption layer plugged into the provider, from `pglite.encryption`. */
+    encryption?: ComponentOrigin;
+  };
 };
+
+/** Where a composed component came from: a digest pin (pulled or cached) or a local file. */
+export type ComponentOrigin = { source: ResolvedPglite['source']; image?: string; path?: string };
+
+function originOf(component: ResolvedPglite): ComponentOrigin {
+  return {
+    source: component.source,
+    ...(component.image === undefined ? {} : { image: component.image }),
+    ...(component.path === undefined ? {} : { path: component.path }),
+  };
+}
 
 export function requirementsForProject(
   project: WasmcloudProject,
@@ -237,6 +264,53 @@ async function composeComponentProvider(
   });
 }
 
+/** `wac` on PATH, else the SQLite toolchain's, and the PATH to run it with. */
+function wacTool(deps: WasmcloudDeps): { wac: string; envPath: string } {
+  const toolsBin = sqliteToolsBin();
+  const envPath = [toolsBin, process.env.PATH ?? ''].filter(Boolean).join(':');
+  const wac =
+    deps.capture('wac', ['--version']) !== undefined
+      ? 'wac'
+      : toolsBin
+        ? join(toolsBin, 'wac')
+        : 'wac';
+  return { wac, envPath };
+}
+
+/** Whether `error` is a spawn failure because the executable does not exist. */
+function isMissingExecutable(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return (
+    code === 'ENOENT' ||
+    (error instanceof Error && /ENOENT|Executable not found/i.test(error.message))
+  );
+}
+
+/** Runs `wac` (or `command`), mapping a missing `wac` binary to `WASMCLOUD_WAC_REQUIRED`. */
+async function runWac(
+  project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
+  deps: WasmcloudDeps,
+  args: string[],
+  command?: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const { wac, envPath } = wacTool(deps);
+  try {
+    return await deps.runCaptured(command ?? wac, args, {
+      cwd: project.projectRoot,
+      env: { ...process.env, PATH: envPath },
+    });
+  } catch (error) {
+    // A missing componentize-qjs compiler surfaces as it is; only wac has an install hint here.
+    if (command !== undefined || !isMissingExecutable(error)) throw error;
+    throw new CommandFailure(
+      'WASMCLOUD_WAC_REQUIRED',
+      'wac is required to compose components; install it (https://github.com/bytecodealliance/wac/releases, or `scripts/install-tools.sh --wac-only` in di-framework/platform `platform/sqlite-component`) and put it on PATH',
+      3,
+      { application: project.applicationName, tool: 'wac' },
+    );
+  }
+}
+
 /**
  * Plugs one provider component into the built guest: `wac plug`, or the
  * componentize-qjs composer when the guest has named imports to preserve.
@@ -248,14 +322,6 @@ async function composeProvider(
   options: { label: string; wasm: string; namedImports: boolean; failureCode: string },
 ): Promise<void> {
   const composed = `${project.outputPath}.composed`;
-  const toolsBin = sqliteToolsBin();
-  const envPath = [toolsBin, process.env.PATH ?? ''].filter(Boolean).join(':');
-  const wac =
-    deps.capture('wac', ['--version']) !== undefined
-      ? 'wac'
-      : toolsBin
-        ? join(toolsBin, 'wac')
-        : 'wac';
   io.stdout.write(`Composing ${options.label} provider...\n`);
   const compiler = options.namedImports ? deps.componentizeQjsPath() : undefined;
   if (options.namedImports && !compiler)
@@ -264,12 +330,13 @@ async function composeProvider(
       'Managed PostgreSQL needs componentize-qjs 0.4.4-di.3 or newer for named-import composition',
       3,
     );
-  const result = await deps.runCaptured(
-    compiler ?? wac,
+  const result = await runWac(
+    project,
+    deps,
     compiler
       ? ['compose', project.outputPath, '--definition', options.wasm, '-o', composed]
       : ['plug', '--plug', options.wasm, project.outputPath, '-o', composed],
-    { cwd: project.projectRoot, env: { ...process.env, PATH: envPath } },
+    compiler,
   );
   if (result.exitCode !== 0) {
     throw new CommandFailure(
@@ -330,6 +397,127 @@ async function inspectComponentImports(
   }
 }
 
+/** The world of a component, as `jco wit` prints it. */
+async function componentWorld(
+  project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
+  deps: WasmcloudDeps,
+  path: string,
+  label: string,
+): Promise<ReturnType<typeof worldInterfaces>> {
+  const captured = await deps.runCaptured(
+    requireNodeBinary(deps.nodeBinaryPath()),
+    [deps.jcoCliPath(), 'wit', path],
+    { cwd: project.projectRoot },
+  );
+  if (captured.exitCode !== 0 && /Cannot find module/.test(captured.stderr)) {
+    throw new CommandFailure(
+      'WASMCLOUD_JCO_REQUIRED',
+      `jco is required to read the WIT world of the ${label}, but ${deps.jcoCliPath()} could not be loaded; reinstall @di-framework/cli-plugin-platform (it depends on @bytecodealliance/jco)`,
+      3,
+      { application: project.applicationName, tool: 'jco' },
+    );
+  }
+  if (captured.exitCode !== 0) {
+    throw new CommandFailure(
+      'WASMCLOUD_COMPONENT_IMPORTS_UNREADABLE',
+      `Could not read the WIT world of the ${label}: ${(captured.stderr || captured.stdout).trim()}`,
+      3,
+      { application: project.applicationName, path },
+    );
+  }
+  return worldInterfaces(captured.stdout);
+}
+
+function notInterposed(
+  project: Pick<WasmcloudProject, 'applicationName'>,
+  problem: string,
+): CommandFailure {
+  return new CommandFailure(
+    'WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED',
+    `The PGlite encryption layer would not sit between the provider and the host filesystem: ` +
+      `${problem}. PGlite would write its data directory in plaintext, so the build stops. ` +
+      'Use a layer built for the WASI versions the pinned provider imports.',
+    3,
+    { application: project.applicationName },
+  );
+}
+
+/**
+ * Composes the encryption layer into the provider and writes the result to `output`, which the
+ * build then plugs into the guest instead of the provider.
+ *
+ * `wac plug` silently skips a layer export whose name matches but whose type is not a subtype of
+ * the provider's import, and exits 0 when anything else plugged, so it cannot prove the layer is
+ * in the path. Instead the build reads both worlds with `jco wit`, plans which layer export each
+ * provider import takes (every `wasi:filesystem/*` import must have one), and composes a WAC
+ * document that passes each of them as a named instantiation argument (`wac compose`). wac
+ * type-checks every argument, so a layer that does not fit fails the build here rather than
+ * being bypassed. The document is kept at `.di-framework/pglite-encryption.wac`.
+ *
+ * Wiring cannot show that the layer encrypts: a pass-through layer wires the same way. So the
+ * layer must also carry the platform's `di-framework:pglite-encfs` custom section. That marker
+ * catches the wrong artifact (a no-op or debug layer, a stale local build); it is forgeable, so
+ * what the layer actually does rests on the digest pin.
+ */
+export async function encryptProvider(
+  project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
+  deps: WasmcloudDeps,
+  io: CliIo,
+  provider: string,
+  layer: string,
+  output: string,
+): Promise<void> {
+  if (encfsSection(readFileSync(layer)) === undefined) {
+    throw new CommandFailure(
+      'WASMCLOUD_PGLITE_ENCRYPTION_LAYER_UNMARKED',
+      `The PGlite encryption layer ${layer} has no ${ENCFS_SECTION} custom section, so it is not ` +
+        "the platform's pglite-encfs component; pin the published ghcr.io/di-framework/pglite-encfs image",
+      3,
+      { application: project.applicationName, path: layer },
+    );
+  }
+  const providerWorld = await componentWorld(project, deps, provider, 'PGlite provider');
+  const layerWorld = await componentWorld(project, deps, layer, 'PGlite encryption layer');
+  const plan = planWiring(providerWorld, layerWorld);
+  if (plan.problem !== undefined) throw notInterposed(project, plan.problem);
+
+  const document = join(dirname(output), 'pglite-encryption.wac');
+  writeFileSync(document, encryptionComposition(plan.wires, providerWorld.exports));
+  rmSync(output, { force: true });
+  io.stdout.write('Composing the PGlite encryption layer into the provider...\n');
+  const result = await runWac(project, deps, [
+    'compose',
+    document,
+    '--dep',
+    `${LAYER_PACKAGE}=${layer}`,
+    '--dep',
+    `${PROVIDER_PACKAGE}=${provider}`,
+    '-o',
+    output,
+  ]);
+  if (result.exitCode !== 0 || !existsSync(output)) {
+    const reason = (result.stderr || result.stdout).trim() || 'wac wrote no component';
+    throw notInterposed(project, `wac compose refused the wiring: ${reason}`);
+  }
+}
+
+/**
+ * The encryption layer reads its key from `DI_PGLITE_KEY`, which reaches the guest only through
+ * the control Secret, and deploy keeps only the keys the project declares there.
+ */
+function assertPgliteKeyDeclared(project: WasmcloudProject): void {
+  if (project.pglite?.encryption === undefined) return;
+  if (project.controlSecretKeys?.includes(PGLITE_KEY_ENV)) return;
+  throw new CommandFailure(
+    'WASMCLOUD_PGLITE_KEY_UNDECLARED',
+    `${project.applicationName} turns on "pglite.encryption", whose layer reads its key from ` +
+      `${PGLITE_KEY_ENV} in the workload's control Secret; add "${PGLITE_KEY_ENV}" to ` +
+      `"controlSecretKeys" in di-framework.config.json`,
+    2,
+    { application: project.applicationName },
+  );
+}
+
 /**
  * The PGlite provider for a guest that imports `di-framework:pglite/database`. The config
  * and the import must agree: the deploy marks the component exclusive and gives it storage
@@ -362,6 +550,18 @@ async function resolvePglite(
   return resolvePgliteComponent(project.pglite, io, deps, project.projectRoot, { deploy });
 }
 
+/** The encryption layer for the provider, when `pglite.encryption` is set. */
+async function resolveEncryption(
+  project: WasmcloudProject,
+  io: CliIo,
+  deps: WasmcloudDeps,
+  deploy: boolean,
+): Promise<ResolvedPglite | undefined> {
+  const encryption = project.pglite?.encryption;
+  if (encryption === undefined) return undefined;
+  return resolvePgliteEncryption(encryption, io, deps, project.projectRoot, { deploy });
+}
+
 /** The disposable `.di-framework/` build directory: WIT world, bundle, and manifests. */
 export async function buildComponent(
   project: WasmcloudProject,
@@ -369,6 +569,8 @@ export async function buildComponent(
   deps: WasmcloudDeps,
   options: { guestLogging?: boolean; deploy?: boolean } = {},
 ): Promise<BuildSummary> {
+  // A config check: before bundling and before anything is pulled.
+  assertPgliteKeyDeclared(project);
   const generatedDirectory = join(project.projectRoot, '.di-framework');
   const generatedWit = join(generatedDirectory, 'wit');
   const bundledJavaScript = join(generatedDirectory, 'component.js');
@@ -509,9 +711,16 @@ export async function buildComponent(
       requirement.package === DI_PGLITE_PACKAGE && requirement.direction === 'import',
   );
   const pglite = await resolvePglite(project, needsPglite, io, deps, options.deploy === true);
-  // Plug a private copy of the verified bytes: the shared cache may change after verification.
+  const encryption =
+    pglite === undefined
+      ? undefined
+      : await resolveEncryption(project, io, deps, options.deploy === true);
+  // Plug private copies of the verified bytes: the shared cache may change after verification.
   const pgliteWasm = join(generatedDirectory, PGLITE_WASM_FILE);
+  const encfsWasm = join(generatedDirectory, PGLITE_ENCFS_WASM_FILE);
+  const encryptedWasm = join(generatedDirectory, PGLITE_ENCRYPTED_WASM_FILE);
   if (pglite !== undefined) writeFileSync(pgliteWasm, pglite.bytes);
+  if (encryption !== undefined) writeFileSync(encfsWasm, encryption.bytes);
 
   const componentize = await runComponentize(project, generatedWit, bundledJavaScript, deps);
   if (componentize.exitCode !== 0) {
@@ -531,9 +740,11 @@ export async function buildComponent(
     await composeComponentProvider(project, deps, io, provider, namedImports);
   }
   if (pglite !== undefined) {
+    if (encryption !== undefined)
+      await encryptProvider(project, deps, io, pgliteWasm, encfsWasm, encryptedWasm);
     await composeProvider(project, deps, io, {
       label: `${DI_PGLITE_PACKAGE}@${DI_PGLITE_VERSION}`,
-      wasm: pgliteWasm,
+      wasm: encryption === undefined ? pgliteWasm : encryptedWasm,
       namedImports,
       failureCode: 'WASMCLOUD_PGLITE_COMPOSE_FAILED',
     });
@@ -568,7 +779,9 @@ export async function buildComponent(
       : undefined,
     [
       ...composedProviders.map((provider) => provider.wasm),
+      // The raw provider and layer bytes, never wac's output, so only the inputs set the key.
       ...(pglite === undefined ? [] : [pgliteWasm]),
+      ...(encryption === undefined ? [] : [encfsWasm]),
     ],
   );
   const artifactDigest = digestBytes(readFileSync(project.outputPath));
@@ -585,9 +798,8 @@ export async function buildComponent(
       ? {}
       : {
           pglite: {
-            source: pglite.source,
-            ...(pglite.image === undefined ? {} : { image: pglite.image }),
-            ...(pglite.path === undefined ? {} : { path: pglite.path }),
+            ...originOf(pglite),
+            ...(encryption === undefined ? {} : { encryption: originOf(encryption) }),
           },
         }),
   };
