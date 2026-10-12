@@ -2,6 +2,7 @@ import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'n
 import { isIP } from 'node:net';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { CommandFailure } from '@di-framework/cli-extension';
+import { RENDERED_ENVIRONMENT_KEYS } from './environment-names';
 import { type PgliteConfig, parsePgliteConfig } from './pglite';
 import { discoverWorkloadEntry, type WorkloadEntry } from './workload-members';
 
@@ -63,8 +64,6 @@ const CONTROL_SECRET_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,252}$/;
  * Secret key must not shadow either.
  */
 const DECLARABLE_DI_KEYS = ['DI_PGLITE_KEY', 'DI_PGLITE_KEY_PREVIOUS'];
-/** Environment names the CLI renders without a `DI_` prefix. */
-const RENDERED_ENVIRONMENT_KEYS = ['ACTOR_STORAGE_DIR', 'QUEUE_DB_PATH', 'MIGRATION_DB_PATH'];
 
 /** Why `name` cannot be declared in `controlSecretKeys`, or undefined when it can. */
 export function controlSecretKeyProblem(name: unknown): string | undefined {

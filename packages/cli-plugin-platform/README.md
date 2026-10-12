@@ -320,28 +320,58 @@ those keys in `di-framework.config.json`:
 A declared key must be an environment variable name. `DI_*` names belong to the framework, so
 of those only `DI_PGLITE_KEY` and `DI_PGLITE_KEY_PREVIOUS` may be declared, and so may none of
 the names the CLI renders into the workload's environment (`ACTOR_STORAGE_DIR`,
-`QUEUE_DB_PATH`, `MIGRATION_DB_PATH`). Deploy never writes values for these keys; the app's own
-tooling does, with an update of the whole Secret that keeps the CLI's two keys. Deploy keeps
-declared keys and refuses any other key:
+`QUEUE_DB_PATH`, `MIGRATION_DB_PATH`). Deploy never writes or reads values for these keys, and
+refuses any key that is neither the CLI's nor declared.
+
+**Once app keys exist, the app's tooling owns the control token.** A tenant developer cannot
+read the Secret, so the tooling cannot keep the CLI's token value. It replaces the whole Secret
+with:
+- its own values;
+- a freshly minted, non-empty `DI_CONTROL_TOKEN` (for example 32 random bytes, base64url);
+- `DI_CONTROL_IDENTITY` set to the workload name.
+
+It then rolls the workload, for example by setting a revision entry in the WorkloadDeployment's
+environment config, as identity-server's `runtime-secrets.ts apply` does. From then on deploy
+keeps that Secret, and token included, never rotates it. Rotate by re-running the tooling. The
+platform issue
+[di-framework/platform#203](https://github.com/di-framework/platform/issues/203) proposes a
+separate `<workload>-secrets` so the control Secret can go back to being CLI-owned and rotated
+on every deploy.
 
 - A new Secret is created with the CLI's keys and a new random token.
 - Tenant developers may create, update and delete Secrets but not read, list, watch or patch
-  them, so the CLI never reads the Secret back for them (`kubectl auth can-i get` decides,
-  without sending a read). It replaces the whole Secret with an unconditional update that
-  holds the CLI's keys and a new token. The platform's `tenant-secret-update` admission policy
-  refuses an update that drops a key, so when the Secret holds other keys the update is
-  denied and nothing changes. Deploy then sends a dry-run update that also names every
-  declared key. If the policy accepts it, every extra key is declared, and deploy keeps the
-  Secret as it is, token included: it cannot carry over values it cannot read. It says
-  "Kept control Secret `<deployment>-control`" and renders no `DI_CONTROL_TOKEN_REVISION`.
-  Otherwise deploy stops with "the control Secret `<deployment>-control` has keys this CLI
-  didn't write". Declare the keys, or delete the Secret with
-  `kubectl delete secret <deployment>-control` and redeploy.
+  them. The CLI never reads the Secret back for them; `kubectl auth can-i get` decides this
+  without sending a read. Every check below is a dry-run update (`?dryRun=All`, nothing
+  stored). It asks the platform's `tenant-secret-update` admission policy, which refuses an
+  update that drops a key, about key names only. With app keys declared, deploy:
+  1. Checks that the policy protects the Secret. A dry run keeping only `DI_CONTROL_IDENTITY`
+     must be refused. If it is accepted, the policy does not apply to this caller (a write-only
+     identity that is not `di-user-*`, or a namespace outside the policy), or the Secret has no
+     token. A blind replace could then drop the app keys for good, so deploy stops with
+     `WASMCLOUD_CONTROL_SECRET_UNGUARDED` and writes nothing.
+  2. Replaces the whole Secret with the CLI's keys and a new token. That succeeds, and rotates
+     the token, only while the Secret holds nothing else.
+  3. If the replace is refused, sends a dry run with the CLI's keys and every declared key. If
+     the policy refuses that too, an undeclared key exists: deploy stops with "the control
+     Secret `<deployment>-control` has keys this CLI didn't write". Declare the keys, or
+     delete the Secret with `kubectl delete secret <deployment>-control` and redeploy.
+  4. Leaves out `DI_CONTROL_TOKEN`, then `DI_CONTROL_IDENTITY`, in two more dry runs. Each must
+     be refused, which proves the key is stored. Otherwise the app tooling dropped it, and
+     deploy stops with `WASMCLOUD_CONTROL_SECRET_INCOMPLETE` rather than run a workload
+     without control credentials. (A deployed workload without a token refuses every control
+     request.)
+  5. Keeps the Secret as it is, token included, says "Kept control Secret
+     `<deployment>-control`", and renders no `DI_CONTROL_TOKEN_REVISION`.
+
+  These checks rely on `tenant-secret-update` having no dry-run exemption
+  ([di-framework/platform#204](https://github.com/di-framework/platform/issues/204)). Without
+  declared keys, deploy only replaces, as before.
 - A caller who may read Secrets (a cluster admin) gets the Secret read. Deploy stops, naming
   the keys, when one is neither the CLI's nor declared, instead of dropping it. Otherwise it
   writes a new token with the declared keys carried over, conditional on the version it read,
   and a concurrent change stops deploy with "changed while deploy was updating it; re-run
-  deploy". Nothing read is printed, and failures are scrubbed of every value read.
+  deploy". Nothing read is printed. Failures are scrubbed of every value read: values of four
+  characters or more wherever they appear, and shorter ones as whole tokens.
 - Other failed writes show kubectl's reason, scrubbed of the token.
 - When deploy writes a token, it rotates at that Secret write, before `kubectl apply`. The WorkloadDeployment
   carries `DI_CONTROL_TOKEN_REVISION` (a digest of the token), so the deploy rolls the

@@ -10,7 +10,7 @@ export type ControlAuthResult =
   | { ok: true; identity: ControlIdentity }
   | { ok: false; status: number; error: string };
 
-/** Unconfigured local/dev only. Never includes `admin`. */
+/** Unconfigured local/dev only (never a deployed workload). Never includes `admin`. */
 const ANONYMOUS_IDENTITY: ControlIdentity = { id: 'anonymous', token: '', roles: ['invoke'] };
 
 function isIdentityEntry(entry: unknown): entry is { id: string; token: string; roles?: unknown } {
@@ -59,7 +59,22 @@ function parseIdentities(): { identities: ControlIdentity[]; configured: boolean
     return { identities: singleTokenIdentities(), configured: true };
   }
   const identities = singleTokenIdentities();
-  return { identities, configured: identities.length > 0 };
+  return { identities, configured: identities.length > 0 || isDeployed() };
+}
+
+/**
+ * A deployed workload: deploy renders the control host settings, and the control Secret supplies
+ * `DI_CONTROL_IDENTITY`. Such a workload without a usable token fails closed instead of falling
+ * back to anonymous invoke, so a control Secret that lost `DI_CONTROL_TOKEN` (for example one
+ * rewritten by app tooling) cannot open cron, queue and actor endpoints.
+ */
+function isDeployed(): boolean {
+  return (
+    process.env.DI_CONTROL_REJECT_FORWARDED === '1' ||
+    (process.env.DI_CONTROL_HTTP_HOST ?? '').trim() !== '' ||
+    process.env.DI_CONTROL_IDENTITY !== undefined ||
+    process.env.DI_CONTROL_TOKEN !== undefined
+  );
 }
 
 function hasRequiredRole(identity: ControlIdentity, requiredRoles: readonly string[]): boolean {

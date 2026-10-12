@@ -166,6 +166,7 @@ function incoming(
 afterEach(() => {
   delete process.env.DI_CONTROL_REJECT_FORWARDED;
   delete process.env.DI_CONTROL_HTTP_HOST;
+  delete process.env.DI_CONTROL_TOKEN;
   applicationState.current = () => new Response('ok');
   wasiState.consumeBody = () => emptyBody();
   runtimeState.ensureError = undefined;
@@ -483,6 +484,7 @@ describe('http adapter', () => {
   it('hides control paths that arrive through forwarded ingress', async () => {
     process.env.DI_CONTROL_REJECT_FORWARDED = '1';
     process.env.DI_CONTROL_HTTP_HOST = 'greeter,greeter.wasmcloud.svc.cluster.local';
+    process.env.DI_CONTROL_TOKEN = 'control-token';
     const encoder = new TextEncoder();
     const forwarded = (await handler.handle(
       incoming({
@@ -499,7 +501,10 @@ describe('http adapter', () => {
         method: { tag: 'post' },
         authority: 'greeter',
         path: '/_di/cron/nightly/invoke',
-        headers: [['host', encoder.encode('greeter')]],
+        headers: [
+          ['host', encoder.encode('greeter')],
+          ['authorization', encoder.encode('Bearer control-token')],
+        ],
       }),
     )) as Outgoing;
     expect(cluster.statusCode).toBe(200);
