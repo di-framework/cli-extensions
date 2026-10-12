@@ -676,8 +676,9 @@ entry has no matching import, because the deploy renders the following from the 
 
 `pglite.encryption` plugs an encrypting `wasi:filesystem` layer between the provider and the
 host, so the data directory holds only ciphertext. The layer is composed into the provider
-first (`wac plug --plug <encfs> <pglite>`), and that result is plugged into the guest exactly as
-an unencrypted provider is; the guest's own WASI imports still go straight to the host.
+first, with an explicit `wac compose` (see below). That result is then plugged into the guest
+exactly as an unencrypted provider is. The guest's own WASI imports still go straight to the
+host.
 
 ```json
 {
@@ -702,14 +703,22 @@ an unencrypted provider is; the guest's own WASI imports still go straight to th
   bundling or any pull. The CLI never writes or reads the
   key: put it in `<deployment>-control` with your own tooling, and keep a copy, since losing it
   loses the database.
-- The layer must sit between the provider and the host. `wac plug` succeeds as soon as any one
-  export matches, so before composing, the build reads both worlds with `jco wit`. The layer
-  must export every `wasi:filesystem/*` interface the provider imports, at a version `wac` will
-  match: the same major (and minor, below 1.0) and no older patch. In practice, build the
-  layer for the WASI versions the pinned provider imports (`wasi:filesystem/*@0.2.9` for
-  provider 6.0.11). After composing, the encrypted provider's only `wasi:filesystem` imports
-  must be the layer's own. Otherwise the build stops with
-  `WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED`.
+- The layer must sit between the provider and the host, and `wac plug` cannot prove that.
+  `wac plug` silently skips an export whose type does not fit, and it exits 0 as long as
+  anything plugged. So the build does this instead:
+  1. Reads both worlds with `jco wit`.
+  2. Takes, for each provider import the layer exports, the export with the same name and
+     version, or else one on the same semver track the way `wac` matches them. That means the
+     same major from 1.0 on, the same minor for 0.x, and an exact match for 0.0.z and
+     pre-releases. Every `wasi:filesystem/*` import must get one.
+  3. Writes `.di-framework/pglite-encryption.wac`. It instantiates the layer against the host
+     and passes each of those exports to the provider as a named instantiation argument.
+  4. Composes it with `wac compose`, which type-checks every argument.
+
+  A layer that misses a filesystem interface, is on another version track, or exports a type
+  the provider cannot use stops the build with `WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED`,
+  carrying `wac`'s message. Build the layer for the WASI versions the pinned provider imports
+  (`wasi:filesystem/*@0.2.9` for provider 6.0.11).
 - Only the engine has `DI_PGLITE_KEY` hidden. The layer filters it from the provider's
   environment, but the guest's own `wasi:cli/environment` still comes from the host, so your
   application code can read the key.

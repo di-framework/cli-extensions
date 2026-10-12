@@ -1,8 +1,14 @@
 /**
- * Checks that a PGlite encryption layer really sits between the provider and the host
- * filesystem. `wac plug` succeeds as soon as any one export of the plug matches an import of the
- * socket, so a layer that exports only `wasi:cli/environment`, or exports the filesystem at an
- * incompatible version, composes cleanly and leaves PGlite writing plaintext to the host.
+ * Wiring a PGlite encryption layer between the provider and the host filesystem.
+ *
+ * `wac plug` is best effort: it plugs each export of the layer whose name matches an import of
+ * the provider *and* whose type is a subtype of it, silently skips the rest, and exits 0 as soon
+ * as one pair plugged. A layer that exports only `wasi:cli/environment`, exports the filesystem
+ * at a version wac does not match, or exports it with a different type would compose cleanly and
+ * leave PGlite writing plaintext to the host. So the build does not use `wac plug` here: it
+ * plans the wiring itself and composes an explicit WAC document with `wac compose`, where every
+ * provider import that must go to the layer is a named instantiation argument. wac then
+ * type-checks each one and fails loudly instead of skipping it.
  */
 
 /** An interface a component's world imports or exports, e.g. `wasi:filesystem/types@0.2.9`. */
@@ -11,7 +17,7 @@ export type WitInterface = { name: string; version?: string };
 const FILESYSTEM = 'wasi:filesystem/';
 const WORLD_ITEM =
   /^\s*(import|export)\s+([a-z][a-z0-9-]*:[a-z][a-z0-9-]*\/[a-z][a-z0-9-]*)(?:@([^;\s]+))?;\s*$/;
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$/;
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
 
 /** The interfaces a component's world imports and exports, from `jco wit` output. */
 export function worldInterfaces(wit: string): { imports: WitInterface[]; exports: WitInterface[] } {
@@ -34,82 +40,103 @@ export function formatInterface(item: WitInterface): string {
 }
 
 /**
- * Whether an export at `exported` satisfies an import at `imported`, the way `wac plug` matches
- * them: the same major version (and minor, below 1.0), and not older. Pre-releases and
- * unversioned interfaces must match exactly.
+ * Whether two versions of an interface are on the same semver track, as wac decides it
+ * (wac-types `are_semver_compatible`), in either direction: the same major from 1.0 on, the
+ * same minor for 0.x with x ≥ 1, and an exact match for 0.0.z and pre-releases. Unversioned
+ * names match only each other.
  */
-export function versionSatisfies(exported?: string, imported?: string): boolean {
-  if (exported === undefined || imported === undefined) return exported === imported;
-  const e = SEMVER.exec(exported);
-  const i = SEMVER.exec(imported);
-  if (e === null || i === null || e[4] !== undefined || i[4] !== undefined)
-    return exported === imported;
-  const [eMajor, eMinor, ePatch] = [1, 2, 3].map((n) => Number(e[n]));
-  const [iMajor, iMinor, iPatch] = [1, 2, 3].map((n) => Number(i[n]));
-  if (eMajor !== iMajor) return false;
-  if (eMajor === 0) return eMinor === iMinor && (ePatch as number) >= (iPatch as number);
-  return (
-    (eMinor as number) > (iMinor as number) ||
-    (eMinor === iMinor && (ePatch as number) >= (iPatch as number))
-  );
+export function semverCompatible(a?: string, b?: string): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  const x = SEMVER.exec(a);
+  const y = SEMVER.exec(b);
+  if (x === null || y === null || x[4] !== undefined || y[4] !== undefined) return false;
+  const [xMajor, xMinor, xPatch] = [1, 2, 3].map((n) => Number(x[n]));
+  const [yMajor, yMinor, yPatch] = [1, 2, 3].map((n) => Number(y[n]));
+  if (xMajor !== yMajor) return false;
+  if (xMajor !== 0) return true;
+  if (xMinor !== yMinor) return false;
+  if (xMinor !== 0) return true;
+  return xPatch === yPatch;
 }
 
 const isFilesystem = (item: WitInterface) => item.name.startsWith(FILESYSTEM);
 
-/**
- * Why the layer cannot stand in for the provider's filesystem, or undefined when it can: it must
- * export, at a compatible version, every `wasi:filesystem/*` interface the provider imports.
- * When it does, `wac plug` connects every one of them, since it plugs each matching export.
- */
-export function layerCoverageProblem(
-  provider: { imports: WitInterface[] },
-  layer: { exports: WitInterface[] },
-): string | undefined {
-  const required = provider.imports.filter(isFilesystem);
-  if (required.length === 0)
-    return 'the provider imports no wasi:filesystem interface, so there is nothing for the layer to encrypt';
-  const missing = required.flatMap((wanted) => {
-    if (
-      layer.exports.some(
-        (offered) =>
-          offered.name === wanted.name && versionSatisfies(offered.version, wanted.version),
-      )
-    )
-      return [];
-    const found = layer.exports
-      .filter((offered) => offered.name === wanted.name)
-      .map((offered) => `@${offered.version ?? 'unversioned'}`);
-    const detail = found.length === 0 ? 'not exported' : `the layer exports ${found.join(', ')}`;
-    return [`${formatInterface(wanted)} (${detail})`];
-  });
-  return missing.length === 0
-    ? undefined
-    : `the layer does not export what the provider imports: ${missing.join('; ')}`;
-}
+/** One provider import wired to one layer export, by their full names. */
+export type Wire = { providerImport: string; layerExport: string };
 
 /**
- * Why the composition did not interpose the layer, or undefined when it did. After the plug, the
- * only filesystem imports left must be the layer's own (its path to the host). Any other
- * `wasi:filesystem` import is one of the provider's that went straight to the host.
+ * Which layer export each provider import is wired to: the export with the same name and
+ * version, else the first on the same semver track (wac's own matching). Every
+ * `wasi:filesystem/*` import must be wired, or `problem` says why not; other interfaces the
+ * layer re-exports (`wasi:io/streams`, `wasi:cli/*`, …) are wired too, since the filesystem
+ * types refer to them.
  */
-export function interpositionProblem(
-  composed: { imports: WitInterface[]; exports: WitInterface[] },
-  layer: { imports: WitInterface[] },
+export function planWiring(
+  provider: { imports: WitInterface[] },
+  layer: { exports: WitInterface[] },
+): { wires: Wire[]; problem?: string } {
+  const required = provider.imports.filter(isFilesystem);
+  if (required.length === 0)
+    return {
+      wires: [],
+      problem:
+        'the provider imports no wasi:filesystem interface, so there is nothing for the layer to encrypt',
+    };
+  const wires: Wire[] = [];
+  const missing: string[] = [];
+  for (const wanted of provider.imports) {
+    const offered =
+      layer.exports.find((item) => item.name === wanted.name && item.version === wanted.version) ??
+      layer.exports.find(
+        (item) => item.name === wanted.name && semverCompatible(item.version, wanted.version),
+      );
+    if (offered !== undefined) {
+      wires.push({
+        providerImport: formatInterface(wanted),
+        layerExport: formatInterface(offered),
+      });
+      continue;
+    }
+    if (!isFilesystem(wanted)) continue;
+    const found = layer.exports
+      .filter((item) => item.name === wanted.name)
+      .map((item) => `@${item.version ?? 'unversioned'}`);
+    const detail = found.length === 0 ? 'not exported' : `the layer exports ${found.join(', ')}`;
+    missing.push(`${formatInterface(wanted)} (${detail})`);
+  }
+  return missing.length === 0
+    ? { wires }
+    : {
+        wires,
+        problem: `the layer does not export what the provider imports: ${missing.join('; ')}`,
+      };
+}
+
+/** WAC package names the composition document refers to (bound with `wac compose --dep`). */
+export const LAYER_PACKAGE = 'pglite:layer';
+export const PROVIDER_PACKAGE = 'pglite:provider';
+
+/**
+ * The WAC document that instantiates the layer against the host and the provider with every
+ * wired import taken from the layer's instance, re-exporting the provider's exports. Imports of
+ * either that are not wired stay imports of the result (`...`).
+ */
+export function encryptionComposition(
+  wires: readonly Wire[],
   providerExports: WitInterface[],
-): string | undefined {
-  const names = (items: WitInterface[]) =>
-    items
-      .filter(isFilesystem)
-      .map(formatInterface)
-      .sort((a, b) => a.localeCompare(b));
-  const left = names(composed.imports);
-  const own = names(layer.imports);
-  const stray = left.filter((name) => !own.includes(name));
-  if (stray.length > 0)
-    return `the composed provider still imports ${stray.join(', ')} from the host, which the layer does not import itself`;
-  const lost = providerExports
-    .map(formatInterface)
-    .filter((name) => !composed.exports.some((item) => formatInterface(item) === name));
-  if (lost.length > 0) return `the composed provider no longer exports ${lost.join(', ')}`;
-  return undefined;
+): string {
+  const quote = (name: string) => JSON.stringify(name);
+  return [
+    'package di-framework:pglite-encrypted;',
+    '',
+    `let layer = new ${LAYER_PACKAGE} { ... };`,
+    `let provider = new ${PROVIDER_PACKAGE} {`,
+    ...wires.map((wire) => `  ${quote(wire.providerImport)}: layer[${quote(wire.layerExport)}],`),
+    '  ...',
+    '};',
+    '',
+    ...providerExports.map((item) => `export provider[${quote(formatInterface(item))}];`),
+    '',
+  ].join('\n');
 }

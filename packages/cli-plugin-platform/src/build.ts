@@ -36,7 +36,13 @@ import {
   resolvePgliteComponent,
   resolvePgliteEncryption,
 } from './pglite';
-import { interpositionProblem, layerCoverageProblem, worldInterfaces } from './pglite-encryption';
+import {
+  encryptionComposition,
+  LAYER_PACKAGE,
+  PROVIDER_PACKAGE,
+  planWiring,
+  worldInterfaces,
+} from './pglite-encryption';
 import { loadProject, type WasmcloudProject } from './project';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { renderQueuesModule } from './queues-module';
@@ -393,16 +399,16 @@ function notInterposed(
 }
 
 /**
- * Plugs the encryption layer into the provider (`wac plug --plug <layer> <provider>`) and writes
- * the result to `output`, which the build then plugs into the guest instead of the provider.
+ * Composes the encryption layer into the provider and writes the result to `output`, which the
+ * build then plugs into the guest instead of the provider.
  *
- * `wac plug` exits 0 as soon as any one export of the layer matches, so the composition is
- * checked on both sides:
- * - before: the layer must export, at a compatible version, every `wasi:filesystem/*` interface
- *   the provider imports. `wac plug` connects every matching export, so all of them then
- *   resolve to the layer;
- * - after: the composed provider's `wasi:filesystem` imports must be exactly the layer's own.
- *   A provider import that bypassed the layer would show up as an extra one.
+ * `wac plug` silently skips a layer export whose name matches but whose type is not a subtype of
+ * the provider's import, and exits 0 when anything else plugged, so it cannot prove the layer is
+ * in the path. Instead the build reads both worlds with `jco wit`, plans which layer export each
+ * provider import takes (every `wasi:filesystem/*` import must have one), and composes a WAC
+ * document that passes each of them as a named instantiation argument (`wac compose`). wac
+ * type-checks every argument, so a layer that does not fit fails the build here rather than
+ * being bypassed. The document is kept at `.di-framework/pglite-encryption.wac`.
  */
 export async function encryptProvider(
   project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
@@ -414,27 +420,32 @@ export async function encryptProvider(
 ): Promise<void> {
   const providerWorld = await componentWorld(project, deps, provider, 'PGlite provider');
   const layerWorld = await componentWorld(project, deps, layer, 'PGlite encryption layer');
-  const coverage = layerCoverageProblem(providerWorld, layerWorld);
-  if (coverage !== undefined) throw notInterposed(project, coverage);
+  const plan = planWiring(providerWorld, layerWorld);
+  if (plan.problem !== undefined) throw notInterposed(project, plan.problem);
 
+  const document = join(dirname(output), 'pglite-encryption.wac');
+  writeFileSync(document, encryptionComposition(plan.wires, providerWorld.exports));
   rmSync(output, { force: true });
   const { wac, envPath } = wacTool(deps);
   io.stdout.write('Composing the PGlite encryption layer into the provider...\n');
-  const result = await deps.runCaptured(wac, ['plug', '--plug', layer, provider, '-o', output], {
-    cwd: project.projectRoot,
-    env: { ...process.env, PATH: envPath },
-  });
+  const result = await deps.runCaptured(
+    wac,
+    [
+      'compose',
+      document,
+      '--dep',
+      `${LAYER_PACKAGE}=${layer}`,
+      '--dep',
+      `${PROVIDER_PACKAGE}=${provider}`,
+      '-o',
+      output,
+    ],
+    { cwd: project.projectRoot, env: { ...process.env, PATH: envPath } },
+  );
   if (result.exitCode !== 0 || !existsSync(output)) {
-    throw new CommandFailure(
-      'WASMCLOUD_PGLITE_ENCRYPTION_COMPOSE_FAILED',
-      `Composition of the PGlite encryption layer into the provider failed: ${result.stderr || result.stdout || 'wac wrote no component'}`,
-      3,
-      { application: project.applicationName, exitCode: result.exitCode },
-    );
+    const reason = (result.stderr || result.stdout).trim() || 'wac wrote no component';
+    throw notInterposed(project, `wac compose refused the wiring: ${reason}`);
   }
-  const composedWorld = await componentWorld(project, deps, output, 'encrypted PGlite provider');
-  const bypass = interpositionProblem(composedWorld, layerWorld, providerWorld.exports);
-  if (bypass !== undefined) throw notInterposed(project, bypass);
 }
 
 /**
