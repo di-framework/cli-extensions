@@ -533,8 +533,8 @@ describe('write-only Secrets (platform#112)', () => {
       ['a write-only caller that is not di-user-*', 'a CI ServiceAccount bound to di-developer'],
       ['a namespace outside the policy', 'a namespace the binding does not select'],
     ] as const) {
-      it(`refuses to replace blind for ${caller}, instead of dropping the app keys`, async () => {
-        // ${story}: Secrets are write-only, and no admission policy refuses a dropped key.
+      it(`refuses to replace blind for ${caller} (${story}), instead of dropping the app keys`, async () => {
+        // Secrets are write-only, and no admission policy refuses a dropped key.
         const { greeter } = makeWorkspace();
         declare(greeter);
         const api = writeOnlySecretsApi('wasmcloud', { unguarded: true });
