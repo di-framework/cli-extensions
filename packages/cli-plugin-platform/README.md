@@ -668,11 +668,26 @@ an unencrypted provider is; the guest's own WASI imports still go straight to th
 - The layer reads its master key from `DI_PGLITE_KEY` (and, while rotating,
   `DI_PGLITE_KEY_PREVIOUS`). The key reaches the guest only through the workload's control
   Secret, so the build fails with `WASMCLOUD_PGLITE_KEY_UNDECLARED` unless `DI_PGLITE_KEY` is in
-  `controlSecretKeys` (see [Control Secret](#control-secret)). The CLI never writes or reads the
+  `controlSecretKeys` (see [Control Secret](#control-secret)). That check runs first, before
+  bundling or any pull. The CLI never writes or reads the
   key: put it in `<deployment>-control` with your own tooling, and keep a copy, since losing it
   loses the database.
-- The layer is part of the deployment digest, and the build and deploy results report it
+- The layer must sit between the provider and the host. `wac plug` succeeds as soon as any one
+  export matches, so before composing, the build reads both worlds with `jco wit`. The layer
+  must export every `wasi:filesystem/*` interface the provider imports, at a version `wac` will
+  match: the same major (and minor, below 1.0) and no older patch. In practice, build the
+  layer for the WASI versions the pinned provider imports (`wasi:filesystem/*@0.2.9` for
+  provider 6.0.11). After composing, the encrypted provider's only `wasi:filesystem` imports
+  must be the layer's own. Otherwise the build stops with
+  `WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED`.
+- Only the engine has `DI_PGLITE_KEY` hidden. The layer filters it from the provider's
+  environment, but the guest's own `wasi:cli/environment` still comes from the host, so your
+  application code can read the key.
+- The composed provider is `.di-framework/di-framework-pglite.encrypted.wasm`. The deployment
+  digest hashes the raw provider and layer bytes, not `wac`'s output, so changing either one
+  redeploys. The build and deploy results report the layer
   (`PGlite: <image>, encrypted at rest by <layer>`).
+- `encryption.image` must not pin the provider's repository or digest.
 
 Give each database one owner. Members of one implicit workload share one storage directory,
 mounted at each member's own `storageMount`. So `/data/pglite` under a `/data` mount and

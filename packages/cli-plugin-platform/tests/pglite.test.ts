@@ -11,9 +11,10 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { buildComponent } from '../src/build';
+import { buildComponent, encryptProvider } from '../src/build';
 import { runWasmcloudDeploy } from '../src/deploy';
 import type { WasmcloudDeps } from '../src/deps';
+import { DEFAULT_DEPS } from '../src/deps';
 import {
   ALLOW_LOCAL_PGLITE_ENV,
   assertDistinctPgliteRoots,
@@ -25,6 +26,7 @@ import {
   PGLITE_ENCFS,
   PGLITE_ENCFS_WASM_ENV,
   PGLITE_ENCFS_WASM_FILE,
+  PGLITE_ENCRYPTED_WASM_FILE,
   PGLITE_WASM_ENV,
   PGLITE_WASM_FILE,
   parseDigestReference,
@@ -37,6 +39,12 @@ import {
   verifyManifest,
   warnIfHostIgnoresExclusive,
 } from '../src/pglite';
+import {
+  interpositionProblem,
+  layerCoverageProblem,
+  versionSatisfies,
+  worldInterfaces,
+} from '../src/pglite-encryption';
 import { loadProject } from '../src/project';
 import type { ClusterConnection } from '../src/target';
 import { runtimeRequirementsFromJavaScript } from '../src/wit';
@@ -1034,6 +1042,28 @@ describe('pglite encryption', () => {
   const GUEST =
     'import { open } from "di-framework:pglite/database@0.2.0";\nexport default open;\n';
   const WIT = 'world application {\n  export wasi:http/handler@0.3.0;\n}\n';
+  const world = (lines: string[]) =>
+    `package root:component;\n\nworld root {\n${lines.map((line) => `  ${line};`).join('\n')}\n}\n`;
+  const PROVIDER_WIT = world([
+    'import wasi:filesystem/types@0.2.9',
+    'import wasi:filesystem/preopens@0.2.9',
+    'import wasi:cli/environment@0.2.9',
+    'export di-framework:pglite/database@0.2.0',
+  ]);
+  const LAYER_WIT = world([
+    'import wasi:filesystem/types@0.2.9',
+    'import wasi:filesystem/preopens@0.2.9',
+    'import wasi:cli/environment@0.2.9',
+    'export wasi:filesystem/types@0.2.9',
+    'export wasi:filesystem/preopens@0.2.9',
+    'export wasi:cli/environment@0.2.9',
+  ]);
+  const COMPOSED_WIT = world([
+    'import wasi:filesystem/types@0.2.9',
+    'import wasi:filesystem/preopens@0.2.9',
+    'import wasi:cli/environment@0.2.9',
+    'export di-framework:pglite/database@0.2.0',
+  ]);
   const parse = (value: unknown) => parsePgliteConfig(value, CONFIG_PATH, toProject);
 
   /** oras serving the provider and the encryption layer, each by its own pin. */
@@ -1080,9 +1110,17 @@ describe('pglite encryption', () => {
       env?: Record<string, string>;
       exitCodes?: Record<string, number>;
       cache?: string;
+      /** `jco wit` of the composed provider; defaults to a correctly interposed one. */
+      composedWit?: string;
+      layerWit?: string;
     } = {},
   ): WasmcloudDeps {
     const invocations = options.invocations ?? [];
+    const worlds: Record<string, string> = {
+      [PGLITE_WASM_FILE]: PROVIDER_WIT,
+      [PGLITE_ENCFS_WASM_FILE]: options.layerWit ?? LAYER_WIT,
+      [PGLITE_ENCRYPTED_WASM_FILE]: options.composedWit ?? COMPOSED_WIT,
+    };
     const base = fakeDeps({
       cwd: root,
       assets: makeAssets(),
@@ -1100,8 +1138,16 @@ describe('pglite encryption', () => {
     const oras = twoImageRegistry(invocations);
     return {
       ...base,
-      runCaptured: async (command, args, runOptions) =>
-        command === 'oras' ? oras(args) : base.runCaptured(command, args, runOptions),
+      runCaptured: async (command, args, runOptions) => {
+        if (command === 'oras') return oras(args);
+        const world =
+          args[1] === 'wit' ? worlds[String(args[2]).split('/').pop() ?? ''] : undefined;
+        if (world !== undefined) {
+          invocations.push({ command, args: [...args], cwd: runOptions.cwd, captured: true });
+          return { exitCode: 0, stdout: world, stderr: '' };
+        }
+        return base.runCaptured(command, args, runOptions);
+      },
     };
   }
 
@@ -1158,22 +1204,27 @@ describe('pglite encryption', () => {
     const generated = join(root, '.di-framework');
     const provider = join(generated, PGLITE_WASM_FILE);
     const layer = join(generated, PGLITE_ENCFS_WASM_FILE);
+    const encrypted = join(generated, PGLITE_ENCRYPTED_WASM_FILE);
     const plugs = invocations.filter((entry) => entry.args[0] === 'plug');
     expect(plugs.map((entry) => entry.args)).toEqual([
-      ['plug', '--plug', layer, provider, '-o', `${provider}.encrypted`],
+      ['plug', '--plug', layer, provider, '-o', encrypted],
       [
         'plug',
         '--plug',
-        provider,
+        encrypted,
         join(root, 'dist', 'orders.wasm'),
         '-o',
         `${join(root, 'dist', 'orders.wasm')}.composed`,
       ],
     ]);
     expect(readFileSync(layer).equals(LAYER)).toBe(true);
-    // The provider the guest got is the encrypted composition, not the pulled bytes.
-    expect(readFileSync(provider, 'utf8')).toBe('composed-sqlite-component');
-    expect(existsSync(`${provider}.encrypted`)).toBe(false);
+    // The guest got the encrypted composition; the raw provider copy is left as pulled.
+    expect(readFileSync(provider).equals(PROVIDER)).toBe(true);
+    expect(readFileSync(encrypted, 'utf8')).toBe('composed-sqlite-component');
+    // Both sides of the plug were inspected: provider, layer, then the composition.
+    expect(
+      invocations.filter((entry) => entry.args[1] === 'wit').map((entry) => entry.args[2]),
+    ).toEqual(expect.arrayContaining([provider, layer, encrypted]));
     // The layer is cached under its own digest and file name.
     const entry = cacheEntry({ [CACHE_DIR_ENV]: cache }, digestOf(ENC_MANIFEST));
     expect(readFileSync(join(entry, PGLITE_ENCFS_WASM_FILE)).equals(LAYER)).toBe(true);
@@ -1201,10 +1252,9 @@ describe('pglite encryption', () => {
           'Orders turns on "pglite.encryption", whose layer reads its key from DI_PGLITE_KEY in ' +
           'the workload\'s control Secret; add "DI_PGLITE_KEY" to "controlSecretKeys" in di-framework.config.json',
       });
-      // Nothing was pulled for the layer.
-      expect(
-        invocations.some((entry) => entry.args.some((arg) => arg.includes(ENC_REPOSITORY))),
-      ).toBe(false);
+      // A config check: nothing was pulled (not even the provider) and nothing was bundled.
+      expect(invocations.filter((entry) => entry.command === 'oras')).toEqual([]);
+      expect(existsSync(join(root, '.di-framework', 'component.js'))).toBe(false);
     }
   });
 
@@ -1323,4 +1373,259 @@ describe('pglite encryption', () => {
       ` PGlite: ${IMAGE}, encrypted at rest by local ${layer} (unverified).`,
     );
   });
+
+  it('refuses a layer pinned to the provider repository or digest', () => {
+    expect(() =>
+      parse({ image: IMAGE, encryption: { image: `${REPOSITORY}@${digestOf(LAYER)}` } }),
+    ).toThrow(
+      `pglite.encryption.image must pin the encryption layer (${ENC_REPOSITORY}), not the provider repository ${REPOSITORY}`,
+    );
+    const mirror = `registry.example.com/mirror/pglite@${digestOf(MANIFEST)}`;
+    expect(() =>
+      parse({
+        image: mirror,
+        encryption: { image: `registry.example.com/mirror/pglite@${digestOf(LAYER)}` },
+      }),
+    ).toThrow('not the provider repository registry.example.com/mirror/pglite');
+    expect(() =>
+      parse({
+        image: mirror,
+        encryption: { image: `registry.example.com/mirror/encfs@${digestOf(MANIFEST)}` },
+      }),
+    ).toThrow('pglite.encryption.image pins the same digest as pglite.image');
+    expect(
+      parse({ wasm: 'vendor/pglite.wasm', encryption: { image: ENC_IMAGE } })?.encryption,
+    ).toEqual({ image: ENC_IMAGE });
+  });
+
+  it('refuses a layer that does not cover the provider filesystem, before composing', async () => {
+    const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
+    const invocations: RunnerInvocation[] = [];
+    const layerWit = world([
+      'import wasi:cli/environment@0.2.9',
+      'export wasi:cli/environment@0.2.9',
+      'export wasi:filesystem/types@0.3.0',
+    ]);
+    await expect(
+      buildComponent(loadProject(root), captureIo().io, buildDeps(root, { invocations, layerWit })),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED',
+      exitCode: 3,
+      message: expect.stringContaining(
+        'the layer does not export what the provider imports: wasi:filesystem/types@0.2.9 (the layer exports @0.3.0); wasi:filesystem/preopens@0.2.9 (not exported)',
+      ),
+    });
+    expect(invocations.some((entry) => entry.args[0] === 'plug')).toBe(false);
+  });
+
+  it('refuses a composition whose provider still reaches the host filesystem', async () => {
+    const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
+    const layerWit = world([
+      'import wasi:filesystem/types@0.2.12',
+      'import wasi:filesystem/preopens@0.2.12',
+      'export wasi:filesystem/types@0.2.9',
+      'export wasi:filesystem/preopens@0.2.9',
+    ]);
+    const bypassed = world([
+      'import wasi:filesystem/types@0.2.12',
+      'import wasi:filesystem/preopens@0.2.12',
+      'import wasi:filesystem/types@0.2.9',
+      'export di-framework:pglite/database@0.2.0',
+    ]);
+    await expect(
+      buildComponent(
+        loadProject(root),
+        captureIo().io,
+        buildDeps(root, { layerWit, composedWit: bypassed }),
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED',
+      message: expect.stringContaining(
+        'the composed provider still imports wasi:filesystem/types@0.2.9 from the host',
+      ),
+    });
+    const lost = world([
+      'import wasi:filesystem/types@0.2.12',
+      'import wasi:filesystem/preopens@0.2.12',
+    ]);
+    await expect(
+      buildComponent(
+        loadProject(root),
+        captureIo().io,
+        buildDeps(root, { layerWit, composedWit: lost }),
+      ),
+    ).rejects.toThrow('the composed provider no longer exports di-framework:pglite/database@0.2.0');
+  });
+
+  it('reports a WIT world it cannot read', async () => {
+    const root = project({ image: IMAGE, encryption: { image: ENC_IMAGE } });
+    const deps = buildDeps(root);
+    const runCaptured = deps.runCaptured;
+    deps.runCaptured = async (command, args, options) =>
+      args[1] === 'wit' && String(args[2]).endsWith(PGLITE_ENCFS_WASM_FILE)
+        ? { exitCode: 1, stdout: '', stderr: 'not a component' }
+        : runCaptured(command, args, options);
+    await expect(buildComponent(loadProject(root), captureIo().io, deps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_COMPONENT_IMPORTS_UNREADABLE',
+      message: 'Could not read the WIT world of the PGlite encryption layer: not a component',
+    });
+  });
+
+  it('changes the deployment digest when only the layer changes, and hashes inputs only', async () => {
+    const root = project({ image: IMAGE, encryption: { wasm: 'vendor/encfs.wasm' } });
+    const build = () => buildComponent(loadProject(root), captureIo().io, buildDeps(root));
+    const layerA = await build();
+    expect(await build()).toMatchObject({ deploymentDigest: layerA.deploymentDigest });
+    writeFileSync(join(root, 'vendor', 'encfs.wasm'), Buffer.from('\0asm\x01\0\0\0layer-b'));
+    const layerB = await build();
+    expect(layerB.deploymentDigest).not.toBe(layerA.deploymentDigest);
+
+    // wac's output is not an input: a different composition leaves the key alone.
+    const other = buildDeps(root);
+    const runCaptured = other.runCaptured;
+    other.runCaptured = async (command, args, options) => {
+      const result = await runCaptured(command, args, options);
+      if (args[0] === 'plug' && args.includes(join(root, '.di-framework', PGLITE_ENCFS_WASM_FILE)))
+        writeFileSync(args[args.indexOf('-o') + 1] as string, 'a different wac build');
+      return result;
+    };
+    expect((await buildComponent(loadProject(root), captureIo().io, other)).deploymentDigest).toBe(
+      layerB.deploymentDigest,
+    );
+  });
 });
+
+describe('pglite encryption interface checks', () => {
+  it('reads world imports and exports from jco wit output', () => {
+    expect(
+      worldInterfaces(
+        'package root:component;\n\nworld root {\n  import wasi:filesystem/types@0.2.9;\n  import x: func();\n  export di-framework:pglite/database@0.2.0;\n  export local:pkg/iface;\n}\n',
+      ),
+    ).toEqual({
+      imports: [{ name: 'wasi:filesystem/types', version: '0.2.9' }],
+      exports: [
+        { name: 'di-framework:pglite/database', version: '0.2.0' },
+        { name: 'local:pkg/iface' },
+      ],
+    });
+  });
+
+  it('matches versions the way wac plug does', () => {
+    expect(versionSatisfies('0.2.9', '0.2.9')).toBe(true);
+    expect(versionSatisfies('0.2.10', '0.2.9')).toBe(true);
+    expect(versionSatisfies('0.2.8', '0.2.9')).toBe(false);
+    expect(versionSatisfies('0.3.0', '0.2.9')).toBe(false);
+    expect(versionSatisfies('1.4.0', '1.2.3')).toBe(true);
+    expect(versionSatisfies('1.2.4', '1.2.3')).toBe(true);
+    expect(versionSatisfies('1.2.2', '1.2.3')).toBe(false);
+    expect(versionSatisfies('1.1.9', '1.2.3')).toBe(false);
+    expect(versionSatisfies('2.0.0', '1.2.3')).toBe(false);
+    expect(versionSatisfies('0.2.9-rc1', '0.2.9-rc1')).toBe(true);
+    expect(versionSatisfies('0.2.10-rc1', '0.2.9')).toBe(false);
+    expect(versionSatisfies(undefined, undefined)).toBe(true);
+    expect(versionSatisfies('0.2.9', undefined)).toBe(false);
+  });
+
+  it('needs a provider that imports the filesystem', () => {
+    expect(
+      layerCoverageProblem(
+        { imports: [{ name: 'wasi:cli/environment', version: '0.2.9' }] },
+        { exports: [] },
+      ),
+    ).toBe(
+      'the provider imports no wasi:filesystem interface, so there is nothing for the layer to encrypt',
+    );
+    expect(interpositionProblem({ imports: [], exports: [] }, { imports: [] }, [])).toBeUndefined();
+  });
+});
+
+/**
+ * Real `wac plug` and `jco wit` on small components built from the WAT next to them
+ * (`wasm-tools parse <name>.wat -o <name>.wasm`). The stand-in provider imports
+ * `wasi:filesystem/{types,preopens}@0.2.9` and `wasi:cli/environment@0.2.9` like PGlite does.
+ */
+const FIXTURES = join(import.meta.dir, 'fixtures', 'pglite-encryption');
+const hasWac = DEFAULT_DEPS.capture('wac', ['--version']) !== undefined;
+describe.skipIf(!hasWac || DEFAULT_DEPS.nodeBinaryPath() === undefined)(
+  'pglite encryption with real components',
+  () => {
+    const compose = async (layer: string) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pglite-encfs-real-'));
+      const output = join(dir, 'encrypted.wasm');
+      await encryptProvider(
+        { projectRoot: dir, applicationName: 'Orders' },
+        DEFAULT_DEPS,
+        captureIo().io,
+        join(FIXTURES, 'provider.wasm'),
+        join(FIXTURES, `${layer}.wasm`),
+        output,
+      );
+      return output;
+    };
+
+    it('composes a layer that exports the filesystem at the same or a newer patch version', async () => {
+      for (const layer of ['layer-full', 'layer-newer-patch']) {
+        const output = await compose(layer);
+        expect(readFileSync(output).subarray(0, 4).toString('latin1')).toBe('\0asm');
+      }
+    }, 30_000);
+
+    it('refuses a layer that exports only wasi:cli/environment, which wac plug would accept', async () => {
+      await expect(compose('layer-env-only')).rejects.toMatchObject({
+        code: 'WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED',
+        message: expect.stringContaining(
+          'wasi:filesystem/types@0.2.9 (not exported); wasi:filesystem/preopens@0.2.9 (not exported)',
+        ),
+      });
+    }, 30_000);
+
+    it('refuses a layer missing preopens or exporting an incompatible version', async () => {
+      await expect(compose('layer-no-preopens')).rejects.toThrow(
+        'the layer does not export what the provider imports: wasi:filesystem/preopens@0.2.9 (not exported)',
+      );
+      await expect(compose('layer-0.3.0')).rejects.toThrow(
+        'wasi:filesystem/types@0.2.9 (the layer exports @0.3.0); wasi:filesystem/preopens@0.2.9 (the layer exports @0.3.0)',
+      );
+    }, 30_000);
+
+    it('detects the bypass in a real composition that wac accepted', async () => {
+      // What the build would get without the coverage check: wac plugs only the environment.
+      const dir = mkdtempSync(join(tmpdir(), 'pglite-encfs-bypass-'));
+      const output = join(dir, 'bypassed.wasm');
+      const plugged = Bun.spawnSync([
+        'wac',
+        'plug',
+        '--plug',
+        join(FIXTURES, 'layer-env-only.wasm'),
+        join(FIXTURES, 'provider.wasm'),
+        '-o',
+        output,
+      ]);
+      expect(plugged.exitCode).toBe(0);
+      const wit = async (path: string) => {
+        const result = await DEFAULT_DEPS.runCaptured(
+          DEFAULT_DEPS.nodeBinaryPath() as string,
+          [DEFAULT_DEPS.jcoCliPath(), 'wit', path],
+          { cwd: dir },
+        );
+        return worldInterfaces(result.stdout);
+      };
+      expect(
+        interpositionProblem(
+          await wit(output),
+          await wit(join(FIXTURES, 'layer-env-only.wasm')),
+          (await wit(join(FIXTURES, 'provider.wasm'))).exports,
+        ),
+      ).toBe(
+        'the composed provider still imports wasi:filesystem/preopens@0.2.9, wasi:filesystem/types@0.2.9 from the host, which the layer does not import itself',
+      );
+      expect(
+        interpositionProblem(
+          await wit(await compose('layer-full')),
+          await wit(join(FIXTURES, 'layer-full.wasm')),
+          (await wit(join(FIXTURES, 'provider.wasm'))).exports,
+        ),
+      ).toBeUndefined();
+    }, 30_000);
+  },
+);

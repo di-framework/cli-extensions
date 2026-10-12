@@ -51,6 +51,8 @@ export const PGLITE_ENCFS_REPOSITORY = 'ghcr.io/di-framework/pglite-encfs';
 export const PGLITE_ENCFS_WASM_ENV = 'DI_FRAMEWORK_PGLITE_ENCFS_WASM';
 /** File name of the encryption layer inside a cache entry. */
 export const PGLITE_ENCFS_WASM_FILE = 'di-framework-pglite-encfs.wasm';
+/** The provider with the encryption layer plugged in, as the build plugs it into the guest. */
+export const PGLITE_ENCRYPTED_WASM_FILE = 'di-framework-pglite.encrypted.wasm';
 /**
  * The guest environment variable the encryption layer reads its master key from. It must come
  * from the control Secret, so the project declares it in `controlSecretKeys`.
@@ -232,6 +234,18 @@ export function parsePgliteConfig(
       configPath,
     );
   const encryption = parseEncryption(entry.encryption, configPath, resolveFile);
+  if (encryption?.image !== undefined) {
+    const layer = parseDigestReference(encryption.image, PGLITE_ENCFS_REPOSITORY);
+    const provider =
+      entry.image === undefined ? undefined : parseDigestReference(entry.image as string);
+    if (layer.repository === PGLITE_REPOSITORY || layer.repository === provider?.repository)
+      configInvalid(
+        `pglite.encryption.image must pin the encryption layer (${PGLITE_ENCFS_REPOSITORY}), not the provider repository ${layer.repository}`,
+        configPath,
+      );
+    if (layer.digest === provider?.digest)
+      configInvalid('pglite.encryption.image pins the same digest as pglite.image', configPath);
+  }
   return {
     ...(entry.image === undefined ? {} : { image: entry.image as string }),
     ...(entry.wasm === undefined ? {} : { wasm: resolveFile(entry.wasm as string) }),

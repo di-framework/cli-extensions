@@ -29,12 +29,14 @@ import {
   DI_PGLITE_PACKAGE,
   DI_PGLITE_VERSION,
   PGLITE_ENCFS_WASM_FILE,
+  PGLITE_ENCRYPTED_WASM_FILE,
   PGLITE_KEY_ENV,
   PGLITE_WASM_FILE,
   type ResolvedPglite,
   resolvePgliteComponent,
   resolvePgliteEncryption,
 } from './pglite';
+import { interpositionProblem, layerCoverageProblem, worldInterfaces } from './pglite-encryption';
 import { loadProject, type WasmcloudProject } from './project';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { renderQueuesModule } from './queues-module';
@@ -353,26 +355,76 @@ async function inspectComponentImports(
   }
 }
 
+/** The world of a component, as `jco wit` prints it. */
+async function componentWorld(
+  project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
+  deps: WasmcloudDeps,
+  path: string,
+  label: string,
+): Promise<ReturnType<typeof worldInterfaces>> {
+  const captured = await deps.runCaptured(
+    requireNodeBinary(deps.nodeBinaryPath()),
+    [deps.jcoCliPath(), 'wit', path],
+    { cwd: project.projectRoot },
+  );
+  if (captured.exitCode !== 0) {
+    throw new CommandFailure(
+      'WASMCLOUD_COMPONENT_IMPORTS_UNREADABLE',
+      `Could not read the WIT world of the ${label}: ${(captured.stderr || captured.stdout).trim()}`,
+      3,
+      { application: project.applicationName, path },
+    );
+  }
+  return worldInterfaces(captured.stdout);
+}
+
+function notInterposed(
+  project: Pick<WasmcloudProject, 'applicationName'>,
+  problem: string,
+): CommandFailure {
+  return new CommandFailure(
+    'WASMCLOUD_PGLITE_ENCRYPTION_NOT_INTERPOSED',
+    `The PGlite encryption layer would not sit between the provider and the host filesystem: ` +
+      `${problem}. PGlite would write its data directory in plaintext, so the build stops. ` +
+      'Use a layer built for the WASI versions the pinned provider imports.',
+    3,
+    { application: project.applicationName },
+  );
+}
+
 /**
- * Plugs the encryption layer into the provider (`wac plug --plug <encfs> <pglite>`), so the
- * provider's filesystem imports resolve to the layer and the provider's exports are unchanged.
- * The result replaces `provider` and is then plugged into the guest as before.
+ * Plugs the encryption layer into the provider (`wac plug --plug <layer> <provider>`) and writes
+ * the result to `output`, which the build then plugs into the guest instead of the provider.
+ *
+ * `wac plug` exits 0 as soon as any one export of the layer matches, so the composition is
+ * checked on both sides:
+ * - before: the layer must export, at a compatible version, every `wasi:filesystem/*` interface
+ *   the provider imports. `wac plug` connects every matching export, so all of them then
+ *   resolve to the layer;
+ * - after: the composed provider's `wasi:filesystem` imports must be exactly the layer's own.
+ *   A provider import that bypassed the layer would show up as an extra one.
  */
-async function encryptProvider(
-  project: WasmcloudProject,
+export async function encryptProvider(
+  project: Pick<WasmcloudProject, 'projectRoot' | 'applicationName'>,
   deps: WasmcloudDeps,
   io: CliIo,
   provider: string,
   layer: string,
+  output: string,
 ): Promise<void> {
-  const composed = `${provider}.encrypted`;
+  const providerWorld = await componentWorld(project, deps, provider, 'PGlite provider');
+  const layerWorld = await componentWorld(project, deps, layer, 'PGlite encryption layer');
+  const coverage = layerCoverageProblem(providerWorld, layerWorld);
+  if (coverage !== undefined) throw notInterposed(project, coverage);
+
+  rmSync(output, { force: true });
   const { wac, envPath } = wacTool(deps);
   io.stdout.write('Composing the PGlite encryption layer into the provider...\n');
-  const result = await deps.runCaptured(wac, ['plug', '--plug', layer, provider, '-o', composed], {
+  const result = await deps.runCaptured(wac, ['plug', '--plug', layer, provider, '-o', output], {
     cwd: project.projectRoot,
     env: { ...process.env, PATH: envPath },
   });
-  if (result.exitCode !== 0 || !existsSync(composed)) {
+  if (result.exitCode !== 0 || !existsSync(output)) {
     throw new CommandFailure(
       'WASMCLOUD_PGLITE_ENCRYPTION_COMPOSE_FAILED',
       `Composition of the PGlite encryption layer into the provider failed: ${result.stderr || result.stdout || 'wac wrote no component'}`,
@@ -380,8 +432,9 @@ async function encryptProvider(
       { application: project.applicationName, exitCode: result.exitCode },
     );
   }
-  writeFileSync(provider, readFileSync(composed));
-  rmSync(composed, { force: true });
+  const composedWorld = await componentWorld(project, deps, output, 'encrypted PGlite provider');
+  const bypass = interpositionProblem(composedWorld, layerWorld, providerWorld.exports);
+  if (bypass !== undefined) throw notInterposed(project, bypass);
 }
 
 /**
@@ -389,6 +442,7 @@ async function encryptProvider(
  * the control Secret, and deploy keeps only the keys the project declares there.
  */
 function assertPgliteKeyDeclared(project: WasmcloudProject): void {
+  if (project.pglite?.encryption === undefined) return;
   if (project.controlSecretKeys?.includes(PGLITE_KEY_ENV)) return;
   throw new CommandFailure(
     'WASMCLOUD_PGLITE_KEY_UNDECLARED',
@@ -441,7 +495,6 @@ async function resolveEncryption(
 ): Promise<ResolvedPglite | undefined> {
   const encryption = project.pglite?.encryption;
   if (encryption === undefined) return undefined;
-  assertPgliteKeyDeclared(project);
   return resolvePgliteEncryption(encryption, io, deps, project.projectRoot, { deploy });
 }
 
@@ -452,6 +505,8 @@ export async function buildComponent(
   deps: WasmcloudDeps,
   options: { guestLogging?: boolean; deploy?: boolean } = {},
 ): Promise<BuildSummary> {
+  // A config check: before bundling and before anything is pulled.
+  assertPgliteKeyDeclared(project);
   const generatedDirectory = join(project.projectRoot, '.di-framework');
   const generatedWit = join(generatedDirectory, 'wit');
   const bundledJavaScript = join(generatedDirectory, 'component.js');
@@ -599,6 +654,7 @@ export async function buildComponent(
   // Plug private copies of the verified bytes: the shared cache may change after verification.
   const pgliteWasm = join(generatedDirectory, PGLITE_WASM_FILE);
   const encfsWasm = join(generatedDirectory, PGLITE_ENCFS_WASM_FILE);
+  const encryptedWasm = join(generatedDirectory, PGLITE_ENCRYPTED_WASM_FILE);
   if (pglite !== undefined) writeFileSync(pgliteWasm, pglite.bytes);
   if (encryption !== undefined) writeFileSync(encfsWasm, encryption.bytes);
 
@@ -620,10 +676,11 @@ export async function buildComponent(
     await composeComponentProvider(project, deps, io, provider, namedImports);
   }
   if (pglite !== undefined) {
-    if (encryption !== undefined) await encryptProvider(project, deps, io, pgliteWasm, encfsWasm);
+    if (encryption !== undefined)
+      await encryptProvider(project, deps, io, pgliteWasm, encfsWasm, encryptedWasm);
     await composeProvider(project, deps, io, {
       label: `${DI_PGLITE_PACKAGE}@${DI_PGLITE_VERSION}`,
-      wasm: pgliteWasm,
+      wasm: encryption === undefined ? pgliteWasm : encryptedWasm,
       namedImports,
       failureCode: 'WASMCLOUD_PGLITE_COMPOSE_FAILED',
     });
@@ -658,7 +715,7 @@ export async function buildComponent(
       : undefined,
     [
       ...composedProviders.map((provider) => provider.wasm),
-      // The provider file is the encrypted composition when a layer is set, so name both inputs.
+      // The raw provider and layer bytes, never wac's output, so only the inputs set the key.
       ...(pglite === undefined ? [] : [pgliteWasm]),
       ...(encryption === undefined ? [] : [encfsWasm]),
     ],
