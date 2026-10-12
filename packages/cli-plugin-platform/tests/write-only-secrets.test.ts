@@ -1171,7 +1171,7 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
           );
         }
         if (match === null) return new Response('not found', { status: 404 });
-        requests.push(`${incoming.method} ${url.pathname}`);
+        requests.push(`${incoming.method} ${url.pathname}${url.search}`);
         const name = match[2];
         if (incoming.method === 'GET' || incoming.method === 'PATCH') {
           return status(403, 'Forbidden', 'secrets is forbidden');
@@ -1220,11 +1220,13 @@ describe.skipIf(kubectlPath === null)('write-only Secrets with the real kubectl'
           const denial = name.startsWith('future-managed-')
             ? MANAGED_DENIAL
             : updateDenial(name, existing, body);
+          const dryRun = url.searchParams.get('dryRun') === 'All';
           if (denial !== undefined) {
+            if (dryRun) requests.push('  dry run refused');
             return status(403, 'Forbidden', admissionDenial(name, 'tenant-secret-update', denial));
           }
-          if (url.searchParams.get('dryRun') === 'All') {
-            requests.push(`dry run ${url.search}`);
+          if (dryRun) {
+            requests.push('  dry run accepted');
             return Response.json(body);
           }
           secrets.set(name, body);
@@ -1367,13 +1369,19 @@ current-context: fake
     expect(requests.slice(start)).toEqual([
       `POST ${collection}`,
       'POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
-      // The dry run that drops DI_CONTROL_TOKEN is refused, so the policy guards the Secret.
+      // Dropping DI_CONTROL_TOKEN is refused, so the policy guards the Secret.
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run refused',
+      // The real replace with only the CLI keys is refused: the Secret holds more.
       `PUT ${collection}/greeter-control`,
-      `PUT ${collection}/greeter-control`,
-      `PUT ${collection}/greeter-control`,
-      'dry run ?dryRun=All',
-      `PUT ${collection}/greeter-control`,
-      `PUT ${collection}/greeter-control`,
+      // Every extra key is declared.
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run accepted',
+      // Leaving out DI_CONTROL_TOKEN, then DI_CONTROL_IDENTITY, is refused: both are stored.
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run refused',
+      `PUT ${collection}/greeter-control?dryRun=All`,
+      '  dry run refused',
     ]);
   }, 30_000);
 });
