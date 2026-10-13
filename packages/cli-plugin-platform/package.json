@@ -46,15 +46,15 @@
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
     "rolldown": "1.2.8",
-    "typescript": "^5",
+    "typescript": "^7",
     "unenv": "2.0.0-rc.24",
-    "@babel/core": "7.29.7",
-    "@babel/plugin-transform-async-to-generator": "7.29.7",
-    "@di-framework/actors": "^5",
+    "@babel/core": "8.0.7",
+    "@babel/plugin-transform-async-to-generator": "8.0.1",
+    "@di-framework/actors": "^6",
     "@di-framework/platform": "^6"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^7"
   },
   "files": [
     "dist",
@@ -62,8 +62,8 @@
   ],
   "devDependencies": {
     "@di-framework/bindings": "^6",
-    "@di-framework/config": "^5",
-    "@di-framework/core": "^5",
+    "@di-framework/config": "^6",
+    "@di-framework/core": "^6",
     "@patternfly/react-core": "^6.6.1",
     "@patternfly/react-icons": "^6.6.1",
     "@patternfly/react-table": "^6.6.1",
