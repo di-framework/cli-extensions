@@ -938,9 +938,7 @@ export async function applyWorkload(
     await runKubectl(deps, connection, ['apply', '-f', path], project.projectRoot);
     await waitForReady(project, connection, deps, io);
   } catch (error) {
-    throw controlSecret?.revision === undefined
-      ? error
-      : withRotatedTokenNotice(error, hasPersistentStorage);
+    throw controlSecret?.revision === undefined ? error : withRotatedTokenNotice(error);
   }
   await cleanupManagedBindings(project, connection, associations, deps);
   if (egress === undefined) await removeWorkloadEgress(project, connection, deps);
@@ -953,7 +951,7 @@ export async function applyWorkload(
  * old token while its cron invokers (which read the Secret when they start) carry the new one,
  * so every cron invocation is refused until a deploy succeeds. Say so in the failure.
  */
-function withRotatedTokenNotice(error: unknown, hasPersistentStorage = false): unknown {
+function withRotatedTokenNotice(error: unknown): unknown {
   if (!isCommandFailure(error)) {
     if (error instanceof Error) {
       error.message = `${error.message}; ${CONTROL_TOKEN_ROTATED_NOTICE}`;
@@ -962,14 +960,9 @@ function withRotatedTokenNotice(error: unknown, hasPersistentStorage = false): u
   }
   // Every failure on this path (kubectl, readiness) carries an object of details.
   const details = error.details as Record<string, JsonValue> | undefined;
-  const [headline = error.message] = error.message.split('. ');
-  const baseMessage =
-    !hasPersistentStorage && error.code === 'WASMCLOUD_DEPLOYMENT_NOT_READY'
-      ? headline
-      : error.message;
   return new CommandFailure(
     error.code,
-    `${baseMessage}; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+    `${error.message}; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
     error.exitCode,
     { ...details, controlTokenRotated: true },
   );
@@ -1068,7 +1061,7 @@ export function resolveDeployTimeoutSeconds(
   ) {
     return Math.ceil(options.timeoutSeconds);
   }
-  const raw = deps.env[DEPLOY_TIMEOUT_ENV] ?? process.env[DEPLOY_TIMEOUT_ENV];
+  const raw = deps.env?.[DEPLOY_TIMEOUT_ENV];
   if (raw !== undefined && /^[1-9]\d*$/.test(raw.trim())) {
     return Number(raw.trim());
   }

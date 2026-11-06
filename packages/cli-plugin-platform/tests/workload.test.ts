@@ -939,7 +939,11 @@ export class Worker {
       ),
     ).rejects.toMatchObject({
       code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
-      message: `WorkloadDeployment greeter in wasmcloud did not become ready; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+      message:
+        'WorkloadDeployment greeter in wasmcloud did not become ready. ' +
+        'The workload may still become Ready while the host finishes rolling; check status with ' +
+        '"kubectl get workloaddeployment greeter -n wasmcloud" or re-run ' +
+        `"di-framework platform deploy greeter --target development".; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
     });
 
     const persistentFailDeps = fakeDeps({
