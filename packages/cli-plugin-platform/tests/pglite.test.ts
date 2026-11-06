@@ -408,8 +408,10 @@ describe('pglite cache and pull', () => {
     const cache = mkdtempSync(join(tmpdir(), 'pglite-cache-'));
     const stale = join(cache, '.pull-old');
     const fresh = join(cache, '.pull-new');
+    const dangling = join(cache, '.pull-dangling');
     const other = join(cache, 'keep');
     for (const dir of [stale, fresh, other]) mkdirSync(dir);
+    symlinkSync(join(cache, 'missing-target'), dangling);
     const old = new Date(Date.now() - STALE_STAGING_MS - 60_000);
     utimesSync(stale, old, old);
     utimesSync(other, old, old);
@@ -546,6 +548,26 @@ describe('pglite cache and pull', () => {
       code: 'WASMCLOUD_PGLITE_LOCAL_REFUSED',
       message: expect.stringContaining('in CI'),
     });
+    await expect(
+      resolvePgliteComponent(
+        local('ok.wasm'),
+        captureIo().io,
+        registryDeps({ env: { CI: '1' } }),
+        dir,
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_PGLITE_LOCAL_REFUSED',
+      message: expect.stringContaining('in CI'),
+    });
+    for (const ci of ['false', 'FALSE', '0']) {
+      const res = await resolvePgliteComponent(
+        local('ok.wasm'),
+        captureIo().io,
+        registryDeps({ env: { CI: ci } }),
+        dir,
+      );
+      expect(res.source).toBe('local');
+    }
     const { io, stderr } = captureIo();
     const allowed = await resolvePgliteComponent(
       local('ok.wasm'),
@@ -883,6 +905,22 @@ describe('pglite workload safety', () => {
         { applicationName: 'b', workload: 'shop', pglite: config('/data/actors', '/data/actors') },
       ]),
     ).toThrow('a and b would open the same PGlite database (<workload storage>/.)');
+    for (const [first, second] of [
+      [config('/data', '/data'), config('/data', '/data/data')],
+      [config('/data', '/data/data'), config('/data', '/data')],
+      [config('/data', '/data/pg'), config('/data', '/data/pg/sub')],
+      [config('/data', '/data/pg/sub'), config('/data', '/data/pg')],
+    ] as const) {
+      expectFailure(
+        () =>
+          assertDistinctPgliteRoots('shop', [
+            { applicationName: 'a', workload: 'shop', pglite: first },
+            { applicationName: 'b', workload: 'shop', pglite: second },
+          ]),
+        'WASMCLOUD_PGLITE_DATA_DIR_CONFLICT',
+        2,
+      );
+    }
     expect(() =>
       assertDistinctPgliteRoots('shop', [
         { applicationName: 'a', workload: 'shop', pglite: config('/data', '/data/orders') },
@@ -924,6 +962,25 @@ describe('pglite workload safety', () => {
     );
     expect(out.stderr.join('')).toContain(
       'a second instance can open the same PGlite data directory',
+    );
+
+    const mixed = captureIo();
+    await warnIfHostIgnoresExclusive(
+      app,
+      tenant,
+      mixed.io,
+      fakeDeps({
+        cwd: '/tmp',
+        capturedStdout: {
+          'kubectl get': pods(
+            'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:abc',
+            'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
+          ),
+        },
+      }),
+    );
+    expect(mixed.stderr.join('')).toContain(
+      'runs ghcr.io/di-framework/wash:2.8.0-wasi-tls, which does not look like the exclusive build',
     );
 
     for (const result of [
