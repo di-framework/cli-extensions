@@ -99,6 +99,10 @@ export type WasmcloudDeps = {
   resolveFromProject(projectRoot: string, specifier: string): string | undefined;
   env: Record<string, string | undefined>;
   cwd(): string;
+  fetch?: typeof fetch;
+  openBrowser?(url: string): void;
+  loginTimeoutMs?: number;
+  stdin?(): string;
 };
 
 const NODE_COMPAT_SEED_RESOLVED = `\0${NODE_COMPAT_SEED_ID}`;

@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import {
   findDeployManifest,
   interpolateEnv,
+  isControllerDomain,
   isTenantName,
   loadDeployManifest,
+  normalizeControllerUrl,
   parseDeployManifest,
 } from '../src/manifest';
 import { expectFailure, makeWorkspace } from './helpers';
@@ -448,6 +450,91 @@ serviceName = "orders-db"
     ]) {
       expectFailure(
         () => parseDeployManifest(path, invalidToml, {}),
+        'WASMCLOUD_DEPLOY_MANIFEST_INVALID',
+        2,
+      );
+    }
+  });
+
+  it('parses and validates account and controller targets', () => {
+    const path = '/workspace/di-framework.deploy.toml';
+    expect(isControllerDomain('localhost')).toBe(true);
+    expect(isControllerDomain('authproto.example.com:8443')).toBe(true);
+    expect(isControllerDomain('localhost:70000')).toBe(false);
+    expect(isControllerDomain('-bad.example.com')).toBe(false);
+    expect(isControllerDomain('a'.repeat(261))).toBe(false);
+
+    expect(normalizeControllerUrl('https://acme.controller.example.com/')).toBe(
+      'https://acme.controller.example.com',
+    );
+    expect(normalizeControllerUrl('http://localhost:8080/sub/')).toBe('http://localhost:8080/sub');
+    expect(normalizeControllerUrl('http://127.0.0.1:9000')).toBe('http://127.0.0.1:9000');
+    expect(normalizeControllerUrl('http://[::1]:9000')).toBe('http://[::1]:9000');
+    expect(normalizeControllerUrl('http://controller.tenant.svc')).toBe(
+      'http://controller.tenant.svc',
+    );
+    expect(normalizeControllerUrl('http://controller.tenant.svc.cluster.local')).toBe(
+      'http://controller.tenant.svc.cluster.local',
+    );
+    expect(normalizeControllerUrl('not-a-url')).toBeUndefined();
+    expect(normalizeControllerUrl('ftp://example.com')).toBeUndefined();
+    expect(normalizeControllerUrl('https://user:pass@example.com')).toBeUndefined();
+    expect(normalizeControllerUrl('https://example.com?foo=1')).toBeUndefined();
+    expect(normalizeControllerUrl('https://example.com#frag')).toBeUndefined();
+    expect(normalizeControllerUrl('https://bad_host.example.com')).toBeUndefined();
+    expect(normalizeControllerUrl('http://remote.example.com')).toBeUndefined();
+
+    const manifest = parseDeployManifest(
+      path,
+      `default-target = "authproto"
+
+[targets.authproto]
+account = "acme"
+domain = "authproto.internal:8443"
+env = "staging"
+secrets = ["db-url"]
+
+[targets.direct]
+controller = "https://acme.controller.example.com/"
+account = "acme"
+
+[targets.loopback]
+controller = "http://127.0.0.1:18080"
+`,
+      {},
+    );
+
+    expect(manifest.targets.authproto).toEqual({
+      kind: 'account',
+      name: 'authproto',
+      account: 'acme',
+      domain: 'authproto.internal:8443',
+      env: 'staging',
+      secrets: ['db-url'],
+    });
+    expect(manifest.targets.direct).toEqual({
+      kind: 'controller',
+      name: 'direct',
+      controller: 'https://acme.controller.example.com',
+      account: 'acme',
+    });
+    expect(manifest.targets.loopback).toEqual({
+      kind: 'controller',
+      name: 'loopback',
+      controller: 'http://127.0.0.1:18080',
+    });
+
+    for (const invalidTarget of [
+      `[targets.bad]\naccount = "Bad_Name"\n`,
+      `[targets.bad]\naccount = "acme"\ndomain = "bad_domain"\n`,
+      `[targets.bad]\ncontroller = "http://remote.example.com"\n`,
+      `[targets.bad]\ncontroller = "https://acme.controller.example.com"\ndomain = "example.com"\n`,
+      `[targets.bad]\ndomain = "example.com"\n`,
+      `[targets.bad]\naccount = "acme"\nplatform = "deploy/platform"\n`,
+      `[targets.bad]\ncontroller = "https://acme.controller.example.com"\nkubeconfig = "/tmp/k"\n`,
+    ]) {
+      expectFailure(
+        () => parseDeployManifest(path, invalidTarget, {}),
         'WASMCLOUD_DEPLOY_MANIFEST_INVALID',
         2,
       );

@@ -1,8 +1,11 @@
-import { invalidUsage, readOptionValue } from './support';
+import type { DeployEnvironment } from './manifest';
+import { invalidUsage, matchOption, readOptionValue } from './support';
 
 export type AppCommandOptions = {
   name?: string;
   target?: string;
+  env?: DeployEnvironment;
+  preview?: boolean;
   yes: boolean;
 };
 
@@ -12,34 +15,90 @@ export type PlatformCommandOptions = {
   yes: boolean;
 };
 
-export function parseAppCommandArgs(args: readonly string[], command: string): AppCommandOptions {
-  let name: string | undefined;
-  let target: string | undefined;
-  let yes = false;
-
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    switch (token) {
-      case '--target':
-        if (target !== undefined) invalidUsage(`Option may be provided only once: ${token}`, token);
-        target = readOptionValue(args, ++position, token);
-        break;
-      case '--yes':
-        if (yes) invalidUsage(`Option may be provided only once: ${token}`, token);
-        yes = true;
-        break;
-      default:
-        if (token.startsWith('--')) {
-          invalidUsage(`Unknown option: ${token}`, token, { command });
-        }
-        if (name !== undefined) {
-          invalidUsage(`Unexpected argument: ${token}`, token, { command });
-        }
-        name = token;
+export function readStringFlag<K extends string>(
+  args: readonly string[],
+  position: number,
+  token: string,
+  flags: Readonly<Record<string, K>>,
+  values: Partial<Record<K, string>>,
+): number | undefined {
+  for (const [flag, key] of Object.entries(flags)) {
+    const matched = matchOption(args, position, token, flag);
+    if (matched) {
+      if (values[key] !== undefined) {
+        invalidUsage(`Option may be provided only once: ${flag}`, flag);
+      }
+      values[key] = matched.value;
+      return matched.consumedThrough + 1;
     }
   }
+  return undefined;
+}
 
-  return { name, target, yes };
+export function readEnvFlag(
+  args: readonly string[],
+  position: number,
+  token: string,
+  current: DeployEnvironment | undefined,
+  command: string,
+): { value: DeployEnvironment; nextPosition: number } | undefined {
+  const matched = matchOption(args, position, token, '--env');
+  if (!matched) return undefined;
+  if (current !== undefined) {
+    invalidUsage('Option may be provided only once: --env', '--env');
+  }
+  if (matched.value !== 'prod' && matched.value !== 'staging') {
+    invalidUsage('--env must be prod or staging', matched.value, { command });
+  }
+  return { value: matched.value, nextPosition: matched.consumedThrough + 1 };
+}
+
+const APP_STRING_FLAGS = { '--target': 'target' } as const;
+
+export function parseAppCommandArgs(args: readonly string[], command: string): AppCommandOptions {
+  let name: string | undefined;
+  const values: { target?: string } = {};
+  let env: DeployEnvironment | undefined;
+  const flags = { preview: false, yes: false };
+
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, APP_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
+      continue;
+    }
+    const envOpt = readEnvFlag(args, position, token, env, command);
+    if (envOpt) {
+      env = envOpt.value;
+      position = envOpt.nextPosition;
+      continue;
+    }
+    if (token === '--preview' || token === '--yes') {
+      const key = token === '--preview' ? 'preview' : 'yes';
+      if (flags[key]) invalidUsage(`Option may be provided only once: ${token}`, token);
+      flags[key] = true;
+      position += 1;
+      continue;
+    }
+    if (token.startsWith('--')) {
+      invalidUsage(`Unknown option: ${token}`, token, { command });
+    }
+    if (name !== undefined) {
+      invalidUsage(`Unexpected argument: ${token}`, token, { command });
+    }
+    name = token;
+    position += 1;
+  }
+
+  return {
+    name,
+    target: values.target,
+    ...(env ? { env } : {}),
+    ...(flags.preview ? { preview: true } : {}),
+    yes: flags.yes,
+  };
 }
 
 export type PlatformInitOptions = {
@@ -70,16 +129,19 @@ export function parsePlatformCommandArgs(
   let target: string | undefined;
   let yes = false;
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
     if (token === '--yes') {
       if (yes) invalidUsage(`Option may be provided only once: ${token}`, token);
       yes = true;
+      position += 1;
       continue;
     }
     if (token === '--target') {
       if (target !== undefined) invalidUsage(`Option may be provided only once: ${token}`, token);
-      target = readOptionValue(args, ++position, token);
+      target = readOptionValue(args, position + 1, token);
+      position += 2;
       continue;
     }
     if (token.startsWith('--')) {
@@ -89,6 +151,7 @@ export function parsePlatformCommandArgs(
       invalidUsage(`Unexpected argument: ${token}`, token, { command });
     }
     target = token;
+    position += 1;
   }
 
   return { ...(target === undefined ? {} : { target }), yes };

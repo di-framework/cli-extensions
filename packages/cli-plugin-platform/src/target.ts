@@ -1,7 +1,14 @@
 import { resolve } from 'node:path';
 import { CommandFailure } from '@di-framework/cli-extension';
 import type { WasmcloudDeps } from './deps';
-import type { DeployManifest, DeployTarget, ExternalTarget, ManagedTarget } from './manifest';
+import type {
+  AccountTarget,
+  ControllerTarget,
+  DeployManifest,
+  DeployTarget,
+  ExternalTarget,
+  ManagedTarget,
+} from './manifest';
 import { loadPlatformOutputs, type PlatformOutputs, resolvePlatformDirectory } from './platform';
 import { materializeRegistry, type RegistryLocation } from './registry';
 
@@ -17,6 +24,25 @@ export type ClusterConnection = {
   platformRoot?: string;
   stack?: string;
 };
+
+export function isControllerBackedTarget(
+  target: DeployTarget,
+): target is AccountTarget | ControllerTarget {
+  return target.kind === 'account' || target.kind === 'controller';
+}
+
+/**
+ * Derives the platform gateway route for a tenant controller (`https://<account>.controller.<domain>`),
+ * matching the HTTPRoute created by the platform tenancy reconcile (platform#58).
+ */
+export function discoverAccountControllerUrl(
+  account: string,
+  domain?: string,
+  env?: Record<string, string | undefined>,
+): string {
+  const effectiveDomain = domain ?? env?.DI_PLATFORM_DOMAIN ?? 'localhost';
+  return `https://${account}.controller.${effectiveDomain}`;
+}
 
 export function resolveTarget(manifest: DeployManifest, requested?: string): DeployTarget {
   const name = requested ?? manifest.defaultTarget;
@@ -46,6 +72,14 @@ export async function resolveConnection(
   manifestPath: string,
   deps: WasmcloudDeps,
 ): Promise<ClusterConnection> {
+  if (isControllerBackedTarget(target)) {
+    const msg = `Target "${target.name}" is a ${target.kind} target and talks to the tenant controller /v1 API rather than a kubeconfig.`;
+    throw new CommandFailure('WASMCLOUD_TARGET_INVALID_KIND', msg, 2, {
+      target: target.name,
+      kind: target.kind,
+      manifestPath,
+    });
+  }
   if (target.kind === 'managed') {
     return resolveManagedConnection(target, workspaceRoot, manifestPath, deps);
   }

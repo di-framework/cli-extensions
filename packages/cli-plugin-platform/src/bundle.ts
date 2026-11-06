@@ -43,7 +43,12 @@ import {
   registryUsesPlainHttp,
 } from './registry';
 import { invalidUsage, toolFailed } from './support';
-import { type ClusterConnection, resolveConnection, resolveTarget } from './target';
+import {
+  type ClusterConnection,
+  isControllerBackedTarget,
+  resolveConnection,
+  resolveTarget,
+} from './target';
 import { parseToml } from './toml';
 import { deploymentResourceName, renderWorkloadManifest } from './workload';
 
@@ -124,12 +129,14 @@ export type ParsedBuildArgs = {
 export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
   if (args.length === 0) return {};
   const result: ParsedBuildArgs = {};
-  for (let i = 0; i < args.length; i++) {
+  let i = 0;
+  while (i < args.length) {
     const arg = args[i] as string;
     if (arg === '--bundle' || arg.startsWith('--bundle=')) {
       const value = arg === '--bundle' ? args[++i] : arg.slice('--bundle='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --bundle', arg);
       result.bundle = value;
+      i += 1;
       continue;
     }
     if (arg === '--env' || arg.startsWith('--env=')) {
@@ -138,24 +145,28 @@ export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
         invalidUsage('Invalid --env value; expected "prod" or "staging"', arg);
       }
       result.env = value;
+      i += 1;
       continue;
     }
     if (arg === '--target' || arg.startsWith('--target=')) {
       const value = arg === '--target' ? args[++i] : arg.slice('--target='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --target', arg);
       result.target = value;
+      i += 1;
       continue;
     }
     if (arg === '--registry' || arg.startsWith('--registry=')) {
       const value = arg === '--registry' ? args[++i] : arg.slice('--registry='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --registry', arg);
       result.registry = value;
+      i += 1;
       continue;
     }
     if (arg === '--tag' || arg.startsWith('--tag=')) {
       const value = arg === '--tag' ? args[++i] : arg.slice('--tag='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --tag', arg);
       result.tag = value;
+      i += 1;
       continue;
     }
     if (arg.startsWith('-')) {
@@ -165,6 +176,7 @@ export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
       invalidUsage(`Unexpected argument: ${arg}`, arg);
     }
     result.name = arg;
+    i += 1;
   }
   if (result.bundle === undefined) {
     const first = args[0] as string;
@@ -659,6 +671,59 @@ function collectDeploySecrets(
   return [...seen];
 }
 
+async function resolveBundleTargetAndConnection(
+  options: BuildDeployBundleOptions,
+  manifest: DeployManifest | undefined,
+  project: WasmcloudProject,
+  resolvedCredentials: BundleRegistryCredentials | undefined,
+  hasExplicitRegistryOrPublish: boolean,
+  deps: WasmcloudDeps,
+): Promise<{ target?: DeployTarget; effectiveConnection: ClusterConnection }> {
+  let target: DeployTarget | undefined;
+  let connection: ClusterConnection | undefined;
+  const shouldResolveTarget = Boolean(
+    options.target ?? manifest?.defaultTarget ?? !hasExplicitRegistryOrPublish,
+  );
+  if (manifest !== undefined && shouldResolveTarget) {
+    target = resolveTarget(manifest, options.target);
+    if (!isControllerBackedTarget(target)) {
+      connection = await resolveConnection(target, manifest.workspaceRoot, manifest.path, deps);
+    }
+  }
+
+  const registryOverride = options.registry ?? resolvedCredentials?.registry;
+  const effectiveConnection: ClusterConnection =
+    connection !== undefined
+      ? {
+          ...connection,
+          hostgroup: connection.hostgroup ?? `tenant-${project.witName}`,
+          ...(registryOverride !== undefined
+            ? { registry: materializeRegistry(registryOverride) }
+            : {}),
+        }
+      : {
+          target: options.target ?? 'bundle',
+          kubeconfig: '',
+          namespace: `di-tenant-${project.witName}`,
+          hostgroup: `tenant-${project.witName}`,
+          registry: materializeRegistry(registryOverride ?? 'localhost:5000'),
+        };
+  return { target, effectiveConnection };
+}
+
+function toComponentReference(published: PublishedImage | ComponentReference): ComponentReference {
+  if ('pullReference' in published && 'artifactDigest' in published) {
+    return {
+      reference: published.pullReference,
+      digest: normalizeSha256Digest(published.artifactDigest),
+    };
+  }
+  return {
+    reference: published.reference,
+    digest: normalizeSha256Digest(published.digest),
+  };
+}
+
 export async function buildDeployBundle(
   options: BuildDeployBundleOptions = {},
   io: CliIo,
@@ -682,33 +747,14 @@ export async function buildDeployBundle(
   const resolvedCredentials =
     typeof options.credentials === 'function' ? await options.credentials() : options.credentials;
 
-  let target: DeployTarget | undefined;
-  let connection: ClusterConnection | undefined;
-  const shouldResolveTarget = Boolean(
-    options.target ?? manifest?.defaultTarget ?? !hasExplicitRegistryOrPublish,
+  const { target, effectiveConnection } = await resolveBundleTargetAndConnection(
+    options,
+    manifest,
+    project,
+    resolvedCredentials,
+    hasExplicitRegistryOrPublish,
+    deps,
   );
-  if (manifest !== undefined && shouldResolveTarget) {
-    target = resolveTarget(manifest, options.target);
-    connection = await resolveConnection(target, manifest.workspaceRoot, manifest.path, deps);
-  }
-
-  const registryOverride = options.registry ?? resolvedCredentials?.registry;
-  const effectiveConnection: ClusterConnection =
-    connection !== undefined
-      ? {
-          ...connection,
-          hostgroup: connection.hostgroup ?? `tenant-${project.witName}`,
-          ...(registryOverride !== undefined
-            ? { registry: materializeRegistry(registryOverride) }
-            : {}),
-        }
-      : {
-          target: options.target ?? 'bundle',
-          kubeconfig: '',
-          namespace: `di-tenant-${project.witName}`,
-          hostgroup: `tenant-${project.witName}`,
-          registry: materializeRegistry(registryOverride ?? 'localhost:5000'),
-        };
 
   const env = options.env ?? target?.env ?? manifestConfig.env ?? 'prod';
   if (env !== 'prod' && env !== 'staging') {
@@ -734,13 +780,7 @@ export async function buildDeployBundle(
     ? await options.publish(publishContext)
     : await publishWithBundleOptions(publishContext);
 
-  const isPublishedImage = (value: PublishedImage | ComponentReference): value is PublishedImage =>
-    'pullReference' in value && 'artifactDigest' in value;
-  const rawDigest = isPublishedImage(published) ? published.artifactDigest : published.digest;
-  const component: ComponentReference = {
-    reference: isPublishedImage(published) ? published.pullReference : published.reference,
-    digest: normalizeSha256Digest(rawDigest),
-  };
+  const component = toComponentReference(published);
 
   const requirements = requirementsForProject(project, deps);
   const discoveredBindings = discoverBindings(project, deps);

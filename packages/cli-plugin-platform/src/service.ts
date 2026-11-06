@@ -2,12 +2,26 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type CliIo, CommandFailure, type JsonValue } from '@di-framework/cli-extension';
+import { readEnvFlag, readStringFlag } from './args';
+import { resolveControllerSession, wrapControllerError } from './controller';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { captureKubectl } from './kubernetes';
-import { loadDeployManifest } from './manifest';
+import {
+  type AccountTarget,
+  type ControllerTarget,
+  type DeployEnvironment,
+  type DeployManifest,
+  loadDeployManifest,
+  tenantNamespace,
+} from './manifest';
 import { isNamespace } from './namespace';
 import { invalidUsage, matchOption } from './support';
-import { type ClusterConnection, resolveConnection, resolveTarget } from './target';
+import {
+  type ClusterConnection,
+  isControllerBackedTarget,
+  resolveConnection,
+  resolveTarget,
+} from './target';
 
 export const BACKING_SERVICE_API_VERSION = 'platform.di-framework.dev/v1alpha1';
 export const BACKING_SERVICE_KIND = 'BackingService';
@@ -59,6 +73,7 @@ export type ServiceCreateOptions = {
   /** Egress only: hosts the workload may reach. */
   destinations?: string[];
   target?: string;
+  env?: DeployEnvironment;
   namespace?: string;
   context?: string;
   wait: boolean;
@@ -68,6 +83,7 @@ export type ServiceCreateOptions = {
 export type ServiceNameOptions = {
   name?: string;
   target?: string;
+  env?: DeployEnvironment;
   namespace?: string;
   context?: string;
 };
@@ -172,59 +188,62 @@ export function buildBackingServiceManifest(options: {
   };
 }
 
+const SERVICE_CREATE_STRING_FLAGS = {
+  '--name': 'name',
+  '--class': 'className',
+  '--target': 'target',
+  '--namespace': 'namespace',
+  '--context': 'context',
+} as const;
+
+const SERVICE_SIZING_FLAGS = {
+  '--memory': 'memory',
+  '--storage': 'storage',
+  '--cpu': 'cpu',
+} as const;
+
+const SERVICE_LIST_STRING_FLAGS = {
+  '--target': 'target',
+  '--namespace': 'namespace',
+  '--context': 'context',
+} as const;
+
 export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOptions {
   let type: ServiceType | undefined;
-  let name: string | undefined;
-  let className: string | undefined;
+  const values: Partial<
+    Record<(typeof SERVICE_CREATE_STRING_FLAGS)[keyof typeof SERVICE_CREATE_STRING_FLAGS], string>
+  > = {};
   let deletionPolicy: DeletionPolicy | undefined;
-  let target: string | undefined;
-  let namespace: string | undefined;
-  let context: string | undefined;
+  let env: DeployEnvironment | undefined;
   let wait = false;
   let timeoutMs = DEFAULT_WAIT_TIMEOUT_MS;
   let timeoutExplicit = false;
   const parameters: ServiceSizingParameters = {};
   const destinations: string[] = [];
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const nameOpt = matchOption(args, position, token, '--name');
-    if (nameOpt) {
-      if (name !== undefined) invalidUsage('Option may be provided only once: --name', '--name');
-      name = nameOpt.value;
-      position = nameOpt.consumedThrough;
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextStringPos = readStringFlag(
+      args,
+      position,
+      token,
+      SERVICE_CREATE_STRING_FLAGS,
+      values,
+    );
+    if (nextStringPos !== undefined) {
+      position = nextStringPos;
       continue;
     }
-    const classOpt = matchOption(args, position, token, '--class');
-    if (classOpt) {
-      if (className !== undefined)
-        invalidUsage('Option may be provided only once: --class', '--class');
-      className = classOpt.value;
-      position = classOpt.consumedThrough;
+    const nextSizingPos = readStringFlag(args, position, token, SERVICE_SIZING_FLAGS, parameters);
+    if (nextSizingPos !== undefined) {
+      position = nextSizingPos;
       continue;
     }
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
-      continue;
-    }
-    const namespaceOpt = matchOption(args, position, token, '--namespace');
-    if (namespaceOpt) {
-      if (namespace !== undefined)
-        invalidUsage('Option may be provided only once: --namespace', '--namespace');
-      namespace = namespaceOpt.value;
-      position = namespaceOpt.consumedThrough;
-      continue;
-    }
-    const contextOpt = matchOption(args, position, token, '--context');
-    if (contextOpt) {
-      if (context !== undefined)
-        invalidUsage('Option may be provided only once: --context', '--context');
-      context = contextOpt.value;
-      position = contextOpt.consumedThrough;
+    const envOpt = readEnvFlag(args, position, token, env, 'platform service create');
+    if (envOpt) {
+      env = envOpt.value;
+      position = envOpt.nextPosition;
       continue;
     }
     const deletionOpt = matchOption(args, position, token, '--deletion-policy');
@@ -237,31 +256,7 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
         });
       }
       deletionPolicy = deletionOpt.value as DeletionPolicy;
-      position = deletionOpt.consumedThrough;
-      continue;
-    }
-    const memoryOpt = matchOption(args, position, token, '--memory');
-    if (memoryOpt) {
-      if (parameters.memory !== undefined)
-        invalidUsage('Option may be provided only once: --memory', '--memory');
-      parameters.memory = memoryOpt.value;
-      position = memoryOpt.consumedThrough;
-      continue;
-    }
-    const storageOpt = matchOption(args, position, token, '--storage');
-    if (storageOpt) {
-      if (parameters.storage !== undefined)
-        invalidUsage('Option may be provided only once: --storage', '--storage');
-      parameters.storage = storageOpt.value;
-      position = storageOpt.consumedThrough;
-      continue;
-    }
-    const cpuOpt = matchOption(args, position, token, '--cpu');
-    if (cpuOpt) {
-      if (parameters.cpu !== undefined)
-        invalidUsage('Option may be provided only once: --cpu', '--cpu');
-      parameters.cpu = cpuOpt.value;
-      position = cpuOpt.consumedThrough;
+      position = deletionOpt.consumedThrough + 1;
       continue;
     }
     const timeoutOpt = matchOption(args, position, token, '--timeout');
@@ -273,18 +268,19 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
         invalidUsage('--timeout must be a positive number of seconds', timeoutOpt.value);
       }
       timeoutMs = Math.floor(parsed * 1000);
-      position = timeoutOpt.consumedThrough;
+      position = timeoutOpt.consumedThrough + 1;
       continue;
     }
     const destinationOpt = matchOption(args, position, token, '--destination');
     if (destinationOpt) {
       destinations.push(destinationOpt.value);
-      position = destinationOpt.consumedThrough;
+      position = destinationOpt.consumedThrough + 1;
       continue;
     }
     if (token === '--wait') {
       if (wait) invalidUsage('Option may be provided only once: --wait', '--wait');
       wait = true;
+      position += 1;
       continue;
     }
     if (token.startsWith('--')) {
@@ -292,11 +288,12 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
     }
     if (type !== undefined) {
       // `service create egress <name>`: the name may follow the type instead of --name.
-      if (name !== undefined)
+      if (values.name !== undefined)
         invalidUsage(`Unexpected argument: ${token}`, token, {
           command: 'platform service create',
         });
-      name = token;
+      values.name = token;
+      position += 1;
       continue;
     }
     if (!isServiceType(token)) {
@@ -307,16 +304,18 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
       );
     }
     type = token;
+    position += 1;
   }
 
   return {
     type,
-    name,
-    className,
+    name: values.name,
+    className: values.className,
     deletionPolicy,
-    target,
-    namespace,
-    context,
+    target: values.target,
+    ...(env ? { env } : {}),
+    namespace: values.namespace,
+    context: values.context,
     wait,
     timeoutMs,
     parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
@@ -326,34 +325,21 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
 
 export function parseServiceNameArgs(args: readonly string[], command: string): ServiceNameOptions {
   let name: string | undefined;
-  let target: string | undefined;
-  let namespace: string | undefined;
-  let context: string | undefined;
+  const values: ServiceListOptions = {};
+  let env: DeployEnvironment | undefined;
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, SERVICE_LIST_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
       continue;
     }
-    const namespaceOpt = matchOption(args, position, token, '--namespace');
-    if (namespaceOpt) {
-      if (namespace !== undefined)
-        invalidUsage('Option may be provided only once: --namespace', '--namespace');
-      namespace = namespaceOpt.value;
-      position = namespaceOpt.consumedThrough;
-      continue;
-    }
-    const contextOpt = matchOption(args, position, token, '--context');
-    if (contextOpt) {
-      if (context !== undefined)
-        invalidUsage('Option may be provided only once: --context', '--context');
-      context = contextOpt.value;
-      position = contextOpt.consumedThrough;
+    const envOpt = readEnvFlag(args, position, token, env, command);
+    if (envOpt) {
+      env = envOpt.value;
+      position = envOpt.nextPosition;
       continue;
     }
     if (token.startsWith('--')) {
@@ -363,40 +349,27 @@ export function parseServiceNameArgs(args: readonly string[], command: string): 
       invalidUsage(`Unexpected argument: ${token}`, token, { command });
     }
     name = token;
+    position += 1;
   }
 
-  return { name, target, namespace, context };
+  return {
+    name,
+    target: values.target,
+    ...(env ? { env } : {}),
+    namespace: values.namespace,
+    context: values.context,
+  };
 }
 
 export function parseServiceListArgs(args: readonly string[]): ServiceListOptions {
-  let target: string | undefined;
-  let namespace: string | undefined;
-  let context: string | undefined;
+  const values: ServiceListOptions = {};
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
-      continue;
-    }
-    const namespaceOpt = matchOption(args, position, token, '--namespace');
-    if (namespaceOpt) {
-      if (namespace !== undefined)
-        invalidUsage('Option may be provided only once: --namespace', '--namespace');
-      namespace = namespaceOpt.value;
-      position = namespaceOpt.consumedThrough;
-      continue;
-    }
-    const contextOpt = matchOption(args, position, token, '--context');
-    if (contextOpt) {
-      if (context !== undefined)
-        invalidUsage('Option may be provided only once: --context', '--context');
-      context = contextOpt.value;
-      position = contextOpt.consumedThrough;
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, SERVICE_LIST_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
       continue;
     }
     if (token.startsWith('--')) {
@@ -405,7 +378,11 @@ export function parseServiceListArgs(args: readonly string[]): ServiceListOption
     invalidUsage(`Unexpected argument: ${token}`, token, { command: 'platform service list' });
   }
 
-  return { target, namespace, context };
+  return {
+    target: values.target,
+    namespace: values.namespace,
+    context: values.context,
+  };
 }
 
 function validateSizing(parameters: ServiceSizingParameters | undefined): void {
@@ -511,14 +488,9 @@ function kubectlFailure(
   result: { exitCode: number; stdout: string; stderr: string },
   details: Record<string, JsonValue> = {},
 ): CommandFailure {
-  const detail = (
-    result.stderr.trim() ||
-    result.stdout.trim() ||
-    `kubectl exited ${result.exitCode}`
-  )
-    .split('\n')
-    .slice(0, 12)
-    .join('\n');
+  const rawDetail =
+    result.stderr.trim() || result.stdout.trim() || `kubectl exited ${result.exitCode}`;
+  const detail = rawDetail.split('\n').slice(0, 12).join('\n');
   const lower = detail.toLowerCase();
   if (lower.includes('alreadyexists') || lower.includes('already exists')) {
     return new CommandFailure(
@@ -576,12 +548,11 @@ function readyCondition(document: BackingServiceDocument): ReadyCondition | unde
 export function summarizeService(document: BackingServiceDocument): ServiceSummary {
   const ready = readyCondition(document);
   const endpoint = document.status?.endpoint;
-  const className =
-    document.spec?.className ||
-    document.status?.classRef?.name ||
-    (document.spec?.type && isServiceType(document.spec.type)
+  const defaultClass =
+    document.spec?.type && isServiceType(document.spec.type)
       ? DEFAULT_SERVICE_CLASSES[document.spec.type]
-      : '');
+      : '';
+  const className = document.spec?.className || document.status?.classRef?.name || defaultClass;
   return {
     name: document.metadata?.name ?? '',
     namespace: document.metadata?.namespace ?? '',
@@ -735,6 +706,49 @@ async function getServiceDocument(
   }
 }
 
+async function runControllerServiceCreate(
+  type: ServiceType,
+  name: string,
+  options: ServiceCreateOptions,
+  target: AccountTarget | ControllerTarget,
+  deployManifest: DeployManifest,
+  deps: WasmcloudDeps,
+) {
+  try {
+    const { credential, client } = await resolveControllerSession({ target }, deps);
+    const env = options.env ?? target.env ?? deployManifest.env ?? 'prod';
+    const created = await client.createService({
+      env,
+      type,
+      name,
+      className: options.className,
+      parameters: options.parameters,
+      deletionPolicy: options.deletionPolicy,
+      destinations: options.destinations,
+    });
+    const data = {
+      name: created.name,
+      type: created.type,
+      className: created.className,
+      env: created.env,
+      account: credential.account,
+      namespace: tenantNamespace(credential.account),
+      target: target.name,
+      ...(created.parameters ? { parameters: created.parameters } : {}),
+      ...(created.deletionPolicy ? { deletionPolicy: created.deletionPolicy } : {}),
+      ...(created.destinations ? { destinations: created.destinations } : {}),
+      wait: options.wait,
+      ready: 'True',
+      createdAt: created.createdAt,
+      resource: { apiVersion: BACKING_SERVICE_API_VERSION, kind: BACKING_SERVICE_KIND },
+    };
+    const text = `Created ${created.type} service ${created.name} (${created.className}) in ${created.env} (${credential.account}).`;
+    return { data, text };
+  } catch (error) {
+    wrapControllerError(error);
+  }
+}
+
 export async function runWasmcloudServiceCreate(
   args: readonly string[],
   io: CliIo,
@@ -742,6 +756,13 @@ export async function runWasmcloudServiceCreate(
 ) {
   const options = parseServiceCreateArgs(args);
   const { type, name } = validateCreateOptions(options);
+  const deployManifest = loadDeployManifest(deps.cwd(), deps.env);
+  const target = resolveTarget(deployManifest, options.target);
+
+  if (isControllerBackedTarget(target)) {
+    return runControllerServiceCreate(type, name, options, target, deployManifest, deps);
+  }
+
   const connection = await resolveServiceConnection(options, deps);
   const existing = await captureKubectl(
     deps,
@@ -799,6 +820,7 @@ export async function runWasmcloudServiceCreate(
         ...(options.deletionPolicy ? { deletionPolicy: options.deletionPolicy } : {}),
       };
 
+  const context = options.context ?? connection.context;
   return {
     data: {
       name,
@@ -806,9 +828,7 @@ export async function runWasmcloudServiceCreate(
       className: summary.className,
       namespace: connection.namespace,
       target: connection.target,
-      ...(options.context !== undefined || connection.context !== undefined
-        ? { context: options.context ?? connection.context }
-        : {}),
+      ...(context !== undefined ? { context } : {}),
       ...(options.parameters ? { parameters: options.parameters } : {}),
       ...(options.deletionPolicy ? { deletionPolicy: options.deletionPolicy } : {}),
       ...(options.destinations ? { destinations: options.destinations } : {}),
@@ -901,6 +921,32 @@ export async function runWasmcloudServiceGet(
   };
 }
 
+async function runControllerServiceDelete(
+  name: string,
+  options: ServiceNameOptions,
+  target: AccountTarget | ControllerTarget,
+  deployManifest: DeployManifest,
+  deps: WasmcloudDeps,
+) {
+  try {
+    const { credential, client } = await resolveControllerSession({ target }, deps);
+    const env = options.env ?? target.env ?? deployManifest.env ?? 'prod';
+    await client.deleteService(env, name);
+    const data = {
+      name,
+      env,
+      account: credential.account,
+      namespace: tenantNamespace(credential.account),
+      target: target.name,
+      deleted: true,
+    };
+    const text = `Deleted BackingService ${name} from ${env} (${credential.account}).`;
+    return { data, text };
+  } catch (error) {
+    wrapControllerError(error);
+  }
+}
+
 export async function runWasmcloudServiceDelete(
   args: readonly string[],
   io: CliIo,
@@ -919,6 +965,12 @@ export async function runWasmcloudServiceDelete(
       { command: 'platform service delete' },
     );
   }
+  const deployManifest = loadDeployManifest(deps.cwd(), deps.env);
+  const target = resolveTarget(deployManifest, options.target);
+  if (isControllerBackedTarget(target)) {
+    return runControllerServiceDelete(options.name, options, target, deployManifest, deps);
+  }
+
   const connection = await resolveServiceConnection(options, deps);
   let deletionPolicy: string | undefined;
   try {
