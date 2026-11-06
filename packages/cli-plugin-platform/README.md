@@ -768,6 +768,16 @@ ServiceBindings before applying the workload. Successful updates and workload
 deletion remove obsolete deployment-owned associations. Shared projections stay
 while other workloads use them.
 
+`wasmcloud:postgres@0.2.0` has no transaction handle, and a `serviceName` binding
+is a named import served from a connection pool with no connection affinity:
+`BEGIN` sent as one call does not cover the next. Do not wrap the binding with
+`createSqlDatabase`, which sends `BEGIN` and `COMMIT` as separate calls and leaves
+a poisoned pool connection that fails subsequent overlapping requests. Statements
+execute as independent transactions and row locks last one statement; keep atomic
+work in single statements (conditional `UPDATE … RETURNING`, data-modifying CTEs)
+or `query-batch` scripts, and use an autocommit adapter such as `identity-server`'s
+(`apps/guest/src/database.ts`, `pg.ts`) or `@di-framework/repo/postgres`.
+
 See [PostgreSQL storage, deletion, and recovery](../di-framework-platform/README.md#dedicated-postgresql-upcoming-release).
 
 ### Blobstore services
