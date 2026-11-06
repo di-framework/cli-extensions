@@ -483,10 +483,21 @@ export async function pullPgliteComponent(
 /** Set to `1` to let `deploy` or a CI build use a local, unverified provider. */
 export const ALLOW_LOCAL_PGLITE_ENV = 'DI_FRAMEWORK_ALLOW_LOCAL_PGLITE';
 
+/**
+ * Options for resolving PGlite components.
+ *
+ * Note: `buildComponent(..., { deploy: true })` enforces the deploy-time refusal of unverified
+ * local providers, whereas calling the lower-level `publishComponent` API directly publishes an
+ * already-built `.wasm` without re-running provider resolution.
+ */
 export type ResolvePgliteOptions = {
   /** A deploy ships the provider, so a local file needs the explicit opt-in. */
   deploy?: boolean;
 };
+
+function isCiEnv(value: string | undefined): boolean {
+  return Boolean(value && value !== '0' && value.toLowerCase() !== 'false');
+}
 
 function readLocalProvider(
   local: string,
@@ -505,7 +516,7 @@ function readLocalProvider(
     );
   let context: string | undefined;
   if (options.deploy) context = 'deploy';
-  else if (deps.env.CI) context = 'CI';
+  else if (isCiEnv(deps.env.CI)) context = 'CI';
   if (context !== undefined && deps.env[ALLOW_LOCAL_PGLITE_ENV] !== '1')
     throw failure(
       'WASMCLOUD_PGLITE_LOCAL_REFUSED',
@@ -531,6 +542,9 @@ function readLocalProvider(
  * The provider to compose: `DI_FRAMEWORK_PGLITE_WASM`, then `pglite.wasm`, then the
  * digest-pinned `pglite.image`. Local files are only checked to be WebAssembly, and are
  * refused in a deploy or on CI without `DI_FRAMEWORK_ALLOW_LOCAL_PGLITE=1`.
+ * Note that `buildComponent(..., { deploy: true })` enforces this deploy-time refusal, whereas
+ * calling the lower-level `publishComponent` API directly publishes an already-built `.wasm`
+ * without re-running provider resolution.
  */
 export async function resolvePgliteComponent(
   config: PgliteConfig,
@@ -590,29 +604,33 @@ export async function resolvePgliteEncryption(
   return pullPgliteComponent(config.image as string, io, deps, projectRoot, PGLITE_ENCFS);
 }
 
+function rootsOverlap(a: string, b: string): boolean {
+  return a === b || a === '' || b === '' || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
 /**
  * Members of one workload share one storage directory, mounted at each member's own
- * `storageMount`. Two members whose `dataDir` is the same path relative to their mount
- * would open the same database from separate instances, which exclusivity cannot stop.
+ * `storageMount`. Two members whose `dataDir` is the same or a nested path relative to their mount
+ * would open overlapping database directories from separate instances, which exclusivity cannot stop.
  */
 export function assertDistinctPgliteRoots(
   workload: string,
   members: Iterable<{ applicationName: string; workload?: string; pglite?: PgliteConfig }>,
 ): void {
-  const owners = new Map<string, string>();
+  const owners: Array<{ root: string; name: string }> = [];
   for (const member of members) {
     if (member.workload !== workload || member.pglite === undefined) continue;
     const root = posix.relative(member.pglite.storageMount, member.pglite.dataDir);
-    const previous = owners.get(root);
+    const previous = owners.find((entry) => rootsOverlap(root, entry.root));
     if (previous !== undefined)
       throw new CommandFailure(
         'WASMCLOUD_PGLITE_DATA_DIR_CONFLICT',
-        `${workload}: ${previous} and ${member.applicationName} would open the same PGlite database ` +
+        `${workload}: ${previous.name} and ${member.applicationName} would open the same PGlite database ` +
           `(<workload storage>/${root || '.'}); members share one storage directory, so give each a different dataDir relative to its storageMount`,
         2,
         { workload, root },
       );
-    owners.set(root, member.applicationName);
+    owners.push({ root, name: member.applicationName });
   }
 }
 
@@ -677,11 +695,10 @@ export async function warnIfHostIgnoresExclusive(
     return;
   }
   const images = await hostImages(connection, hostgroup, deps, project.projectRoot);
-  if (images?.some(hasExclusiveTag)) return;
+  if (images !== undefined && images.length > 0 && images.every(hasExclusiveTag)) return;
+  const nonExclusive = images?.find((img) => !hasExclusiveTag(img));
   const seen =
-    images === undefined || images.length === 0
-      ? 'could not read its host image'
-      : `runs ${images[0]}`;
+    nonExclusive === undefined ? 'could not read its host image' : `runs ${nonExclusive}`;
   io.stderr.write(
     `Warning: ${project.applicationName} embeds PGlite and is marked exclusive, but host group ${hostgroup} ` +
       `${seen}, which does not look like the exclusive build (tagged *${EXCLUSIVE_HOST_IMAGE_MARKER}, set with the platform's tenantHostImage). ${risk}.\n`,
