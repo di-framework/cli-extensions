@@ -54,7 +54,7 @@ import {
 import { loadProject, type WasmcloudProject } from './project';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { renderQueuesModule } from './queues-module';
-import { invalidUsage, requireNodeBinary, toolFailed } from './support';
+import { requireNodeBinary, toolFailed } from './support';
 import {
   buildWitLock,
   COMPONENT_MODEL,

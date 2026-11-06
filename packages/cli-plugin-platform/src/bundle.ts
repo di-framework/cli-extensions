@@ -1,5 +1,14 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import {
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import type { CliIo } from '@di-framework/cli-extension';
 import { discoverActors } from './actors';
 import { type BindingRecord, discoverBindings } from './bindings';
@@ -25,13 +34,7 @@ import {
   parseManifestSecrets,
 } from './manifest';
 import { loadProject, type WasmcloudProject } from './project';
-import {
-  contentDigest,
-  ociReference,
-  type PublishedImage,
-  projectRelativePath,
-  publishComponent,
-} from './publish';
+import { ociReference, type PublishedImage, projectRelativePath } from './publish';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import {
   materializeRegistry,
@@ -76,6 +79,7 @@ export type BundleRegistryCredentials = {
   username?: string;
   password?: string;
   token?: string;
+  registryConfigPath?: string;
 };
 
 export type BundlePublishContext = {
@@ -121,7 +125,7 @@ export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
   if (args.length === 0) return {};
   const result: ParsedBuildArgs = {};
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
+    const arg = args[i] as string;
     if (arg === '--bundle' || arg.startsWith('--bundle=')) {
       const value = arg === '--bundle' ? args[++i] : arg.slice('--bundle='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --bundle', arg);
@@ -163,7 +167,8 @@ export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
     result.name = arg;
   }
   if (result.bundle === undefined) {
-    invalidUsage(`platform build does not accept arguments without --bundle: ${args[0]}`, args[0]!);
+    const first = args[0] as string;
+    invalidUsage(`platform build does not accept arguments without --bundle: ${first}`, first);
   }
   return result;
 }
@@ -216,51 +221,121 @@ export function pinImageToDigest(reference: string, digest: string): string {
   return `${repository}@${normalizedDigest}`;
 }
 
+function parseManifestDescriptorDigest(stdout: string): string {
+  let parsed: { digest?: unknown } | null = null;
+  try {
+    parsed = JSON.parse(stdout) as { digest?: unknown } | null;
+  } catch {
+    // handled below
+  }
+  const digest = typeof parsed === 'object' && parsed !== null ? parsed.digest : undefined;
+  if (typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/i.test(digest)) {
+    throw new Error(`Failed to resolve OCI manifest digest from oras descriptor: ${stdout.trim()}`);
+  }
+  return digest.toLowerCase();
+}
+
 async function publishWithBundleOptions(context: BundlePublishContext): Promise<PublishedImage> {
   const { project, connection, build, io, deps, tag, credentials } = context;
-  const hasCustomAuth = Boolean(credentials?.token || credentials?.username);
-  const hasCustomTagOrRepo = Boolean(tag || credentials?.repository);
-  if (!hasCustomAuth && !hasCustomTagOrRepo) {
-    return publishComponent(project, connection, io, deps, build.deploymentDigest);
-  }
   const repository = credentials?.repository ?? project.witName;
   const resolvedTag = tag ?? `sha256-${build.deploymentDigest}`;
   const pushReference = `${registryReferenceHost(connection.registry.push)}/${repository}:${resolvedTag}`;
   const pullReference = `${registryReferenceHost(connection.registry.pull)}/${repository}:${resolvedTag}`;
-  const artifactDigest = contentDigest(project.outputPath);
   const configPath = resolve(project.projectRoot, '.di-framework', 'oci-config.json');
   const componentPath = projectRelativePath(project.projectRoot, project.outputPath);
   const projectConfigPath = projectRelativePath(project.projectRoot, configPath);
   const transportArgs = registryUsesPlainHttp(connection.registry) ? ['--plain-http'] : [];
-  const authArgs = credentials?.token
-    ? ['--registry-config', credentials.token]
-    : credentials?.username
-      ? ['-u', credentials.username, ...(credentials.password ? ['-p', credentials.password] : [])]
-      : [];
-  io.stdout.write(`Publishing ${componentPath} as ${pushReference}...\n`);
-  const pushed = await deps.runner(
-    'oras',
-    [
-      'push',
-      ...transportArgs,
-      ...authArgs,
-      '--config',
-      `${projectConfigPath}:application/vnd.wasm.config.v0+json`,
-      pushReference,
-      `${componentPath}:application/wasm`,
-    ],
-    { cwd: project.projectRoot },
-  );
-  if (pushed.exitCode !== 0) {
-    throw toolFailed('oras push', pushed.exitCode);
+
+  let tempAuthDir: string | undefined;
+  let authArgs: string[] = [];
+  if (credentials?.registryConfigPath) {
+    authArgs = ['--registry-config', credentials.registryConfigPath];
+  } else if (credentials?.username || credentials?.token) {
+    tempAuthDir = mkdtempSync(join(tmpdir(), 'di-framework-oras-'));
+    const tempConfigPath = join(tempAuthDir, 'config.json');
+    const authEntry: Record<string, string> = {};
+    if (credentials.username) {
+      authEntry.auth = Buffer.from(
+        `${credentials.username}:${credentials.password ?? ''}`,
+      ).toString('base64');
+    }
+    if (credentials.token) {
+      authEntry.identitytoken = credentials.token;
+    }
+    const refHost = registryReferenceHost(connection.registry.push);
+    const serverHost = refHost.replace(/\/.*$/, '');
+    const config = {
+      auths: {
+        [serverHost]: authEntry,
+        [refHost]: authEntry,
+      },
+    };
+    const fd = openSync(tempConfigPath, 'wx', 0o600);
+    try {
+      writeFileSync(fd, `${JSON.stringify(config)}\n`, 'utf8');
+    } finally {
+      closeSync(fd);
+    }
+    authArgs = ['--registry-config', tempConfigPath];
   }
-  return {
-    artifactDigest,
-    digest: build.deploymentDigest,
-    pullReference,
-    pushReference,
-    reference: pushReference,
-  };
+
+  try {
+    io.stdout.write(`Publishing ${componentPath} as ${pushReference}...\n`);
+    if (!tag) {
+      const existing = await deps.runCaptured(
+        'oras',
+        ['manifest', 'fetch', ...transportArgs, ...authArgs, '--descriptor', pushReference],
+        { cwd: project.projectRoot },
+      );
+      if (existing.exitCode === 0) {
+        io.stdout.write(`OCI tag ${pushReference} already exists; keeping it immutable.\n`);
+        const existingDigest = parseManifestDescriptorDigest(existing.stdout);
+        return {
+          artifactDigest: existingDigest,
+          digest: build.deploymentDigest,
+          pullReference,
+          pushReference,
+          reference: pushReference,
+        };
+      }
+    }
+    const pushed = await deps.runner(
+      'oras',
+      [
+        'push',
+        ...transportArgs,
+        ...authArgs,
+        '--config',
+        `${projectConfigPath}:application/vnd.wasm.config.v0+json`,
+        pushReference,
+        `${componentPath}:application/wasm`,
+      ],
+      { cwd: project.projectRoot },
+    );
+    if (pushed.exitCode !== 0) {
+      throw toolFailed('oras push', pushed.exitCode);
+    }
+    const descriptor = await deps.runCaptured(
+      'oras',
+      ['manifest', 'fetch', ...transportArgs, ...authArgs, '--descriptor', pushReference],
+      { cwd: project.projectRoot },
+    );
+    if (descriptor.exitCode !== 0) {
+      throw toolFailed('oras manifest fetch', descriptor.exitCode);
+    }
+    const manifestDigest = parseManifestDescriptorDigest(descriptor.stdout);
+    return {
+      artifactDigest: manifestDigest,
+      digest: build.deploymentDigest,
+      pullReference,
+      pushReference,
+      reference: pushReference,
+    };
+  } finally {
+    if (tempAuthDir !== undefined) {
+      rmSync(tempAuthDir, { recursive: true, force: true });
+    }
+  }
 }
 
 function filterPassthroughMap(
@@ -453,8 +528,8 @@ function parseYamlBlock(
   if (lines[startIndex]?.text.startsWith('- ')) {
     const items: unknown[] = [];
     let index = startIndex;
-    while (index < lines.length && lines[index]!.indent === blockIndent) {
-      const line = lines[index]!;
+    while (index < lines.length && (lines[index] as YamlLine).indent === blockIndent) {
+      const line = lines[index] as YamlLine;
       if (!line.text.startsWith('- ')) break;
       const itemText = line.text.slice(2).trim();
       const { key, value } = splitYamlKeyValue(itemText);
@@ -468,13 +543,13 @@ function parseYamlBlock(
         itemMap[key] = parseYamlScalar(value);
         index++;
       } else {
-        const nextIndent = lines[index + 1]!.indent;
-        const [nested, nextIdx] = parseYamlBlock(lines, index + 1, nextIdxIndent(nextIndent));
+        const nextIndent = (lines[index + 1] as YamlLine).indent;
+        const [nested, nextIdx] = parseYamlBlock(lines, index + 1, nextIndent);
         itemMap[key] = nested;
         index = nextIdx;
       }
-      if (index < lines.length && lines[index]!.indent > blockIndent) {
-        const [restMap, nextIdx] = parseYamlMap(lines, index, lines[index]!.indent);
+      if (index < lines.length && (lines[index] as YamlLine).indent > blockIndent) {
+        const [restMap, nextIdx] = parseYamlMap(lines, index, (lines[index] as YamlLine).indent);
         Object.assign(itemMap, restMap);
         index = nextIdx;
       }
@@ -485,10 +560,6 @@ function parseYamlBlock(
   return parseYamlMap(lines, startIndex, blockIndent);
 }
 
-function nextIdxIndent(indent: number): number {
-  return indent;
-}
-
 function parseYamlMap(
   lines: readonly YamlLine[],
   startIndex: number,
@@ -496,15 +567,15 @@ function parseYamlMap(
 ): [Record<string, unknown>, number] {
   const result: Record<string, unknown> = {};
   let index = startIndex;
-  while (index < lines.length && lines[index]!.indent === mapIndent) {
-    const line = lines[index]!;
+  while (index < lines.length && (lines[index] as YamlLine).indent === mapIndent) {
+    const line = lines[index] as YamlLine;
     if (line.text.startsWith('- ')) break;
     const { key, value } = splitYamlKeyValue(line.text);
     if (value !== '') {
       result[key] = parseYamlScalar(value);
       index++;
     } else {
-      const childIndent = lines[index + 1]!.indent;
+      const childIndent = (lines[index + 1] as YamlLine).indent;
       const [nested, nextIdx] = parseYamlBlock(lines, index + 1, childIndent);
       result[key] = nested;
       index = nextIdx;

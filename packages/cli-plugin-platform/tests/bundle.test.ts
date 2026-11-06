@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runWasmcloudBuild } from '../src/build';
@@ -13,6 +13,7 @@ import {
   pinImageToDigest,
   sanitizeWorkloadForBundle,
 } from '../src/bundle';
+import type { WasmcloudDeps } from '../src/deps';
 import { loadProject } from '../src/project';
 import {
   captureIo,
@@ -23,6 +24,71 @@ import {
   makeWorkspace,
   type RunnerInvocation,
 } from './helpers';
+
+const MANIFEST_DIGEST = `sha256:${'d'.repeat(64)}`;
+
+function bundleFakeDeps(
+  options: Parameters<typeof fakeDeps>[0] & {
+    manifestDigest?: string;
+    manifestAlreadyExists?: boolean;
+    fetchAfterPushExitCode?: number;
+    descriptorStdout?: string;
+    onOrasConfig?: (configPath: string, content: string, mode: number) => void;
+  },
+): WasmcloudDeps {
+  const base = fakeDeps(options);
+  const pushedRefs = new Set<string>();
+  const digest = options.manifestDigest ?? MANIFEST_DIGEST;
+  const descriptorJson =
+    options.descriptorStdout ??
+    JSON.stringify({
+      mediaType: 'application/vnd.oci.image.manifest.v1+json',
+      digest,
+      size: 512,
+    });
+
+  const inspectRegistryConfig = (args: readonly string[]) => {
+    const idx = args.indexOf('--registry-config');
+    if (idx >= 0) {
+      const configPath = args[idx + 1];
+      if (configPath && existsSync(configPath)) {
+        options.onOrasConfig?.(
+          configPath,
+          readFileSync(configPath, 'utf8'),
+          statSync(configPath).mode & 0o777,
+        );
+      }
+    }
+  };
+
+  return {
+    ...base,
+    runner: async (command, args, runOptions) => {
+      if (command === 'oras' && args[0] === 'push') {
+        inspectRegistryConfig(args);
+        const ref = args[args.length - 2];
+        if (ref) pushedRefs.add(ref);
+      }
+      return base.runner(command, args, runOptions);
+    },
+    runCaptured: async (command, args, runOptions) => {
+      const result = await base.runCaptured(command, args, runOptions);
+      if (command === 'oras' && args[0] === 'manifest' && args[1] === 'fetch') {
+        inspectRegistryConfig(args);
+        const ref = args[args.length - 1] ?? '';
+        if (options.manifestAlreadyExists || pushedRefs.has(ref)) {
+          return {
+            exitCode: options.fetchAfterPushExitCode ?? 0,
+            stdout: descriptorJson,
+            stderr: '',
+          };
+        }
+        return { exitCode: 1, stdout: '', stderr: 'not found' };
+      }
+      return result;
+    },
+  };
+}
 
 const DNS_LABEL = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
 const SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
@@ -404,11 +470,10 @@ service-name = "redis-staging"
     const invocations: RunnerInvocation[] = [];
     const output = captureIo();
     const outPath = join(root, 'out', 'greeter.bundle.json');
-    const deps = fakeDeps({
+    const deps = bundleFakeDeps({
       cwd: root,
       assets: makeAssets(),
       invocations,
-      exitCodes: { 'manifest fetch': 1 },
     });
 
     const result = await runWasmcloudBuild(['greeter', '--bundle', outPath], output.io, deps);
@@ -423,7 +488,7 @@ service-name = "redis-staging"
     expect(written.component.reference).toMatch(
       /^registry\.example\.com\/acme\/greeter:sha256-[0-9a-f]{64}$/,
     );
-    expect(written.component.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(written.component.digest).toBe(MANIFEST_DIGEST);
     expect(written.bindings).toEqual([
       {
         name: 'cache',
@@ -455,9 +520,7 @@ service-name = "redis-staging"
 
     const components = templateSpec.components as Record<string, unknown>[];
     expect(components).toHaveLength(1);
-    expect(components[0]?.image).toBe(
-      `registry.example.com/acme/greeter@${written.component.digest}`,
-    );
+    expect(components[0]?.image).toBe(`registry.example.com/acme/greeter@${MANIFEST_DIGEST}`);
     const localEnv = (components[0]?.localResources as Record<string, unknown>)
       ?.environment as Record<string, unknown>;
     expect(localEnv.configFrom).toBeUndefined();
@@ -469,14 +532,24 @@ service-name = "redis-staging"
     );
     expect(httpIface?.config).toEqual({ host: 'greeter-staging' });
 
-    // Also verify when OCI tag already exists in registry
-    const cachedDeps = fakeDeps({
+    // Also verify when OCI tag already exists in registry (skips push, uses existing manifest digest)
+    const cachedInvocations: RunnerInvocation[] = [];
+    const existingManifestDigest = `sha256:${'e'.repeat(64)}`;
+    const cachedOutput = captureIo();
+    const cachedDeps = bundleFakeDeps({
       cwd: greeter,
       assets: makeAssets(),
-      exitCodes: { 'manifest fetch': 0 },
+      invocations: cachedInvocations,
+      manifestAlreadyExists: true,
+      manifestDigest: existingManifestDigest,
     });
-    const secondBundle = await buildDeployBundle({ env: 'prod' }, captureIo().io, cachedDeps);
+    const secondBundle = await buildDeployBundle({ env: 'prod' }, cachedOutput.io, cachedDeps);
     expect(secondBundle.env).toBe('prod');
+    expect(secondBundle.component.digest).toBe(existingManifestDigest);
+    expect(
+      cachedInvocations.some((call) => call.command === 'oras' && call.args[0] === 'push'),
+    ).toBe(false);
+    expect(cachedOutput.stdout.join('')).toContain('already exists; keeping it immutable.');
     expect(controllerInvalidReason(secondBundle)).toBeUndefined();
   });
 
@@ -626,11 +699,13 @@ export class AppCfg extends Config {}
     );
 
     const invocations: RunnerInvocation[] = [];
-    const deps = fakeDeps({
+    const observedConfigs: Array<{ path: string; content: string; mode: number }> = [];
+    const deps = bundleFakeDeps({
       cwd: root,
       assets: makeAssets(),
       invocations,
       resolutions: { '@di-framework/bindings/catalog.json': join(root, 'catalog.json') },
+      onOrasConfig: (path, content, mode) => observedConfigs.push({ path, content, mode }),
     });
 
     const bundle = await buildDeployBundle(
@@ -657,6 +732,7 @@ export class AppCfg extends Config {}
 
     expect(controllerInvalidReason(bundle)).toBeUndefined();
     expect(bundle.component.reference).toBe('127.0.0.1:25000/tenant-acme/orders-service:v2.1.0');
+    expect(bundle.component.digest).toBe(MANIFEST_DIGEST);
     expect(bundle.bindings).toEqual([
       {
         name: 'orders-db',
@@ -677,21 +753,45 @@ export class AppCfg extends Config {}
     expect(bundle.secrets).toEqual(['orders-api-key', 'extra-secret']);
     const pushCall = invocations.find((call) => call.command === 'oras' && call.args[0] === 'push');
     expect(pushCall?.args).toContain('--plain-http');
-    expect(pushCall?.args).toContain('-u');
-    expect(pushCall?.args).toContain('robot');
-    expect(pushCall?.args).toContain('-p');
+    expect(pushCall?.args).toContain('--registry-config');
+    expect(pushCall?.args).not.toContain('-p');
+    expect(pushCall?.args).not.toContain('secret-password');
+    expect(observedConfigs.length).toBeGreaterThan(0);
+    const firstConfig = observedConfigs[0];
+    expect(firstConfig?.mode).toBe(0o600);
+    expect(existsSync(firstConfig?.path ?? '')).toBe(false);
+    expect(JSON.parse(firstConfig?.content ?? '{}')).toEqual({
+      auths: {
+        '127.0.0.1:25000': {
+          auth: Buffer.from('robot:secret-password').toString('base64'),
+        },
+        '127.0.0.1:25000/tenant-acme': {
+          auth: Buffer.from('robot:secret-password').toString('base64'),
+        },
+      },
+    });
 
-    // Token-based credentials and username without password
+    // Token-based credentials, username without password, and explicit registryConfigPath
+    observedConfigs.length = 0;
     await buildDeployBundle(
       {
         credentials: {
           registry: 'registry.example.com/acme',
-          token: '/tmp/registry-config.json',
+          token: 'secret-identity-token',
         },
       },
       captureIo().io,
       deps,
     );
+    expect(JSON.parse(observedConfigs[0]?.content ?? '{}')).toEqual({
+      auths: {
+        'registry.example.com': { identitytoken: 'secret-identity-token' },
+        'registry.example.com/acme': { identitytoken: 'secret-identity-token' },
+      },
+    });
+    expect(existsSync(observedConfigs[0]?.path ?? '')).toBe(false);
+
+    observedConfigs.length = 0;
     await buildDeployBundle(
       {
         credentials: {
@@ -702,6 +802,28 @@ export class AppCfg extends Config {}
       captureIo().io,
       deps,
     );
+    expect(JSON.parse(observedConfigs[0]?.content ?? '{}')).toEqual({
+      auths: {
+        'registry.example.com': { auth: Buffer.from('token-user:').toString('base64') },
+        'registry.example.com/acme': { auth: Buffer.from('token-user:').toString('base64') },
+      },
+    });
+
+    await buildDeployBundle(
+      {
+        credentials: {
+          registry: 'registry.example.com/acme',
+          registryConfigPath: '/tmp/custom-registry-config.json',
+        },
+      },
+      captureIo().io,
+      deps,
+    );
+    expect(
+      invocations.some(
+        (call) => call.command === 'oras' && call.args.includes('/tmp/custom-registry-config.json'),
+      ),
+    ).toBe(true);
 
     // Registry override on an existing target connection
     writeFileSync(
@@ -731,7 +853,7 @@ registry = "registry.example.com/old"
           tag: 'v4',
         },
         captureIo().io,
-        fakeDeps({
+        bundleFakeDeps({
           cwd: root,
           assets: makeAssets(),
           resolutions: { '@di-framework/bindings/catalog.json': join(root, 'catalog.json') },
@@ -739,6 +861,42 @@ registry = "registry.example.com/old"
         }),
       ),
     ).rejects.toMatchObject({ code: 'WASMCLOUD_TOOL_FAILED', exitCode: 3 });
+
+    // Oras manifest fetch failure after push
+    await expect(
+      buildDeployBundle(
+        {
+          registry: 'registry.example.com/new',
+          tag: 'v4',
+        },
+        captureIo().io,
+        bundleFakeDeps({
+          cwd: root,
+          assets: makeAssets(),
+          resolutions: { '@di-framework/bindings/catalog.json': join(root, 'catalog.json') },
+          fetchAfterPushExitCode: 1,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_TOOL_FAILED', exitCode: 3 });
+
+    // Invalid manifest descriptor output from oras
+    for (const badStdout of ['not-json', '{}', 'null']) {
+      await expect(
+        buildDeployBundle(
+          {
+            registry: 'registry.example.com/new',
+            tag: 'v4',
+          },
+          captureIo().io,
+          bundleFakeDeps({
+            cwd: root,
+            assets: makeAssets(),
+            resolutions: { '@di-framework/bindings/catalog.json': join(root, 'catalog.json') },
+            descriptorStdout: badStdout,
+          }),
+        ),
+      ).rejects.toThrow(/Failed to resolve OCI manifest digest/);
+    }
 
     // Invalid env option passed directly to buildDeployBundle
     await expect(
