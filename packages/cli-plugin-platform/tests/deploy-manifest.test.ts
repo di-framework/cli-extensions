@@ -389,4 +389,68 @@ registry = "registry.example.com/ci"
     expect(interpolateEnv(12, {}, '/m')).toBe(12);
     expect(interpolateEnv(null, {}, '/m')).toBeNull();
   });
+
+  it('parses and validates env, bindings, and secrets in deploy manifests', () => {
+    const path = '/workspace/di-framework.deploy.toml';
+    const manifest = parseDeployManifest(
+      path,
+      `env = "prod"
+secrets = ["s1", "s2", "s1"]
+
+[bindings.cache]
+capability = "keyvalue"
+service = "redis"
+
+[bindings.cache.config]
+bucket = "main"
+
+[targets.local]
+platform = "deploy/platform"
+env = "staging"
+secrets = ["s3"]
+
+[targets.local.bindings.db]
+capability = "postgres"
+serviceName = "orders-db"
+`,
+      {},
+    );
+    expect(manifest.env).toBe('prod');
+    expect(manifest.secrets).toEqual(['s1', 's2']);
+    expect(manifest.bindings).toEqual([
+      {
+        name: 'cache',
+        capability: 'keyvalue',
+        serviceName: 'redis',
+        config: { bucket: 'main' },
+      },
+    ]);
+    expect(manifest.targets.local).toMatchObject({
+      env: 'staging',
+      secrets: ['s3'],
+      bindings: [
+        {
+          name: 'db',
+          capability: 'postgres',
+          serviceName: 'orders-db',
+        },
+      ],
+    });
+
+    for (const invalidToml of [
+      `env = "dev"\n[targets.local]\nplatform = "p"\n`,
+      `bindings = "nope"\n[targets.local]\nplatform = "p"\n`,
+      `[bindings]\ncache = "nope"\n[targets.local]\nplatform = "p"\n`,
+      `[bindings.cache]\ncapability = "keyvalue"\nextra = "nope"\n[targets.local]\nplatform = "p"\n`,
+      `[bindings.cache]\nservice = "redis"\n[targets.local]\nplatform = "p"\n`,
+      `[bindings.cache]\ncapability = "keyvalue"\nconfig = "nope"\n[targets.local]\nplatform = "p"\n`,
+      `[bindings.cache]\ncapability = "keyvalue"\n[bindings.cache.config]\nflag = true\n[targets.local]\nplatform = "p"\n`,
+    ]) {
+      expectFailure(
+        () => parseDeployManifest(path, invalidToml, {}),
+        'WASMCLOUD_DEPLOY_MANIFEST_INVALID',
+        2,
+      );
+    }
+  });
 });
