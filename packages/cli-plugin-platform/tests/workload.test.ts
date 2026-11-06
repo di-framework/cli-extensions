@@ -3,14 +3,24 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadProject } from '../src/project';
+import { SECRET_UPDATE_KEYS_MESSAGE } from '../src/secret-admission';
 import {
   applyWorkload,
+  CONTROL_TOKEN_ROTATED_NOTICE,
+  DEFAULT_DEPLOY_TIMEOUT_SECONDS,
+  deleteWorkload,
+  projectHasStorageOrPglite,
   renderWorkloadManifest,
+  resolveDeployTimeoutSeconds,
+  STORAGE_DEPLOY_TIMEOUT_SECONDS,
+  STORAGE_WAIT_ATTEMPTS,
   storageDirectoryName,
   storageOwnershipConflict,
+  WAIT_ATTEMPTS,
   WORKLOAD_DEPLOYMENT_RESOURCE,
   WORKLOAD_REPLICA_SET_RESOURCE,
   waitForReady,
+  writeControlSecret,
 } from '../src/workload';
 import {
   captureIo,
@@ -717,5 +727,577 @@ export class Worker {
           invocation.args.includes('secret'),
       ),
     ).toBe(false);
+  });
+
+  it('matches control secret errors on raw stderr before 400-char truncation (#59 S7)', async () => {
+    const { greeter } = makeWorkspace();
+    const project = loadProject(greeter);
+    const connection = {
+      target: 'development',
+      kubeconfig: '/tmp/kube',
+      namespace: 'wasmcloud',
+      registry: REGISTRY,
+    };
+    const longWarning = `Warning: ${'x'.repeat(450)}\n`;
+
+    const keysDeniedDeps = fakeDeps({ cwd: greeter });
+    keysDeniedDeps.runCaptured = async (_command, args) => {
+      if (args.includes('create')) {
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      }
+      if (args.includes('can-i')) {
+        return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      }
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `${longWarning}Error from server (Forbidden): ${SECRET_UPDATE_KEYS_MESSAGE}`,
+      };
+    };
+    await expect(writeControlSecret(project, connection, keysDeniedDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+      exitCode: 2,
+    });
+
+    const conflictDeps = fakeDeps({ cwd: greeter });
+    conflictDeps.runCaptured = async (_command, args) => {
+      if (args.includes('create')) {
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      }
+      if (args.includes('can-i')) {
+        return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      }
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `${longWarning}Error from server (Conflict): Operation cannot be fulfilled on secrets "greeter-control"`,
+      };
+    };
+    await expect(writeControlSecret(project, connection, conflictDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_CONTROL_SECRET_CHANGED',
+      exitCode: 3,
+    });
+  });
+
+  it('appends the rotated-token notice to non-CommandFailure Errors after Secret PUT (#59 S8)', async () => {
+    const { greeter } = makeWorkspace();
+    const project = loadProject(greeter);
+    const connection = {
+      target: 'development',
+      kubeconfig: '/tmp/kube',
+      namespace: 'wasmcloud',
+      registry: REGISTRY,
+    };
+    const deps = fakeDeps({ cwd: greeter });
+    const spawnError = new Error('spawn kubectl EACCES');
+    deps.runner = async (command, args) => {
+      if (command === 'kubectl' && args.includes('apply')) throw spawnError;
+      return { exitCode: 0 };
+    };
+    await expect(
+      applyWorkload(
+        project,
+        connection,
+        'registry.example.com/team/greeter:1',
+        captureIo().io,
+        deps,
+      ),
+    ).rejects.toThrow(`spawn kubectl EACCES; ${CONTROL_TOKEN_ROTATED_NOTICE}`);
+    expect(spawnError.message).toContain(CONTROL_TOKEN_ROTATED_NOTICE);
+
+    deps.runner = async (command, args) => {
+      if (command === 'kubectl' && args.includes('apply')) throw 'non-error-string';
+      return { exitCode: 0 };
+    };
+    await expect(
+      applyWorkload(
+        project,
+        connection,
+        'registry.example.com/team/greeter:1',
+        captureIo().io,
+        deps,
+      ),
+    ).rejects.toBe('non-error-string');
+  });
+
+  it('supports configurable readiness timeouts and longer storage/pglite defaults (#73, #68)', async () => {
+    const { greeter } = makeWorkspace();
+    const baseProject = loadProject(greeter);
+    const connection = {
+      target: 'development',
+      kubeconfig: '/tmp/kube',
+      namespace: 'wasmcloud',
+      registry: REGISTRY,
+    };
+
+    expect(projectHasStorageOrPglite(baseProject)).toBe(false);
+    expect(projectHasStorageOrPglite({ ...baseProject, persistentStorage: true })).toBe(true);
+    expect(projectHasStorageOrPglite({ ...baseProject, storage: { mount: '/data' } })).toBe(true);
+    expect(
+      projectHasStorageOrPglite({
+        ...baseProject,
+        pglite: {
+          image: `ghcr.io/di-framework/pglite@sha256:${'a'.repeat(64)}`,
+          dataDir: '/data/pglite',
+          storageMount: '/data',
+        },
+      }),
+    ).toBe(true);
+    expect(projectHasStorageOrPglite({ ...baseProject, actors: true })).toBe(true);
+
+    expect(resolveDeployTimeoutSeconds(baseProject, { env: {} })).toBe(
+      DEFAULT_DEPLOY_TIMEOUT_SECONDS,
+    );
+    expect(
+      resolveDeployTimeoutSeconds({ ...baseProject, persistentStorage: true }, { env: {} }),
+    ).toBe(STORAGE_DEPLOY_TIMEOUT_SECONDS);
+    expect(
+      resolveDeployTimeoutSeconds(baseProject, {
+        env: { DI_FRAMEWORK_DEPLOY_TIMEOUT_SECONDS: '120' },
+      }),
+    ).toBe(120);
+    expect(
+      resolveDeployTimeoutSeconds(
+        baseProject,
+        { env: { DI_FRAMEWORK_DEPLOY_TIMEOUT_SECONDS: '120' } },
+        { timeoutSeconds: 10 },
+      ),
+    ).toBe(10);
+    expect(
+      resolveDeployTimeoutSeconds(baseProject, {
+        env: { DI_FRAMEWORK_DEPLOY_TIMEOUT_SECONDS: 'invalid' },
+      }),
+    ).toBe(DEFAULT_DEPLOY_TIMEOUT_SECONDS);
+
+    let statelessWaits = 0;
+    const statelessDeps = fakeDeps({
+      cwd: greeter,
+      capturedStdout: { 'kubectl get': '{}' },
+    });
+    statelessDeps.wait = async () => {
+      statelessWaits += 1;
+    };
+    await expect(waitForReady(baseProject, connection, statelessDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
+      exitCode: 3,
+      details: { timeoutSeconds: 60 },
+      message: expect.stringContaining(
+        'The workload may still become Ready while the host finishes rolling; check status with "kubectl get workloaddeployment greeter -n wasmcloud" or re-run "di-framework platform deploy greeter --target development".',
+      ),
+    });
+    expect(statelessWaits).toBe(WAIT_ATTEMPTS);
+
+    let storageWaits = 0;
+    const storageDeps = fakeDeps({
+      cwd: greeter,
+      capturedStdout: { 'kubectl get': '{}' },
+    });
+    storageDeps.wait = async () => {
+      storageWaits += 1;
+    };
+    const output = captureIo();
+    await expect(
+      waitForReady({ ...baseProject, persistentStorage: true }, connection, storageDeps, output.io),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
+      exitCode: 3,
+      details: { timeoutSeconds: 180 },
+    });
+    expect(storageWaits).toBe(STORAGE_WAIT_ATTEMPTS);
+    expect(output.stderr.join('')).toContain(
+      'check status with "kubectl get workloaddeployment greeter -n wasmcloud"',
+    );
+
+    let customWaits = 0;
+    const customDeps = fakeDeps({
+      cwd: greeter,
+      capturedStdout: { 'kubectl get': '{}' },
+    });
+    customDeps.wait = async () => {
+      customWaits += 1;
+    };
+    await expect(
+      waitForReady(baseProject, connection, customDeps, undefined, { timeoutSeconds: 6 }),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
+      details: { timeoutSeconds: 6 },
+    });
+    expect(customWaits).toBe(3);
+
+    const statelessFailDeps = fakeDeps({
+      cwd: greeter,
+      capturedStdout: { 'kubectl get': '{}' },
+    });
+    statelessFailDeps.wait = async () => undefined;
+    await expect(
+      applyWorkload(
+        baseProject,
+        connection,
+        'registry.example.com/team/greeter:1',
+        captureIo().io,
+        statelessFailDeps,
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
+      message:
+        'WorkloadDeployment greeter in wasmcloud did not become ready. ' +
+        'The workload may still become Ready while the host finishes rolling; check status with ' +
+        '"kubectl get workloaddeployment greeter -n wasmcloud" or re-run ' +
+        `"di-framework platform deploy greeter --target development".; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+    });
+
+    const persistentFailDeps = fakeDeps({
+      cwd: greeter,
+      capturedStdout: { 'kubectl get': '{}' },
+    });
+    persistentFailDeps.wait = async () => undefined;
+    await expect(
+      applyWorkload(
+        { ...baseProject, persistentStorage: true },
+        connection,
+        'registry.example.com/team/greeter:1',
+        captureIo().io,
+        persistentFailDeps,
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_DEPLOYMENT_NOT_READY',
+      message: expect.stringContaining(
+        `check status with "kubectl get workloaddeployment greeter -n wasmcloud" or re-run "di-framework platform deploy greeter --target development".; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+      ),
+    });
+  });
+
+  it('covers remaining manifest, control secret, and lifecycle branches', async () => {
+    const { greeter } = makeWorkspace();
+    const project = loadProject(greeter);
+    const connection = {
+      target: 'development',
+      kubeconfig: '/tmp/kube',
+      namespace: 'wasmcloud',
+      registry: REGISTRY,
+    };
+
+    expect(() =>
+      renderWorkloadManifest(project, connection, 'img:1', undefined, [], {
+        hasPersistentStorage: true,
+        replicas: 2,
+      }),
+    ).toThrow('SQLite-backed workloads require replicas: 1');
+
+    expect(() =>
+      renderWorkloadManifest(
+        {
+          ...project,
+          pglite: {
+            image: `ghcr.io/di-framework/pglite@sha256:${'a'.repeat(64)}`,
+            dataDir: '/data/pglite',
+            storageMount: '/data',
+          },
+        },
+        connection,
+        'img:1',
+        undefined,
+        [],
+        { replicas: 2 },
+      ),
+    ).toThrow('PGlite workloads require replicas: 1');
+
+    expect(() =>
+      renderWorkloadManifest(
+        {
+          ...project,
+          pglite: {
+            image: `ghcr.io/di-framework/pglite@sha256:${'a'.repeat(64)}`,
+            dataDir: '/outside/pglite',
+            storageMount: '/data',
+          },
+        },
+        connection,
+        'img:1',
+      ),
+    ).toThrow('outside the storage mount');
+
+    expect(() =>
+      renderWorkloadManifest(
+        { ...project, persistentStorage: true },
+        { ...connection, hostgroup: 'tenant-acme' },
+        'img:1',
+        undefined,
+        [],
+        { storageVolume: { mountPath: '/custom' } },
+      ),
+    ).toThrow('Tenant storage mounts at');
+
+    const actorTenantYaml = renderWorkloadManifest(
+      {
+        ...project,
+        pglite: {
+          image: `ghcr.io/di-framework/pglite@sha256:${'a'.repeat(64)}`,
+          dataDir: '/data/actors/pglite',
+          storageMount: '/data/actors',
+        },
+      },
+      { ...connection, hostgroup: 'tenant-acme' },
+      'img:1',
+      undefined,
+      [],
+      true,
+      [
+        {
+          jobId: 'sync',
+          name: '',
+          kebabId: '',
+          schedule: '*/5 * * * *',
+          cronExpression: '*/5 * * * *',
+          className: 'SyncJob',
+          methodName: 'run',
+          filePath: 'src/cron.ts',
+          allowConcurrent: true,
+          timeoutMs: 10_000,
+        },
+      ],
+      [
+        {
+          className: 'Worker',
+          methodName: 'run',
+          queueName: 'mail',
+          filePath: 'src/worker.ts',
+          options: { concurrency: 2, maxRetries: 3, backoffMs: 1000, timeoutMs: 5000 },
+        },
+      ],
+    );
+    expect(actorTenantYaml).toContain('di-framework.dev/storage-mount: "/data/actors"');
+    expect(actorTenantYaml).toContain('di-framework.dev/exclusive-instance: "true"');
+    expect(actorTenantYaml).toContain('DI_QUEUE_MAIL_CONCURRENCY: "2"');
+    expect(actorTenantYaml).toContain('DI_QUEUE_MAIL_MAX_RETRIES: "3"');
+    expect(actorTenantYaml).toContain('DI_QUEUE_MAIL_BACKOFF_MS: "1000"');
+    expect(actorTenantYaml).toContain('DI_QUEUE_MAIL_TIMEOUT_MS: "5000"');
+    expect(actorTenantYaml).toContain('concurrencyPolicy: Allow');
+
+    const encode = (v: string) => Buffer.from(v, 'utf8').toString('base64');
+    const adminDeps = fakeDeps({ cwd: greeter });
+    adminDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+      if (args.includes('get')) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            metadata: { resourceVersion: '1' },
+            data: {
+              DI_CONTROL_TOKEN: encode('tok'),
+              DI_CONTROL_IDENTITY: encode('greeter'),
+              APP_KEY: encode('short'),
+              TINY: encode('ab'),
+            },
+          }),
+          stderr: '',
+        };
+      }
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const rotated = await writeControlSecret(
+      { ...project, controlSecretKeys: ['APP_KEY', 'TINY'] },
+      connection,
+      adminDeps,
+    );
+    expect(rotated.revision).toBeDefined();
+
+    await expect(writeControlSecret(project, connection, adminDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS',
+    });
+
+    const adminReplaceFailDeps = fakeDeps({ cwd: greeter });
+    adminReplaceFailDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+      if (args.includes('get')) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            metadata: {},
+            data: { TINY: encode('ab') },
+          }),
+          stderr: '',
+        };
+      }
+      return { exitCode: 1, stdout: '', stderr: 'Error from server (BadRequest): token ab failed' };
+    };
+    await expect(
+      writeControlSecret(
+        { ...project, controlSecretKeys: ['TINY'] },
+        connection,
+        adminReplaceFailDeps,
+      ),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_TOOL_FAILED',
+      message: expect.stringContaining('[redacted]'),
+    });
+
+    const adminGetFailDeps = fakeDeps({ cwd: greeter });
+    adminGetFailDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+      return { exitCode: 1, stdout: '', stderr: '' };
+    };
+    await expect(writeControlSecret(project, connection, adminGetFailDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_TOOL_FAILED',
+    });
+
+    const adminBadJsonDeps = fakeDeps({ cwd: greeter });
+    adminBadJsonDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+      return { exitCode: 0, stdout: '{', stderr: '' };
+    };
+    await expect(writeControlSecret(project, connection, adminBadJsonDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_TOOL_FAILED',
+    });
+
+    const adminNonStringDeps = fakeDeps({ cwd: greeter });
+    adminNonStringDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 0, stdout: 'yes\n', stderr: '' };
+      return { exitCode: 0, stdout: JSON.stringify({ data: { BAD: 123 } }), stderr: '' };
+    };
+    await expect(writeControlSecret(project, connection, adminNonStringDeps)).rejects.toMatchObject(
+      { code: 'WASMCLOUD_TOOL_FAILED' },
+    );
+
+    const createFailDeps = fakeDeps({ cwd: greeter });
+    createFailDeps.runCaptured = async () => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Error from server (Forbidden): forbidden',
+    });
+    await expect(writeControlSecret(project, connection, createFailDeps)).rejects.toMatchObject({
+      code: 'WASMCLOUD_TOOL_FAILED',
+    });
+
+    const unguardedDeps = fakeDeps({ cwd: greeter });
+    unguardedDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    await expect(
+      writeControlSecret({ ...project, controlSecretKeys: ['APP_KEY'] }, connection, unguardedDeps),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_CONTROL_SECRET_UNGUARDED' });
+
+    let dryRunStep = 0;
+    const keptSecretDeps = fakeDeps({ cwd: greeter });
+    keptSecretDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      if (args.some((a) => a.includes('dryRun=All'))) {
+        dryRunStep += 1;
+        if (dryRunStep === 2) return { exitCode: 0, stdout: '', stderr: '' };
+        return { exitCode: 1, stdout: '', stderr: SECRET_UPDATE_KEYS_MESSAGE };
+      }
+      if (args.includes('replace')) {
+        return { exitCode: 1, stdout: '', stderr: SECRET_UPDATE_KEYS_MESSAGE };
+      }
+      if (args.includes('--ignore-not-found')) {
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      return { exitCode: 0, stdout: READY_WORKLOAD_JSON, stderr: '' };
+    };
+    keptSecretDeps.wait = async () => undefined;
+    const keptIo = captureIo();
+    await applyWorkload(
+      {
+        ...project,
+        controlSecretKeys: ['APP_KEY'],
+        allowedIpNameLookups: ['api.example.com'],
+        workloadEntry: {
+          kind: 'service',
+          exportName: 'collect',
+          path: '/collect',
+          subscriptions: ['events'],
+        },
+      },
+      { ...connection, hostgroup: 'tenant-acme' },
+      'img:1',
+      keptIo.io,
+      keptSecretDeps,
+    );
+    expect(keptIo.stdout.join('')).toContain('Kept control Secret');
+
+    let incompleteStep = 0;
+    const incompleteDeps = fakeDeps({ cwd: greeter });
+    incompleteDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      if (args.some((a) => a.includes('dryRun=All'))) {
+        incompleteStep += 1;
+        if (incompleteStep >= 2) return { exitCode: 0, stdout: '', stderr: '' };
+        return { exitCode: 1, stdout: '', stderr: SECRET_UPDATE_KEYS_MESSAGE };
+      }
+      return { exitCode: 1, stdout: '', stderr: SECRET_UPDATE_KEYS_MESSAGE };
+    };
+    await expect(
+      writeControlSecret(
+        { ...project, controlSecretKeys: ['APP_KEY'] },
+        connection,
+        incompleteDeps,
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_CONTROL_SECRET_INCOMPLETE' });
+
+    const foreignDryRunDeps = fakeDeps({ cwd: greeter });
+    foreignDryRunDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      return { exitCode: 1, stdout: '', stderr: SECRET_UPDATE_KEYS_MESSAGE };
+    };
+    await expect(
+      writeControlSecret(
+        { ...project, controlSecretKeys: ['APP_KEY'] },
+        connection,
+        foreignDryRunDeps,
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_CONTROL_SECRET_FOREIGN_KEYS' });
+
+    const dryRunErrorDeps = fakeDeps({ cwd: greeter });
+    dryRunErrorDeps.runCaptured = async (_cmd, args) => {
+      if (args.includes('create'))
+        return { exitCode: 1, stdout: '', stderr: 'Error from server (AlreadyExists): exists' };
+      if (args.includes('can-i')) return { exitCode: 1, stdout: 'no\n', stderr: '' };
+      return { exitCode: 1, stdout: '', stderr: 'Error from server (InternalError): boom' };
+    };
+    await expect(
+      writeControlSecret(
+        { ...project, controlSecretKeys: ['APP_KEY'] },
+        connection,
+        dryRunErrorDeps,
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_TOOL_FAILED' });
+
+    await applyWorkload(
+      { ...project, ingress: false },
+      connection,
+      'img:1',
+      captureIo().io,
+      fakeDeps({ cwd: greeter, capturedStdout: { 'kubectl get': READY_WORKLOAD_JSON } }),
+    );
+    await expect(
+      applyWorkload(
+        { ...project, ingress: false },
+        connection,
+        'img:1',
+        captureIo().io,
+        fakeDeps({ cwd: greeter, exitCodes: { 'kubectl apply': 1 } }),
+      ),
+    ).rejects.toMatchObject({ code: 'WASMCLOUD_TOOL_FAILED' });
+
+    await deleteWorkload(project, connection, captureIo().io, fakeDeps({ cwd: greeter }));
   });
 });

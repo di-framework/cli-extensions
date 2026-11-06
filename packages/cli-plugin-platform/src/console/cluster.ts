@@ -51,6 +51,8 @@ export type BindInput = {
   capability: string;
 };
 
+export type ProjectionEnvironment = 'prod' | 'staging';
+
 export type ConsoleCluster = {
   listWorkloads(connection: ClusterConnection): Promise<WorkloadDocument[]>;
   listBindings(connection: ClusterConnection): Promise<BindingDocument[]>;
@@ -61,8 +63,16 @@ export type ConsoleCluster = {
   ): Promise<void>;
   reassignSecret(connection: ClusterConnection, name: string, value: string): Promise<void>;
   canWrite(connection: ClusterConnection): Promise<boolean>;
-  readLogs(connection: ClusterConnection, application: string): Promise<string[] | undefined>;
-  readSignals(connection: ClusterConnection, application: string): Promise<SignalView | undefined>;
+  readLogs(
+    connection: ClusterConnection,
+    application: string,
+    env?: ProjectionEnvironment,
+  ): Promise<string[] | undefined>;
+  readSignals(
+    connection: ClusterConnection,
+    application: string,
+    env?: ProjectionEnvironment,
+  ): Promise<SignalView | undefined>;
   /** `data.urlTemplate` of the tenant's `di-platform-routes` ConfigMap, if the platform has one. */
   readRouteTemplate(connection: ClusterConnection): Promise<string | undefined>;
   /** Host failures by WorkloadDeployment name, from every logs projection in the namespace. */
@@ -70,6 +80,16 @@ export type ConsoleCluster = {
   bindService(connection: ClusterConnection, input: BindInput): Promise<void>;
   unbindService(connection: ClusterConnection, workload: string, binding: string): Promise<void>;
 };
+
+export function projectionSelector(
+  projection: 'logs' | 'signals',
+  application: string,
+  env?: ProjectionEnvironment,
+): string {
+  const envSelector =
+    env === undefined ? '!platform.di-framework.dev/env' : `platform.di-framework.dev/env=${env}`;
+  return `di-framework.dev/projection=${projection},di-framework.dev/application=${application},${envSelector}`;
+}
 
 export function createKubectlConsoleCluster(
   deps: WasmcloudDeps,
@@ -136,12 +156,13 @@ export function createKubectlConsoleCluster(
       const directory = mkdtempSync(join(tmpdir(), 'di-console-secret-'));
       try {
         const path = join(directory, 'secret.json');
+        const encoded = Buffer.from(value, 'utf8').toString('base64');
         const document = {
           apiVersion: 'v1',
           kind: 'Secret',
           metadata: { name, namespace: connection.namespace },
           type: 'Opaque',
-          data: { credential: Buffer.from(value, 'utf8').toString('base64') },
+          data: { credential: encoded },
         };
         writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
         const uri = `/api/v1/namespaces/${encodeURIComponent(connection.namespace)}/secrets/${encodeURIComponent(name)}`;
@@ -151,53 +172,15 @@ export function createKubectlConsoleCluster(
           ['replace', '--raw', uri, '-f', path],
           deps.cwd(),
         );
-        const reason = result.exitCode === 0 ? undefined : kubectlStatusReason(result.stderr);
-        if (reason === 'NotFound') {
-          log(sanitizePublicText(result.stderr));
-          throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
-        }
-        if (result.exitCode !== 0 && result.stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
-          log(sanitizePublicText(result.stderr));
-          throw new ConsoleError(
-            409,
-            'SECRET_NOT_SINGLE_KEY',
-            `${name} holds values other than a single credential, so it cannot be reassigned here.`,
-          );
-        }
-        if (
-          result.exitCode !== 0 &&
-          MANAGED_SECRET_DENIALS.some((message) => result.stderr.includes(message))
-        ) {
-          log(sanitizePublicText(result.stderr));
-          throw new ConsoleError(
-            403,
-            'SECRET_MANAGED',
-            `${name} is managed by the platform and cannot be reassigned.`,
-          );
-        }
-        // A Secret's type is immutable, so a non-Opaque Secret cannot take the Opaque document.
-        if (
-          reason === 'Invalid' &&
-          /\btype: Invalid value:.*field is immutable/.test(result.stderr)
-        ) {
-          log(sanitizePublicText(result.stderr));
-          throw new ConsoleError(
-            409,
-            'SECRET_TYPE_MISMATCH',
-            `${name} is not a plain (Opaque) Secret and its type cannot change, so it cannot be reassigned here.`,
-          );
-        }
-        if (reason === 'Forbidden') {
-          log(sanitizePublicText(result.stderr));
-          throw new ConsoleError(
-            403,
-            'WRITES_FORBIDDEN',
-            'This credential cannot change the application.',
-          );
-        }
         if (result.exitCode !== 0) {
-          log(sanitizePublicText(result.stderr || result.stdout || 'request failed'));
-          throw new ConsoleError(502, 'REQUEST_FAILED', 'The credential could not be reassigned.');
+          const scrub = (text: string) =>
+            [value, encoded]
+              .filter((secret) => secret.length > 0)
+              .sort((a, b) => b.length - a.length)
+              .reduce((current, secret) => current.split(secret).join('[redacted]'), text);
+          classifySecretError(name, result.stderr, (raw = result.stderr) =>
+            log(sanitizePublicText(scrub(raw || result.stdout || 'request failed'))),
+          );
         }
       } finally {
         rmSync(directory, { recursive: true, force: true });
@@ -216,25 +199,41 @@ export function createKubectlConsoleCluster(
       }
       return result.stdout.trim() === 'yes';
     },
-    async readLogs(connection, application) {
-      return readProjection(deps, connection, application, 'logs', log, (data) => {
-        const raw = data.lines ?? data.log;
-        if (typeof raw !== 'string') return undefined;
-        const lines = raw
-          .split('\n')
-          .slice(0, 200)
-          .map((line) => sanitizePublicText(line, 500));
-        return lines;
-      });
+    async readLogs(connection, application, env) {
+      return readProjection(
+        deps,
+        connection,
+        application,
+        'logs',
+        log,
+        (data) => {
+          const raw = data.lines ?? data.log;
+          if (typeof raw !== 'string') return undefined;
+          const lines = raw
+            .split('\n')
+            .slice(0, 200)
+            .map((line) => sanitizePublicText(line, 500));
+          return lines;
+        },
+        env,
+      );
     },
-    async readSignals(connection, application) {
-      return readProjection(deps, connection, application, 'signals', log, (data) => {
-        const success = whole(data.success);
-        const error = whole(data.error);
-        if (success === undefined || error === undefined) return undefined;
-        const compute = series(data.compute);
-        return { success, error, ...(compute ? { compute } : {}) };
-      });
+    async readSignals(connection, application, env) {
+      return readProjection(
+        deps,
+        connection,
+        application,
+        'signals',
+        log,
+        (data) => {
+          const success = whole(data.success);
+          const error = whole(data.error);
+          if (success === undefined || error === undefined) return undefined;
+          const compute = series(data.compute);
+          return { success, error, ...(compute ? { compute } : {}) };
+        },
+        env,
+      );
     },
     async readRouteTemplate(connection) {
       const result = await captureKubectl(
@@ -358,6 +357,44 @@ export function createKubectlConsoleCluster(
   };
 }
 
+function classifySecretError(name: string, stderr: string, logFailure: () => void): never {
+  const reason = kubectlStatusReason(stderr);
+  logFailure();
+  if (reason === 'NotFound') {
+    throw new ConsoleError(404, 'SECRET_NOT_FOUND', `No credential named ${name}.`);
+  }
+  if (stderr.includes(SECRET_UPDATE_KEYS_MESSAGE)) {
+    throw new ConsoleError(
+      409,
+      'SECRET_NOT_SINGLE_KEY',
+      `${name} holds values other than a single credential, so it cannot be reassigned here.`,
+    );
+  }
+  if (MANAGED_SECRET_DENIALS.some((message) => stderr.includes(message))) {
+    throw new ConsoleError(
+      403,
+      'SECRET_MANAGED',
+      `${name} is managed by the platform and cannot be reassigned.`,
+    );
+  }
+  // A Secret's type is immutable, so a non-Opaque Secret cannot take the Opaque document.
+  if (reason === 'Invalid' && /\btype: Invalid value:.*field is immutable/.test(stderr)) {
+    throw new ConsoleError(
+      409,
+      'SECRET_TYPE_MISMATCH',
+      `${name} is not a plain (Opaque) Secret and its type cannot change, so it cannot be reassigned here.`,
+    );
+  }
+  if (reason === 'Forbidden') {
+    throw new ConsoleError(
+      403,
+      'WRITES_FORBIDDEN',
+      'This credential cannot change the application.',
+    );
+  }
+  throw new ConsoleError(502, 'REQUEST_FAILED', 'The credential could not be reassigned.');
+}
+
 async function readProjection<T>(
   deps: WasmcloudDeps,
   connection: ClusterConnection,
@@ -365,18 +402,12 @@ async function readProjection<T>(
   projection: 'logs' | 'signals',
   log: (line: string) => void,
   parse: (data: Record<string, string>) => T | undefined,
+  env?: ProjectionEnvironment,
 ): Promise<T | undefined> {
   const result = await captureKubectl(
     deps,
     connection,
-    [
-      'get',
-      'configmap',
-      '-l',
-      `di-framework.dev/projection=${projection},di-framework.dev/application=${application}`,
-      '-o',
-      'json',
-    ],
+    ['get', 'configmap', '-l', projectionSelector(projection, application, env), '-o', 'json'],
     deps.cwd(),
   );
   if (result.exitCode !== 0) {
