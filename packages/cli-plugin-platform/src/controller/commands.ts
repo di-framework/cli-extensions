@@ -5,6 +5,7 @@ import {
   type CommandResult,
   type JsonValue,
 } from '@di-framework/cli-extension';
+import { readEnvFlag, readStringFlag } from '../args';
 import { DEFAULT_DEPS, type WasmcloudDeps } from '../deps';
 import {
   type AccountTarget,
@@ -18,7 +19,7 @@ import { loadProject } from '../project';
 import { invalidUsage, matchOption } from '../support';
 import { discoverAccountControllerUrl, isControllerBackedTarget, resolveTarget } from '../target';
 import { deploymentResourceName } from '../workload';
-import { type ControllerError, createClient, type LogEvent } from './client';
+import { type ControllerError, createClient, type LogEvent, type TenantClient } from './client';
 import {
   bearer,
   CliError,
@@ -29,6 +30,7 @@ import {
   readStore,
   resolveAccount,
   resolveControllerSession,
+  resolveControllerTargetCredential,
   writeStore,
 } from './credentials';
 import {
@@ -199,63 +201,37 @@ export type LoginOptions = {
   noBrowser: boolean;
 };
 
+const LOGIN_STRING_FLAGS = {
+  '--target': 'target',
+  '--controller': 'controller',
+  '--account': 'account',
+  '--api-key': 'apiKey',
+  '--ca-file': 'caFile',
+} as const;
+
 export function parseLoginArgs(args: readonly string[]): LoginOptions {
-  let target: string | undefined;
-  let controller: string | undefined;
-  let account: string | undefined;
-  let apiKey: string | undefined;
-  let caFile: string | undefined;
+  const values: Partial<
+    Record<(typeof LOGIN_STRING_FLAGS)[keyof typeof LOGIN_STRING_FLAGS], string>
+  > = {};
   let noCa = false;
   let noBrowser = false;
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
-      continue;
-    }
-    const controllerOpt = matchOption(args, position, token, '--controller');
-    if (controllerOpt) {
-      if (controller !== undefined)
-        invalidUsage('Option may be provided only once: --controller', '--controller');
-      controller = controllerOpt.value;
-      position = controllerOpt.consumedThrough;
-      continue;
-    }
-    const accountOpt = matchOption(args, position, token, '--account');
-    if (accountOpt) {
-      if (account !== undefined)
-        invalidUsage('Option may be provided only once: --account', '--account');
-      account = accountOpt.value;
-      position = accountOpt.consumedThrough;
-      continue;
-    }
-    const apiKeyOpt = matchOption(args, position, token, '--api-key');
-    if (apiKeyOpt) {
-      if (apiKey !== undefined)
-        invalidUsage('Option may be provided only once: --api-key', '--api-key');
-      apiKey = apiKeyOpt.value;
-      position = apiKeyOpt.consumedThrough;
-      continue;
-    }
-    const caFileOpt = matchOption(args, position, token, '--ca-file');
-    if (caFileOpt) {
-      if (caFile !== undefined)
-        invalidUsage('Option may be provided only once: --ca-file', '--ca-file');
-      caFile = caFileOpt.value;
-      position = caFileOpt.consumedThrough;
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, LOGIN_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
       continue;
     }
     if (token === '--no-ca') {
       noCa = true;
+      position += 1;
       continue;
     }
     if (token === '--no-browser') {
       noBrowser = true;
+      position += 1;
       continue;
     }
     invalidUsage(
@@ -265,19 +241,50 @@ export function parseLoginArgs(args: readonly string[]): LoginOptions {
     );
   }
 
-  if (caFile !== undefined && noCa) {
+  if (values.caFile !== undefined && noCa) {
     invalidUsage('--ca-file and --no-ca are exclusive', '--no-ca', { command: 'platform login' });
   }
 
   return {
-    ...(target ? { target } : {}),
-    ...(controller ? { controller } : {}),
-    ...(account ? { account } : {}),
-    ...(apiKey ? { apiKey } : {}),
-    ...(caFile ? { caFile } : {}),
+    ...values,
     noCa,
     noBrowser,
   };
+}
+
+function resolveLoginEndpoint(
+  options: LoginOptions,
+  target: AccountTarget | ControllerTarget | undefined,
+  store: CredentialStore,
+  env: Record<string, string | undefined>,
+): { account?: string; controller: string } {
+  let account = options.account;
+  let rawController = options.controller;
+  if (target?.kind === 'account') {
+    account = account ?? target.account;
+    const defaultUrl =
+      store[account]?.controller.url ?? discoverAccountControllerUrl(account, undefined, env);
+    const targetUrl = target.domain
+      ? discoverAccountControllerUrl(account, target.domain, env)
+      : defaultUrl;
+    rawController = rawController ?? targetUrl;
+  } else if (target?.kind === 'controller') {
+    account = account ?? target.account;
+    rawController = rawController ?? target.controller;
+  } else if (rawController === undefined && account !== undefined) {
+    rawController =
+      store[account]?.controller.url ?? discoverAccountControllerUrl(account, undefined, env);
+  }
+
+  if (rawController === undefined) {
+    invalidUsage(
+      'Missing required --controller <url> or --target <name> for platform login',
+      '--controller',
+      { command: 'platform login' },
+    );
+  }
+
+  return { account, controller: rawController.replace(/\/$/, '') };
 }
 
 export async function runWasmcloudLogin(
@@ -289,36 +296,8 @@ export async function runWasmcloudLogin(
   try {
     const store = readStore(deps.env);
     const { target } = resolveOptionalControllerTarget(options.target, deps, 'platform login');
+    const { account, controller } = resolveLoginEndpoint(options, target, store, deps.env);
 
-    let account = options.account;
-    let rawController = options.controller;
-    if (target?.kind === 'account') {
-      account = account ?? target.account;
-      const defaultUrl =
-        store[account]?.controller.url ??
-        discoverAccountControllerUrl(account, undefined, deps.env);
-      const targetUrl = target.domain
-        ? discoverAccountControllerUrl(account, target.domain, deps.env)
-        : defaultUrl;
-      rawController = rawController ?? targetUrl;
-    } else if (target?.kind === 'controller') {
-      account = account ?? target.account;
-      rawController = rawController ?? target.controller;
-    } else if (rawController === undefined && account !== undefined) {
-      rawController =
-        store[account]?.controller.url ??
-        discoverAccountControllerUrl(account, undefined, deps.env);
-    }
-
-    if (rawController === undefined) {
-      invalidUsage(
-        'Missing required --controller <url> or --target <name> for platform login',
-        '--controller',
-        { command: 'platform login' },
-      );
-    }
-
-    const controller = rawController.replace(/\/$/, '');
     const certificateAuthorityData = options.caFile
       ? readCaFile(options.caFile)
       : storedCa(store, controller, options.noCa);
@@ -376,29 +355,23 @@ export type AccountCommandOptions = {
   account?: string;
 };
 
+const ACCOUNT_STRING_FLAGS = {
+  '--target': 'target',
+  '--account': 'account',
+} as const;
+
 export function parseAccountCommandArgs(
   args: readonly string[],
   command: string,
 ): AccountCommandOptions {
-  let target: string | undefined;
-  let account: string | undefined;
+  const values: AccountCommandOptions = {};
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
-      continue;
-    }
-    const accountOpt = matchOption(args, position, token, '--account');
-    if (accountOpt) {
-      if (account !== undefined)
-        invalidUsage('Option may be provided only once: --account', '--account');
-      account = accountOpt.value;
-      position = accountOpt.consumedThrough;
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, ACCOUNT_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
       continue;
     }
     invalidUsage(
@@ -408,10 +381,22 @@ export function parseAccountCommandArgs(
     );
   }
 
-  return {
-    ...(target ? { target } : {}),
-    ...(account ? { account } : {}),
-  };
+  return values;
+}
+
+function resolveLogoutCredential(
+  options: AccountCommandOptions,
+  target: AccountTarget | ControllerTarget | undefined,
+  store: CredentialStore,
+  env: Record<string, string | undefined>,
+): Credential {
+  if (target?.kind === 'controller') {
+    return resolveControllerTargetCredential(target, options.account, store);
+  }
+  const account =
+    options.account ??
+    (target?.kind === 'account' ? target.account : resolveAccount(undefined, env, store));
+  return load(account, env);
 }
 
 export async function runWasmcloudLogout(
@@ -423,26 +408,9 @@ export async function runWasmcloudLogout(
   try {
     const store = readStore(deps.env);
     const { target } = resolveOptionalControllerTarget(options.target, deps, 'platform logout');
-    let account: string;
-    if (options.account !== undefined) {
-      account = options.account;
-    } else if (target?.kind === 'account') {
-      account = target.account;
-    } else if (target?.kind === 'controller') {
-      if (target.account !== undefined) {
-        account = target.account;
-      } else {
-        const matched = Object.values(store).find(
-          (entry) =>
-            entry.controller.url.replace(/\/$/, '') === target.controller.replace(/\/$/, ''),
-        );
-        account = matched ? matched.account : resolveAccount(undefined, deps.env, store);
-      }
-    } else {
-      account = resolveAccount(undefined, deps.env, store);
-    }
+    const credential = resolveLogoutCredential(options, target, store, deps.env);
+    const account = credential.account;
 
-    const credential = load(account, deps.env);
     try {
       await createClient({
         baseUrl: credential.controller.url,
@@ -517,65 +485,34 @@ export type LogsCommandOptions = {
   tail?: number;
 };
 
+const LOGS_STRING_FLAGS = {
+  '--service': 'service',
+  '--target': 'target',
+  '--account': 'account',
+  '--deployment': 'deployment',
+  '--since': 'since',
+} as const;
+
 export function parseLogsArgs(args: readonly string[]): LogsCommandOptions {
-  let service: string | undefined;
-  let target: string | undefined;
-  let account: string | undefined;
+  const values: Partial<
+    Record<(typeof LOGS_STRING_FLAGS)[keyof typeof LOGS_STRING_FLAGS], string>
+  > = {};
   let env: DeployEnvironment | undefined;
-  let deployment: string | undefined;
   let follow = false;
-  let since: string | undefined;
   let tail: number | undefined;
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const serviceOpt = matchOption(args, position, token, '--service');
-    if (serviceOpt) {
-      if (service !== undefined)
-        invalidUsage('Option may be provided only once: --service', '--service');
-      service = serviceOpt.value;
-      position = serviceOpt.consumedThrough;
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, LOGS_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
       continue;
     }
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
-      continue;
-    }
-    const accountOpt = matchOption(args, position, token, '--account');
-    if (accountOpt) {
-      if (account !== undefined)
-        invalidUsage('Option may be provided only once: --account', '--account');
-      account = accountOpt.value;
-      position = accountOpt.consumedThrough;
-      continue;
-    }
-    const envOpt = matchOption(args, position, token, '--env');
+    const envOpt = readEnvFlag(args, position, token, env, 'platform logs');
     if (envOpt) {
-      if (env !== undefined) invalidUsage('Option may be provided only once: --env', '--env');
-      if (envOpt.value !== 'prod' && envOpt.value !== 'staging') {
-        invalidUsage('--env must be prod or staging', envOpt.value, { command: 'platform logs' });
-      }
       env = envOpt.value;
-      position = envOpt.consumedThrough;
-      continue;
-    }
-    const deploymentOpt = matchOption(args, position, token, '--deployment');
-    if (deploymentOpt) {
-      if (deployment !== undefined)
-        invalidUsage('Option may be provided only once: --deployment', '--deployment');
-      deployment = deploymentOpt.value;
-      position = deploymentOpt.consumedThrough;
-      continue;
-    }
-    const sinceOpt = matchOption(args, position, token, '--since');
-    if (sinceOpt) {
-      if (since !== undefined) invalidUsage('Option may be provided only once: --since', '--since');
-      since = sinceOpt.value;
-      position = sinceOpt.consumedThrough;
+      position = envOpt.nextPosition;
       continue;
     }
     const tailOpt = matchOption(args, position, token, '--tail');
@@ -586,30 +523,28 @@ export function parseLogsArgs(args: readonly string[]): LogsCommandOptions {
         invalidUsage('--tail must be a whole number', tailOpt.value, { command: 'platform logs' });
       }
       tail = parsed;
-      position = tailOpt.consumedThrough;
+      position = tailOpt.consumedThrough + 1;
       continue;
     }
     if (token === '--follow') {
       follow = true;
+      position += 1;
       continue;
     }
     if (token.startsWith('--')) {
       invalidUsage(`Unknown option: ${token}`, token, { command: 'platform logs' });
     }
-    if (service !== undefined) {
+    if (values.service !== undefined) {
       invalidUsage(`Unexpected argument: ${token}`, token, { command: 'platform logs' });
     }
-    service = token;
+    values.service = token;
+    position += 1;
   }
 
   return {
-    ...(service ? { service } : {}),
-    ...(target ? { target } : {}),
-    ...(account ? { account } : {}),
+    ...values,
     ...(env ? { env } : {}),
-    ...(deployment ? { deployment } : {}),
     follow,
-    ...(since ? { since } : {}),
     ...(tail !== undefined ? { tail } : {}),
   };
 }
@@ -681,74 +616,21 @@ export type ConfigCommandOptions = {
   value?: string;
 };
 
-export function parseConfigArgs(args: readonly string[], command: string): ConfigCommandOptions {
-  let action: ConfigAction | undefined;
-  let name: string | undefined;
-  let target: string | undefined;
-  let account: string | undefined;
-  let env: DeployEnvironment | undefined;
-  let fromFile: string | undefined;
-  let value: string | undefined;
+const CONFIG_STRING_FLAGS = {
+  '--target': 'target',
+  '--account': 'account',
+  '--from-file': 'fromFile',
+  '--value': 'value',
+} as const;
 
-  for (let position = 0; position < args.length; position++) {
-    const token = args[position] ?? '';
-    const targetOpt = matchOption(args, position, token, '--target');
-    if (targetOpt) {
-      if (target !== undefined)
-        invalidUsage('Option may be provided only once: --target', '--target');
-      target = targetOpt.value;
-      position = targetOpt.consumedThrough;
-      continue;
-    }
-    const accountOpt = matchOption(args, position, token, '--account');
-    if (accountOpt) {
-      if (account !== undefined)
-        invalidUsage('Option may be provided only once: --account', '--account');
-      account = accountOpt.value;
-      position = accountOpt.consumedThrough;
-      continue;
-    }
-    const envOpt = matchOption(args, position, token, '--env');
-    if (envOpt) {
-      if (env !== undefined) invalidUsage('Option may be provided only once: --env', '--env');
-      if (envOpt.value !== 'prod' && envOpt.value !== 'staging') {
-        invalidUsage('--env must be prod or staging', envOpt.value, { command });
-      }
-      env = envOpt.value;
-      position = envOpt.consumedThrough;
-      continue;
-    }
-    const fromFileOpt = matchOption(args, position, token, '--from-file');
-    if (fromFileOpt) {
-      if (fromFile !== undefined)
-        invalidUsage('Option may be provided only once: --from-file', '--from-file');
-      fromFile = fromFileOpt.value;
-      position = fromFileOpt.consumedThrough;
-      continue;
-    }
-    const valueOpt = matchOption(args, position, token, '--value');
-    if (valueOpt) {
-      if (value !== undefined) invalidUsage('Option may be provided only once: --value', '--value');
-      value = valueOpt.value;
-      position = valueOpt.consumedThrough;
-      continue;
-    }
-    if (token.startsWith('--')) {
-      invalidUsage(`Unknown option: ${token}`, token, { command });
-    }
-    if (action === undefined) {
-      if (token !== 'list' && token !== 'set' && token !== 'update' && token !== 'unset') {
-        invalidUsage(`Usage: ${command} <list|set|update|unset> [name]`, token, { command });
-      }
-      action = token;
-      continue;
-    }
-    if (name !== undefined) {
-      invalidUsage(`Unexpected argument: ${token}`, token, { command });
-    }
-    name = token;
-  }
+const CONFIG_ACTIONS = new Set<string>(['list', 'set', 'update', 'unset']);
 
+function validateConfigOptions(
+  action: ConfigAction | undefined,
+  name: string | undefined,
+  values: { fromFile?: string; value?: string },
+  command: string,
+): ConfigAction {
   if (action === undefined) {
     invalidUsage(`Usage: ${command} <list|set|update|unset> [name]`, command, { command });
   }
@@ -758,27 +640,70 @@ export function parseConfigArgs(args: readonly string[], command: string): Confi
   if (action !== 'list' && name === undefined) {
     invalidUsage(`Missing required <name> for ${command} ${action}`, action, { command });
   }
-  if (fromFile !== undefined && value !== undefined) {
+  if (values.fromFile !== undefined && values.value !== undefined) {
     invalidUsage('--from-file and --value are exclusive', '--value', { command });
   }
-  if ((action === 'set' || action === 'update') && fromFile === undefined && value === undefined) {
+  if (
+    (action === 'set' || action === 'update') &&
+    values.fromFile === undefined &&
+    values.value === undefined
+  ) {
     invalidUsage(
       `Missing required --from-file <path|-> or --value for ${command} ${action}`,
       '--from-file',
-      {
-        command,
-      },
+      { command },
     );
   }
+  return action;
+}
+
+export function parseConfigArgs(args: readonly string[], command: string): ConfigCommandOptions {
+  let action: ConfigAction | undefined;
+  let name: string | undefined;
+  const values: Partial<
+    Record<(typeof CONFIG_STRING_FLAGS)[keyof typeof CONFIG_STRING_FLAGS], string>
+  > = {};
+  let env: DeployEnvironment | undefined;
+
+  let position = 0;
+  while (position < args.length) {
+    const token = args[position] as string;
+    const nextPos = readStringFlag(args, position, token, CONFIG_STRING_FLAGS, values);
+    if (nextPos !== undefined) {
+      position = nextPos;
+      continue;
+    }
+    const envOpt = readEnvFlag(args, position, token, env, command);
+    if (envOpt) {
+      env = envOpt.value;
+      position = envOpt.nextPosition;
+      continue;
+    }
+    if (token.startsWith('--')) {
+      invalidUsage(`Unknown option: ${token}`, token, { command });
+    }
+    if (action === undefined) {
+      if (!CONFIG_ACTIONS.has(token)) {
+        invalidUsage(`Usage: ${command} <list|set|update|unset> [name]`, token, { command });
+      }
+      action = token as ConfigAction;
+      position += 1;
+      continue;
+    }
+    if (name !== undefined) {
+      invalidUsage(`Unexpected argument: ${token}`, token, { command });
+    }
+    name = token;
+    position += 1;
+  }
+
+  const validAction = validateConfigOptions(action, name, values, command);
 
   return {
-    action,
+    action: validAction,
     ...(name ? { name } : {}),
-    ...(target ? { target } : {}),
-    ...(account ? { account } : {}),
+    ...values,
     ...(env ? { env } : {}),
-    ...(fromFile ? { fromFile } : {}),
-    ...(value !== undefined ? { value } : {}),
   };
 }
 
@@ -787,6 +712,48 @@ function readConfigValue(options: ConfigCommandOptions, deps: WasmcloudDeps): st
   const source = options.fromFile as string;
   const raw = source === '-' ? (deps.stdin?.() ?? '') : readFileSync(source, 'utf8');
   return raw.replace(/\r?\n$/, '');
+}
+
+async function listConfigItems(
+  kind: 'secrets' | 'vars',
+  env: DeployEnvironment,
+  account: string,
+  client: TenantClient,
+): Promise<CommandResult> {
+  const isSecret = kind === 'secrets';
+  const list = isSecret ? await client.secrets(env) : await client.vars(env);
+  const formatEntry = (entry: { name: string; value?: string }) =>
+    isSecret ? entry.name : `${entry.name}=${entry.value ?? ''}`;
+  const text =
+    list.items.length === 0 ? `no ${kind} in ${env}` : list.items.map(formatEntry).join('\n');
+  return {
+    data: { env, account, items: list.items as unknown as JsonValue },
+    text,
+  };
+}
+
+async function unsetConfigItem(
+  kind: 'secrets' | 'vars',
+  name: string,
+  env: DeployEnvironment,
+  account: string,
+  client: TenantClient,
+  io: CliIo,
+): Promise<CommandResult> {
+  if (kind === 'secrets') {
+    await client.unsetSecret(env, name);
+    const text = `unset secret ${name} in ${env}`;
+    io.stderr.write(`${text}\n`);
+    return { data: { action: 'unset', name, env, account }, text };
+  }
+  const result = await client.unsetVar(env, name);
+  for (const warning of result.warnings) {
+    io.stderr.write(`warning: ${warning.detail}\n`);
+  }
+  const text = `unset var ${name} in ${env}`;
+  io.stderr.write(`${text}\n`);
+  const warnings = result.warnings as unknown as JsonValue;
+  return { data: { action: 'unset', name, env, account, warnings }, text };
 }
 
 async function runConfigCommand(
@@ -808,33 +775,12 @@ async function runConfigCommand(
     );
 
     if (options.action === 'list') {
-      const list = isSecret ? await client.secrets(env) : await client.vars(env);
-      const formatEntry = (entry: { name: string; value?: string }) =>
-        isSecret ? entry.name : `${entry.name}=${entry.value ?? ''}`;
-      const text =
-        list.items.length === 0 ? `no ${kind} in ${env}` : list.items.map(formatEntry).join('\n');
-      return {
-        data: { env, account: credential.account, items: list.items as unknown as JsonValue },
-        text,
-      };
+      return await listConfigItems(kind, env, credential.account, client);
     }
 
     const name = options.name as string;
     if (options.action === 'unset') {
-      if (isSecret) {
-        await client.unsetSecret(env, name);
-        const text = `unset secret ${name} in ${env}`;
-        io.stderr.write(`${text}\n`);
-        return { data: { action: 'unset', name, env, account: credential.account }, text };
-      }
-      const result = await client.unsetVar(env, name);
-      for (const warning of result.warnings) {
-        io.stderr.write(`warning: ${warning.detail}\n`);
-      }
-      const text = `unset var ${name} in ${env}`;
-      io.stderr.write(`${text}\n`);
-      const warnings = result.warnings as unknown as JsonValue;
-      return { data: { action: 'unset', name, env, account: credential.account, warnings }, text };
+      return await unsetConfigItem(kind, name, env, credential.account, client, io);
     }
 
     const value = readConfigValue(options, deps);

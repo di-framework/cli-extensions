@@ -56,6 +56,7 @@ import {
   parseServiceNameArgs,
   runWasmcloudServiceCreate,
   runWasmcloudServiceDelete,
+  summarizeService,
 } from '../src/service';
 import {
   discoverAccountControllerUrl,
@@ -157,6 +158,8 @@ platform = "deploy/platform"
     const acct = resolveTarget(manifest, 'acct');
     const ctrl = resolveTarget(manifest, 'ctrl');
     const local = resolveTarget(manifest, 'local');
+    expect(() => resolveTarget(manifest)).toThrow('No deployment target selected');
+    expect(() => resolveTarget(manifest, 'missing')).toThrow('Unknown target "missing"');
 
     expect(isControllerBackedTarget(acct)).toBe(true);
     expect(isControllerBackedTarget(ctrl)).toBe(true);
@@ -749,18 +752,35 @@ describe('OIDC, trust, registry, and credential helpers', () => {
     );
     expect(ctrlMatchedSession.credential.account).toBe('acme');
 
-    const ctrlFallbackSession = await resolveControllerSession(
-      {
-        target: {
-          kind: 'controller',
-          name: 'other',
-          controller: 'https://other.controller.example.com',
+    await expect(
+      resolveControllerSession(
+        {
+          target: {
+            kind: 'controller',
+            name: 'other',
+            controller: 'https://other.controller.example.com',
+          },
         },
-      },
-      { env, fetch: mockFetch },
+        { env, fetch: mockFetch },
+      ),
+    ).rejects.toThrow(
+      'not logged in to https://other.controller.example.com; run: di-framework platform login --target other',
     );
-    expect(ctrlFallbackSession.credential.controller.url).toBe(
-      'https://other.controller.example.com',
+
+    await expect(
+      resolveControllerSession(
+        {
+          target: {
+            kind: 'controller',
+            name: 'other',
+            controller: 'https://other.controller.example.com',
+            account: 'acme',
+          },
+        },
+        { env, fetch: mockFetch },
+      ),
+    ).rejects.toThrow(
+      'credential for acme is for https://acme.controller.example.com, not https://other.controller.example.com; run: di-framework platform login --target other',
     );
 
     const noTargetSession = await resolveControllerSession(
@@ -921,7 +941,7 @@ platform = "deploy/platform"
     expect(revokeCalled).toBe(1);
     expect(readStore(env)).toEqual({});
 
-    // Re-login and logout via account target without domain, controller target with account, and unmatched controller target
+    // Re-login and logout via account target without domain, controller target with account, and unmatched controller target refusal
     await runWasmcloudLogin(
       ['--target', 'authproto-nodomain', '--api-key', 'dik_secret'],
       io,
@@ -932,14 +952,22 @@ platform = "deploy/platform"
       loggedOut: true,
     });
     await runWasmcloudLogin(['--target', 'direct-acct', '--api-key', 'dik_secret'], io, apiKeyDeps);
-    expect((await runWasmcloudLogout(['--target', 'direct-acct'], io, apiKeyDeps)).data).toEqual({
-      account: 'acme',
-      loggedOut: true,
+    await expect(
+      runWasmcloudLogout(['--target', 'direct-unmatched'], io, apiKeyDeps),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_CONTROLLER_AUTH_REQUIRED',
+      message:
+        'not logged in to https://unmatched.controller.authproto.example.com; run: di-framework platform login --target direct-unmatched',
     });
-    await runWasmcloudLogin(['--target', 'authproto', '--api-key', 'dik_secret'], io, apiKeyDeps);
-    expect(
-      (await runWasmcloudLogout(['--target', 'direct-unmatched'], io, apiKeyDeps)).data,
-    ).toEqual({
+    await expect(
+      runWasmcloudLogout(['--target', 'direct-unmatched', '--account', 'acme'], io, apiKeyDeps),
+    ).rejects.toMatchObject({
+      code: 'WASMCLOUD_CONTROLLER_AUTH_REQUIRED',
+      message:
+        'credential for acme is for https://acme.controller.authproto.example.com, not https://unmatched.controller.authproto.example.com; run: di-framework platform login --target direct-unmatched',
+    });
+    expect(readStore(env).acme?.account).toBe('acme');
+    expect((await runWasmcloudLogout(['--target', 'direct-acct'], io, apiKeyDeps)).data).toEqual({
       account: 'acme',
       loggedOut: true,
     });
@@ -1505,6 +1533,11 @@ export default () => new Response('ok');
       yes: false,
     });
     expectFailure(
+      () => parseAppCommandArgs(['--target', 'a', '--target', 'b'], 'platform deploy'),
+      'INVALID_USAGE',
+      2,
+    );
+    expectFailure(
       () => parseAppCommandArgs(['--env', 'invalid'], 'platform deploy'),
       'INVALID_USAGE',
       2,
@@ -1525,6 +1558,7 @@ export default () => new Response('ok');
       name: 'kv',
       env: 'staging',
     });
+    expect(summarizeService({}).className).toBe('');
     expectFailure(
       () => parseServiceCreateArgs(['keyvalue', '--name', 'kv', '--env', 'bad']),
       'INVALID_USAGE',

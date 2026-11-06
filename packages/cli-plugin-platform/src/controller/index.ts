@@ -59,6 +59,7 @@ export {
   refreshCredential,
   resolveAccount,
   resolveControllerSession,
+  resolveControllerTargetCredential,
   writeStore,
 } from './credentials';
 export {

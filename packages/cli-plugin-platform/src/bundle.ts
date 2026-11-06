@@ -129,12 +129,14 @@ export type ParsedBuildArgs = {
 export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
   if (args.length === 0) return {};
   const result: ParsedBuildArgs = {};
-  for (let i = 0; i < args.length; i++) {
+  let i = 0;
+  while (i < args.length) {
     const arg = args[i] as string;
     if (arg === '--bundle' || arg.startsWith('--bundle=')) {
       const value = arg === '--bundle' ? args[++i] : arg.slice('--bundle='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --bundle', arg);
       result.bundle = value;
+      i += 1;
       continue;
     }
     if (arg === '--env' || arg.startsWith('--env=')) {
@@ -143,24 +145,28 @@ export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
         invalidUsage('Invalid --env value; expected "prod" or "staging"', arg);
       }
       result.env = value;
+      i += 1;
       continue;
     }
     if (arg === '--target' || arg.startsWith('--target=')) {
       const value = arg === '--target' ? args[++i] : arg.slice('--target='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --target', arg);
       result.target = value;
+      i += 1;
       continue;
     }
     if (arg === '--registry' || arg.startsWith('--registry=')) {
       const value = arg === '--registry' ? args[++i] : arg.slice('--registry='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --registry', arg);
       result.registry = value;
+      i += 1;
       continue;
     }
     if (arg === '--tag' || arg.startsWith('--tag=')) {
       const value = arg === '--tag' ? args[++i] : arg.slice('--tag='.length);
       if (!value || value.startsWith('-')) invalidUsage('Missing value for --tag', arg);
       result.tag = value;
+      i += 1;
       continue;
     }
     if (arg.startsWith('-')) {
@@ -170,6 +176,7 @@ export function parseBuildArgs(args: readonly string[]): ParsedBuildArgs {
       invalidUsage(`Unexpected argument: ${arg}`, arg);
     }
     result.name = arg;
+    i += 1;
   }
   if (result.bundle === undefined) {
     const first = args[0] as string;
@@ -664,29 +671,14 @@ function collectDeploySecrets(
   return [...seen];
 }
 
-export async function buildDeployBundle(
-  options: BuildDeployBundleOptions = {},
-  io: CliIo,
-  deps: WasmcloudDeps = DEFAULT_DEPS,
-): Promise<DeployBundle> {
-  const startDir = options.project?.projectRoot ?? deps.cwd();
-  const hasExplicitRegistryOrPublish = Boolean(
-    options.registry !== undefined ||
-      options.publish !== undefined ||
-      options.credentials !== undefined,
-  );
-  const manifestConfig = loadBundleManifestConfig(startDir, deps.env, hasExplicitRegistryOrPublish);
-  const manifest = manifestConfig.manifest;
-
-  const project =
-    options.project ??
-    (manifest !== undefined && options.name !== undefined
-      ? resolveApplication(deps.cwd(), options.name, manifest.workspaceRoot, manifest.discovery)
-      : loadProject(deps.cwd()));
-
-  const resolvedCredentials =
-    typeof options.credentials === 'function' ? await options.credentials() : options.credentials;
-
+async function resolveBundleTargetAndConnection(
+  options: BuildDeployBundleOptions,
+  manifest: DeployManifest | undefined,
+  project: WasmcloudProject,
+  resolvedCredentials: BundleRegistryCredentials | undefined,
+  hasExplicitRegistryOrPublish: boolean,
+  deps: WasmcloudDeps,
+): Promise<{ target?: DeployTarget; effectiveConnection: ClusterConnection }> {
   let target: DeployTarget | undefined;
   let connection: ClusterConnection | undefined;
   const shouldResolveTarget = Boolean(
@@ -716,6 +708,53 @@ export async function buildDeployBundle(
           hostgroup: `tenant-${project.witName}`,
           registry: materializeRegistry(registryOverride ?? 'localhost:5000'),
         };
+  return { target, effectiveConnection };
+}
+
+function toComponentReference(published: PublishedImage | ComponentReference): ComponentReference {
+  if ('pullReference' in published && 'artifactDigest' in published) {
+    return {
+      reference: published.pullReference,
+      digest: normalizeSha256Digest(published.artifactDigest),
+    };
+  }
+  return {
+    reference: published.reference,
+    digest: normalizeSha256Digest(published.digest),
+  };
+}
+
+export async function buildDeployBundle(
+  options: BuildDeployBundleOptions = {},
+  io: CliIo,
+  deps: WasmcloudDeps = DEFAULT_DEPS,
+): Promise<DeployBundle> {
+  const startDir = options.project?.projectRoot ?? deps.cwd();
+  const hasExplicitRegistryOrPublish = Boolean(
+    options.registry !== undefined ||
+      options.publish !== undefined ||
+      options.credentials !== undefined,
+  );
+  const manifestConfig = loadBundleManifestConfig(startDir, deps.env, hasExplicitRegistryOrPublish);
+  const manifest = manifestConfig.manifest;
+
+  const project =
+    options.project ??
+    (manifest !== undefined && options.name !== undefined
+      ? resolveApplication(deps.cwd(), options.name, manifest.workspaceRoot, manifest.discovery)
+      : loadProject(deps.cwd()));
+
+  const resolvedCredentials =
+    typeof options.credentials === 'function' ? await options.credentials() : options.credentials;
+
+  const { target, effectiveConnection } = await resolveBundleTargetAndConnection(
+    options,
+    manifest,
+    project,
+    resolvedCredentials,
+    hasExplicitRegistryOrPublish,
+    deps,
+  );
 
   const env = options.env ?? target?.env ?? manifestConfig.env ?? 'prod';
   if (env !== 'prod' && env !== 'staging') {
@@ -741,13 +780,7 @@ export async function buildDeployBundle(
     ? await options.publish(publishContext)
     : await publishWithBundleOptions(publishContext);
 
-  const isPublishedImage = (value: PublishedImage | ComponentReference): value is PublishedImage =>
-    'pullReference' in value && 'artifactDigest' in value;
-  const rawDigest = isPublishedImage(published) ? published.artifactDigest : published.digest;
-  const component: ComponentReference = {
-    reference: isPublishedImage(published) ? published.pullReference : published.reference,
-    digest: normalizeSha256Digest(rawDigest),
-  };
+  const component = toComponentReference(published);
 
   const requirements = requirementsForProject(project, deps);
   const discoveredBindings = discoverBindings(project, deps);

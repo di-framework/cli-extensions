@@ -1,50 +1,57 @@
-import type { components, operations, paths } from './schema';
+import type {
+  AuthInfo,
+  ConfigList,
+  ControllerPath,
+  CreateServiceRequest,
+  DeployBundle,
+  Deployment,
+  DeploymentList,
+  DeploymentStats,
+  DeploymentsQuery,
+  DeployPlan,
+  Env,
+  LogEvent,
+  LogsQuery,
+  Principal,
+  Problem,
+  ProxyRequest,
+  ProxySession,
+  RegistryInfo,
+  RollbackRequest,
+  SecretList,
+  Service,
+  VarUnset,
+} from './schema';
 import { events } from './sse';
 
+export type {
+  AuthInfo,
+  ConfigList,
+  ControllerPath,
+  CreateServiceRequest,
+  DeployBundle,
+  Deployment,
+  DeploymentList,
+  DeploymentStats,
+  DeploymentsQuery,
+  DeployPlan,
+  Env,
+  LogEvent,
+  LogsQuery,
+  Principal,
+  Problem,
+  ProxyRequest,
+  ProxySession,
+  RegistryInfo,
+  RollbackRequest,
+  SecretList,
+  Service,
+  VarUnset,
+} from './schema';
 export { events, type SseEvent } from './sse';
 
-type Json<
-  Op extends keyof operations,
-  Status extends number,
-> = operations[Op]['responses'] extends {
-  [S in Status]: { content: { 'application/json': infer T } };
-}
-  ? T
-  : never;
-type Body<Op extends keyof operations> = operations[Op] extends {
-  requestBody: { content: { 'application/json': infer T } };
-}
-  ? T
-  : never;
-type Query<Op extends keyof operations> = operations[Op]['parameters'] extends {
-  query: infer Q;
-}
-  ? Q
-  : never;
-
-export type Env = Query<'deployments'>['env'];
-export type AuthInfo = components['schemas']['AuthInfo'];
-export type Principal = components['schemas']['Principal'];
-export type DeployBundle = Body<'deploy'>;
-export type DeployPlan = Json<'previewDeploy', 200>;
-export type Deployment = Json<'deploy', 202>;
-export type RegistryInfo = Json<'registry', 200>;
-export type DeploymentList = Json<'deployments', 200>;
-export type DeploymentStats = Json<'deploymentStats', 200>;
-export type RollbackRequest = Body<'rollback'>;
-export type CreateServiceRequest = Body<'createService'>;
-export type Service = Json<'createService', 201>;
-export type LogEvent = Json<'logs', 200>;
-export type LogsQuery = Query<'logs'>;
-export type SecretList = Json<'secrets', 200>;
-export type ConfigList = Json<'vars', 200>;
-export type VarUnset = Json<'unsetVar', 200>;
-export type ProxyRequest = Body<'proxy'>;
-export type ProxySession = Json<'proxy', 201>;
-export type Problem = components['schemas']['Problem'];
-
 /**
- * Every path the client calls, checked against the generated `paths` at compile time: an
+ * Every path the client calls, checked against `ControllerPath` at compile time: an
  * operation that leaves the contract stops the client from building.
  */
 const PATHS = {
@@ -66,7 +73,7 @@ const PATHS = {
   secret: '/v1/secrets/{name}',
   vars: '/v1/vars',
   var: '/v1/vars/{name}',
-} as const satisfies Record<string, keyof paths>;
+} as const satisfies Record<string, ControllerPath>;
 
 /** A non-2xx answer from the controller, carrying its problem details when it sent any. */
 export class ControllerError extends Error {
@@ -111,7 +118,8 @@ export function createClient(options: ClientOptions) {
       if (value !== undefined) search.set(key, String(value));
     }
     const qs = search.toString();
-    return `${base}${path}${qs ? `?${qs}` : ''}`;
+    const querySuffix = qs ? `?${qs}` : '';
+    return `${base}${path}${querySuffix}`;
   };
 
   const send = async (call: Call): Promise<Response> => {
@@ -173,8 +181,8 @@ export function createClient(options: ClientOptions) {
       }
     },
 
-    deployments: (query: Query<'deployments'>) =>
-      json<DeploymentList>({ method: 'GET', path: PATHS.deployments, query }),
+    deployments: (query: DeploymentsQuery) =>
+      json<DeploymentList>({ method: 'GET', path: PATHS.deployments, query: { ...query } }),
     deploymentStats: (env: Env) =>
       json<DeploymentStats>({ method: 'GET', path: PATHS.deploymentStats, query: { env } }),
     rollback: (request: RollbackRequest) =>

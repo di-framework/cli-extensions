@@ -47,8 +47,16 @@ export async function pkce(
   return { verifier, challenge: base64url(new Uint8Array(digest)) };
 }
 
+function trimTrailingSlashes(value: string): string {
+  let result = value;
+  while (result.endsWith('/')) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
+
 export async function discover(issuer: string, doFetch: Fetch = fetch): Promise<ProviderMetadata> {
-  const url = `${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`;
+  const url = `${trimTrailingSlashes(issuer)}/.well-known/openid-configuration`;
   const response = await doFetch(url);
   if (!response.ok)
     throw new OidcError(`discovery at ${issuer} answered ${response.status}`, response.status);
@@ -56,7 +64,7 @@ export async function discover(issuer: string, doFetch: Fetch = fetch): Promise<
   for (const field of ['issuer', 'authorization_endpoint', 'token_endpoint'] as const) {
     if (!metadata[field]) throw new OidcError(`discovery at ${issuer} lacks ${field}`);
   }
-  if (String(metadata.issuer).replace(/\/+$/, '') !== issuer.replace(/\/+$/, '')) {
+  if (trimTrailingSlashes(String(metadata.issuer)) !== trimTrailingSlashes(issuer)) {
     throw new OidcError(`discovery at ${issuer} names a different issuer`);
   }
   const origin = new URL(issuer).origin;

@@ -122,6 +122,14 @@ function isPlainHttpAllowedControllerHost(hostname: string): boolean {
   return hostname.endsWith('.svc') || hostname.endsWith('.svc.cluster.local');
 }
 
+function trimTrailingSlashes(value: string): string {
+  let result = value;
+  while (result.endsWith('/')) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
+
 /**
  * Validates and normalizes a tenant controller URL (without trailing slash).
  * Requires `https://`, or `http://` for loopback and in-cluster (`*.svc`) hosts only.
@@ -143,7 +151,7 @@ export function normalizeControllerUrl(value: string): string | undefined {
   if (url.protocol === 'http:' && !isPlainHttpAllowedControllerHost(hostname)) {
     return undefined;
   }
-  const path = url.pathname === '/' ? '' : url.pathname.replace(/\/+$/, '');
+  const path = url.pathname === '/' ? '' : trimTrailingSlashes(url.pathname);
   return `${url.origin}${path}`;
 }
 

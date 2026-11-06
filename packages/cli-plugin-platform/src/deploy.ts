@@ -1,5 +1,5 @@
 import type { CliIo, CommandResult } from '@di-framework/cli-extension';
-import { parseAppCommandArgs } from './args';
+import { type AppCommandOptions, parseAppCommandArgs } from './args';
 import { type BuildSummary, buildComponent, type ComponentOrigin } from './build';
 import { buildDeployBundle } from './bundle';
 import {
@@ -14,8 +14,16 @@ import {
 import { discoverScheduledJobs } from './cron';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { discoverProjects, resolveApplication } from './discovery';
-import { type DeployEnvironment, loadDeployManifest, tenantNamespace } from './manifest';
+import {
+  type AccountTarget,
+  type ControllerTarget,
+  type DeployEnvironment,
+  type DeployManifest,
+  loadDeployManifest,
+  tenantNamespace,
+} from './manifest';
 import { assertDistinctPgliteRoots } from './pglite';
+import type { WasmcloudProject } from './project';
 import { publishComponent } from './publish';
 import { materializeRegistry, type RegistryLocation } from './registry';
 import { isControllerBackedTarget, resolveConnection, resolveTarget } from './target';
@@ -52,6 +60,106 @@ export type WasmcloudDeployResult = Omit<CommandResult, 'data' | 'text'> & {
   text: string;
 };
 
+async function runControllerDeploy(
+  project: WasmcloudProject,
+  target: AccountTarget | ControllerTarget,
+  manifest: DeployManifest,
+  options: AppCommandOptions,
+  io: CliIo,
+  deps: WasmcloudDeps,
+): Promise<WasmcloudDeployResult> {
+  try {
+    const { credential, client } = await resolveControllerSession({ target }, deps);
+    const registryInfo = await client.registry();
+    const regOrigin = registryOrigin(registryInfo.url);
+    const username = registryUsername(registryInfo.username);
+    const env = options.env ?? target.env ?? manifest.env ?? 'prod';
+    const repository = registryInfo.repositoryPrefix
+      ? `${registryInfo.repositoryPrefix}/${project.witName}`
+      : project.witName;
+
+    io.stdout.write(
+      `Deploying ${project.applicationName} to target ${target.name} (${credential.account}/${env})...\n`,
+    );
+    const bundle = await buildDeployBundle(
+      {
+        project,
+        target: target.name,
+        env,
+        registry: regOrigin.origin,
+        credentials: {
+          username,
+          password: bearer(credential),
+          repository,
+        },
+      },
+      io,
+      deps,
+    );
+
+    const cronJobs = discoverScheduledJobs(project.projectRoot);
+    const namespace = tenantNamespace(credential.account);
+    const registry = materializeRegistry(regOrigin.origin);
+    const deploymentDigest = bundle.component.digest.replace(/^sha256:/, '');
+
+    if (options.preview) {
+      const plan = await client.previewDeploy(bundle);
+      const changesSummary =
+        plan.changes.length === 0
+          ? 'no changes'
+          : plan.changes.map((c) => `${c.kind} ${c.resource}/${c.name}`).join(', ');
+      const data: WasmcloudDeployData = {
+        application: project.applicationName,
+        target: target.name,
+        namespace,
+        registry,
+        image: bundle.component.reference,
+        publishedImage: bundle.component.reference,
+        digest: bundle.component.digest,
+        deploymentDigest,
+        service: bundle.service,
+        env,
+        account: credential.account,
+        controller: credential.controller.url,
+        preview: plan,
+      };
+      const text = `Previewed ${project.applicationName} in ${plan.env} (${credential.account}): ${changesSummary}.`;
+      return { data, text };
+    }
+
+    const deployment = await client.deploy(bundle);
+    const cronSummary = cronJobs.map((j) => ({
+      jobId: j.jobId,
+      schedule: j.schedule,
+      cronExpression: j.cronExpression,
+    }));
+    const data: WasmcloudDeployData = {
+      application: project.applicationName,
+      target: target.name,
+      namespace,
+      registry,
+      image: bundle.component.reference,
+      publishedImage: bundle.component.reference,
+      digest: bundle.component.digest,
+      deploymentDigest,
+      service: bundle.service,
+      env,
+      account: credential.account,
+      controller: credential.controller.url,
+      deployment,
+      ...(cronSummary.length > 0 ? { cronJobs: cronSummary } : {}),
+    };
+    const cronNote =
+      cronJobs.length > 0
+        ? ` Scheduled jobs (${cronJobs.length}): ${cronJobs.map((j) => j.jobId).join(', ')}`
+        : '';
+    const text = `Deployed ${project.applicationName} to ${target.name} (${credential.account}/${deployment.env}: ${deployment.id} ${deployment.status}, ${bundle.component.reference}).${cronNote}`;
+    return { data, text };
+  } catch (error) {
+    wrapControllerError(error);
+  }
+}
+
 export async function runWasmcloudDeploy(
   args: readonly string[],
   io: CliIo,
@@ -74,96 +182,7 @@ export async function runWasmcloudDeploy(
   }
 
   if (isControllerBackedTarget(target)) {
-    try {
-      const { credential, client } = await resolveControllerSession({ target }, deps);
-      const registryInfo = await client.registry();
-      const regOrigin = registryOrigin(registryInfo.url);
-      const username = registryUsername(registryInfo.username);
-      const env = options.env ?? target.env ?? manifest.env ?? 'prod';
-      const repository = registryInfo.repositoryPrefix
-        ? `${registryInfo.repositoryPrefix}/${project.witName}`
-        : project.witName;
-
-      io.stdout.write(
-        `Deploying ${project.applicationName} to target ${target.name} (${credential.account}/${env})...\n`,
-      );
-      const bundle = await buildDeployBundle(
-        {
-          project,
-          target: target.name,
-          env,
-          registry: regOrigin.origin,
-          credentials: {
-            username,
-            password: bearer(credential),
-            repository,
-          },
-        },
-        io,
-        deps,
-      );
-
-      const cronJobs = discoverScheduledJobs(project.projectRoot);
-      const namespace = tenantNamespace(credential.account);
-      const registry = materializeRegistry(regOrigin.origin);
-      const deploymentDigest = bundle.component.digest.replace(/^sha256:/, '');
-
-      if (options.preview) {
-        const plan = await client.previewDeploy(bundle);
-        const changesSummary =
-          plan.changes.length === 0
-            ? 'no changes'
-            : plan.changes.map((c) => `${c.kind} ${c.resource}/${c.name}`).join(', ');
-        const data: WasmcloudDeployData = {
-          application: project.applicationName,
-          target: target.name,
-          namespace,
-          registry,
-          image: bundle.component.reference,
-          publishedImage: bundle.component.reference,
-          digest: bundle.component.digest,
-          deploymentDigest,
-          service: bundle.service,
-          env,
-          account: credential.account,
-          controller: credential.controller.url,
-          preview: plan,
-        };
-        const text = `Previewed ${project.applicationName} in ${plan.env} (${credential.account}): ${changesSummary}.`;
-        return { data, text };
-      }
-
-      const deployment = await client.deploy(bundle);
-      const cronSummary = cronJobs.map((j) => ({
-        jobId: j.jobId,
-        schedule: j.schedule,
-        cronExpression: j.cronExpression,
-      }));
-      const data: WasmcloudDeployData = {
-        application: project.applicationName,
-        target: target.name,
-        namespace,
-        registry,
-        image: bundle.component.reference,
-        publishedImage: bundle.component.reference,
-        digest: bundle.component.digest,
-        deploymentDigest,
-        service: bundle.service,
-        env,
-        account: credential.account,
-        controller: credential.controller.url,
-        deployment,
-        ...(cronSummary.length > 0 ? { cronJobs: cronSummary } : {}),
-      };
-      const cronNote =
-        cronJobs.length > 0
-          ? ` Scheduled jobs (${cronJobs.length}): ${cronJobs.map((j) => j.jobId).join(', ')}`
-          : '';
-      const text = `Deployed ${project.applicationName} to ${target.name} (${credential.account}/${deployment.env}: ${deployment.id} ${deployment.status}, ${bundle.component.reference}).${cronNote}`;
-      return { data, text };
-    } catch (error) {
-      wrapControllerError(error);
-    }
+    return runControllerDeploy(project, target, manifest, options, io, deps);
   }
 
   const build = await buildComponent(project, io, deps, { deploy: true });

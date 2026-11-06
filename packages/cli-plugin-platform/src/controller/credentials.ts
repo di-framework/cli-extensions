@@ -142,6 +142,57 @@ export type ResolveControllerSessionOptions = {
   fresh?: boolean;
 };
 
+function resolveAccountTargetCredential(
+  target: AccountTarget,
+  account: string | undefined,
+  store: CredentialStore,
+  env: Record<string, string | undefined>,
+): { stored: Credential; controllerUrlOverride: string } {
+  const resolvedAccount = account ?? target.account;
+  const entry = store[resolvedAccount];
+  if (!entry) {
+    throw new CliError(
+      `not logged in to ${resolvedAccount}; run: di-framework platform login --target ${target.name}`,
+    );
+  }
+  const controllerUrlOverride = target.domain
+    ? discoverAccountControllerUrl(resolvedAccount, target.domain, env)
+    : entry.controller.url || discoverAccountControllerUrl(resolvedAccount, undefined, env);
+  return { stored: entry, controllerUrlOverride };
+}
+
+export function resolveControllerTargetCredential(
+  target: ControllerTarget,
+  account: string | undefined,
+  store: CredentialStore,
+): Credential {
+  const controllerUrl = target.controller.replace(/\/$/, '');
+  const accountHint = account ?? target.account;
+  if (accountHint !== undefined) {
+    const stored = store[accountHint];
+    if (!stored) {
+      throw new CliError(
+        `not logged in to ${accountHint}; run: di-framework platform login --target ${target.name}`,
+      );
+    }
+    if (stored.controller.url.replace(/\/$/, '') !== controllerUrl) {
+      throw new CliError(
+        `credential for ${accountHint} is for ${stored.controller.url}, not ${controllerUrl}; run: di-framework platform login --target ${target.name}`,
+      );
+    }
+    return stored;
+  }
+  const matched = Object.values(store).find(
+    (entry) => entry.controller.url.replace(/\/$/, '') === controllerUrl,
+  );
+  if (!matched) {
+    throw new CliError(
+      `not logged in to ${controllerUrl}; run: di-framework platform login --target ${target.name}`,
+    );
+  }
+  return matched;
+}
+
 export async function resolveControllerSession(
   options: ResolveControllerSessionOptions,
   deps: Pick<WasmcloudDeps, 'env' | 'fetch'>,
@@ -151,35 +202,16 @@ export async function resolveControllerSession(
   let controllerUrlOverride: string | undefined;
 
   if (options.target?.kind === 'account') {
-    const account = options.account ?? options.target.account;
-    const entry = store[account];
-    if (!entry) {
-      throw new CliError(
-        `not logged in to ${account}; run: di-framework platform login --target ${options.target.name}`,
-      );
-    }
-    stored = entry;
-    controllerUrlOverride = options.target.domain
-      ? discoverAccountControllerUrl(account, options.target.domain, deps.env)
-      : entry.controller.url || discoverAccountControllerUrl(account, undefined, deps.env);
+    const resolved = resolveAccountTargetCredential(
+      options.target,
+      options.account,
+      store,
+      deps.env,
+    );
+    stored = resolved.stored;
+    controllerUrlOverride = resolved.controllerUrlOverride;
   } else if (options.target?.kind === 'controller') {
-    const controllerUrl = options.target.controller.replace(/\/$/, '');
-    controllerUrlOverride = controllerUrl;
-    const explicitAccount = options.account ?? options.target.account;
-    if (explicitAccount !== undefined) {
-      const entry = store[explicitAccount];
-      if (!entry) {
-        throw new CliError(
-          `not logged in to ${explicitAccount}; run: di-framework platform login --target ${options.target.name}`,
-        );
-      }
-      stored = entry;
-    } else {
-      const matched = Object.values(store).find(
-        (entry) => entry.controller.url.replace(/\/$/, '') === controllerUrl,
-      );
-      stored = matched ?? load(resolveAccount(undefined, deps.env, store), deps.env);
-    }
+    stored = resolveControllerTargetCredential(options.target, options.account, store);
   } else {
     const account = resolveAccount(options.account, deps.env, store);
     stored = load(account, deps.env);
