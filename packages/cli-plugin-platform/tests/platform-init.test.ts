@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { runWasmcloudPlatformDeploy } from '../src/platform';
 import {
   createPlatformProjectName,
@@ -296,5 +297,74 @@ registry = "registry.example.com/team"
     expect(createPlatformProjectName(`/tmp/${'-'.repeat(10_000)}consumer`)).toMatch(
       /^di-framework-wasmcloud-consumer-[a-f0-9]{10}$/,
     );
+  });
+
+  it('scaffolds a nodenext tsconfig and kubeconfigs re-export that type-check cleanly', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'wasmcloud-init-typecheck-'));
+    await runWasmcloudPlatformInit([], captureIo().io, fakeDeps({ cwd: root, assets: ASSETS }));
+
+    const platform = join(root, 'deploy', 'platform');
+    const tsconfig = JSON.parse(readFileSync(join(platform, 'tsconfig.json'), 'utf8')) as {
+      compilerOptions: { module: string; moduleResolution: string };
+    };
+    expect(tsconfig.compilerOptions.module).toBe('nodenext');
+    expect(tsconfig.compilerOptions.moduleResolution).toBe('nodenext');
+
+    const indexTs = readFileSync(join(platform, 'index.ts'), 'utf8');
+    expect(indexTs).toContain(
+      "export { schemaVersion, kubeconfig, namespace, registry, endpoints, tenants, users, kubeconfigs } from '@di-framework/platform/local';",
+    );
+
+    const readme = readFileSync(join(platform, 'README.md'), 'utf8');
+    expect(readme).toContain(
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
+    );
+    expect(readme).toContain(
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:0ee414e9db4b0d4fc923eb477f1b1afd20f707b8ab3e552957575ff4f8e6a528',
+    );
+    expect(readme).not.toContain(
+      'ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669',
+    );
+    expect(readme).toContain('insecureRegistries');
+
+    const stubPkgDir = join(platform, 'node_modules', '@di-framework', 'platform');
+    mkdirSync(stubPkgDir, { recursive: true });
+    writeFileSync(
+      join(stubPkgDir, 'package.json'),
+      JSON.stringify({
+        name: '@di-framework/platform',
+        version: '0.0.0',
+        exports: {
+          './local': {
+            types: './local.d.ts',
+            default: './local.js',
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      join(stubPkgDir, 'local.d.ts'),
+      [
+        'export declare const schemaVersion: 2;',
+        'export declare const kubeconfig: unknown;',
+        'export declare const namespace: unknown;',
+        'export declare const registry: unknown;',
+        'export declare const endpoints: unknown;',
+        'export declare const tenants: unknown;',
+        'export declare const users: unknown;',
+        'export declare const kubeconfigs: unknown;',
+      ].join('\n'),
+    );
+
+    const parsed = ts.parseJsonConfigFileContent(tsconfig, ts.sys, platform);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.options.module).toBe(ts.ModuleKind.NodeNext);
+    expect(parsed.options.moduleResolution).toBe(ts.ModuleResolutionKind.NodeNext);
+
+    const program = ts.createProgram({
+      rootNames: parsed.fileNames,
+      options: { ...parsed.options, noEmit: true },
+    });
+    expect(ts.getPreEmitDiagnostics(program)).toEqual([]);
   });
 });

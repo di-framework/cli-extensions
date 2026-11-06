@@ -2,8 +2,8 @@
 
 This generated Pulumi project provisions platform resources only:
 
-- a pinned k0s controller/worker in a stack- and workspace-scoped Docker network;
-- stack-scoped Docker volumes for k0s state and pod logs;
+- a pinned k0s controller/worker in a stack- and workspace-scoped container network;
+- stack-scoped container volumes for k0s state and pod logs;
 - an in-cluster, pinned OCI registry exposed to the host only through loopback;
 - wasmCloud runtime operator 2.8.0 and its default HTTP host group;
 - a generic loopback HTTP entrypoint.
@@ -37,6 +37,33 @@ push address (`http://127.0.0.1:25000` by default) and cluster pull address
 (`di-framework-registry.wasmcloud.svc.cluster.local:5000`) reach the same
 registry content.
 
+## Container engine
+
+Docker is the default. To run the k0s container with Podman (or another
+Docker-compatible CLI on `PATH`), set `containerCli` before the first deployment:
+
+```sh
+pulumi config set containerCli podman
+```
+
+The value must be a plain command name or path. Resources stay owned by the
+engine that created them, so to switch engines destroy the platform first and
+deploy again; that removes cluster state.
+
+## Registry mirrors
+
+To pull images through a mirror (for example when Docker Hub is rate limited or
+unreachable from the container engine), set `registryMirrors` before the first
+deployment. It maps a registry host to an ordered list of mirror URLs; containerd
+tries each mirror and then the registry itself:
+
+```sh
+pulumi config set --path 'registryMirrors["docker.io"][0]' https://mirror.gcr.io
+```
+
+Unset means no mirrors. The `@di-framework/platform` README lists the accepted
+values. Changing mirrors later requires destroying and redeploying the platform.
+
 ## Output contract
 
 | Output | Meaning |
@@ -50,6 +77,7 @@ registry content.
 | `endpoints.kubernetes` | loopback API server URL |
 | `endpoints.registry` | loopback registry URL |
 | `endpoints.http` | loopback HTTP URL |
+| `kubeconfigs` | secret: `{ [tenant]: { [user]: kubeconfig } }`, one per user membership |
 
 ## Lifecycle
 
@@ -71,9 +99,14 @@ Send the configured project name as the HTTP `Host` header, for example:
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
-Platform destroy removes only Docker and Kubernetes resources bearing this
+`pulumi up` checks the platform configuration (tenants, users, route aliases,
+tenant auth, runtime NATS, insecure registries, the tenant host image) before it
+creates anything, so invalid configuration fails without creating the k0s
+container, network, or volumes.
+
+Platform destroy removes only container-engine and Kubernetes resources bearing this
 project/stack scope, along with the generated kubeconfig. It refuses to adopt
-or replace an already-existing Docker resource with the same name. Teardown
+or replace an already-existing container, network, or volume with the same name. Teardown
 uses the `kubectl` bundled in the scoped k0s container, so no host-side
 `kubectl` installation is needed for platform lifecycle commands.
 
@@ -107,8 +140,8 @@ are no additional platform CLI subcommands. Controller TypeScript is compiled to
 JavaScript when Pulumi builds its ConfigMap; no custom container build is needed.
 Run `bun run check` in this directory to check all generated TypeScript.
 
-Each tenant gets `di-tenant-<name>` for workloads and `di-runtime-<name>` for its
-host pool, Redis, and NATS. Host environments match the workload namespace, and
+Each tenant gets `di-tenant-<name>` for workloads, `di-runtime-<name>` for its
+host pool, Redis, and NATS, and `di-apikeys-<name>` for its API keys (no pods). Host environments match the workload namespace, and
 `allowSharedHosts` is false. Runtime certificates remain in the runtime namespace.
 Pulumi seeds these namespaces before Helm so the wasmCloud operator can watch
 host pods there; the controller then manages their resources and lifecycle.
@@ -119,7 +152,8 @@ objects. Increase `resources.cpu` and `resources.memory` when increasing
 `runtime.replicas`; these quotas cover runtime pods and aggregate
 `requests.storage` (50Gi hard) for stock and future `di-bs-*` backends, not
 individual Wasm invocations. Override concurrent service/binding counts with
-`resources.backingServices` / `resources.serviceBindings`.
+`resources.backingServices` / `resources.serviceBindings`. A tenant may hold
+1000 API keys; override with `resources.apiKeys` (1–10000).
 
 Users get a ServiceAccount in `wasmcloud` and tenant RoleBindings. Developers
 can manage WorkloadDeployments, `BackingService`, `ServiceBinding`, ConfigMaps,
@@ -135,19 +169,22 @@ tenant; the platform does **not** claim finer credential isolation. Admission
 still blocks CLI/API bypass for forged hostInterfaces and mutation of
 controller-managed config (see `@di-framework/platform` README).
 
-As administrator, use the platform kubeconfig to issue an expiring user token:
+Each membership gets a kubeconfig built from a controller-managed ServiceAccount
+token Secret (`di-user-<user>-<tenant>-token` in `wasmcloud`), with the loopback API
+server, the cluster CA, and the tenant workload namespace selected. Pulumi reads it
+once the User is Ready and exports it in the secret `kubeconfigs` output:
 
 ```sh
-export KUBECONFIG="$(pulumi stack output kubeconfig)"
-kubectl create token di-user-alice -n wasmcloud --duration=8h
+pulumi stack output kubeconfigs --show-secrets | jq -r '.warehouse.alice' > alice.kubeconfig
+chmod 600 alice.kubeconfig
 ```
 
-Build the user's kubeconfig with the same cluster server and CA from the admin
-kubeconfig, this token as its **only** credential, and the tenant workload namespace
-as its context namespace. Do not distribute the admin kubeconfig or its client
-certificate/key. Kubernetes may shorten the requested token lifetime. Tokens are
-never stored in User status or Pulumi outputs. The `users` output identifies the
-ServiceAccount; `tenants` identifies the namespaces and host group.
+The token is the kubeconfig's **only** credential; do not distribute the admin
+kubeconfig or its client certificate/key. `viewer` users get read-only access.
+The token does not expire: removing the membership or suspending the user deletes
+its Secret and invalidates it. Tokens are never stored in User status. The `users`
+output identifies the ServiceAccount; `tenants` identifies the namespaces and host
+group.
 
 Configure a deployment target with the user's kubeconfig and `tenant = "warehouse"`,
 which selects `namespace = "di-tenant-warehouse"` and `hostgroup = "tenant-warehouse"`:
@@ -171,8 +208,11 @@ For shared tenant keyvalue storage, reference the controller-managed ConfigMap
 services use ConfigMaps named `di-bs-*` and binding-projected Secrets/ConfigMaps
 named `di-binding-*` (#450/#451). The warehouse's HTTP, Redis, and NATS sync flow
 has been verified on wash 2.8.0. The platform default host image is
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`,
-which links `wasi:tls`. Native keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`,
+which links `wasi:tls` (and `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:0ee414e9db4b0d4fc923eb477f1b1afd20f707b8ab3e552957575ff4f8e6a528`
+adds the exclusive-instance patch); the tenant host pin PR moves it with each canonical host publish, so an
+install without `tenantHostImage` moves its tenant hosts on the first deploy of a release that
+contains that pin (set `tenantHostImage` to a digest to hold a build). Native keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
 in its external-cluster setup. Messaging uses the tenant's dedicated NATS backend.
 Tenant admission restricts native interfaces, forbids host volumes and guest
 network capabilities, and reserves `di-tenant-stock`, `di-bs-*`, and
@@ -202,6 +242,15 @@ registries, production storage, and stronger resource accounting are separate
 work. Namespace NetworkPolicies require an enforcing CNI (the generated k0s
 cluster uses kube-router). `tenantHostImage` and `tenantHostImagePullPolicy`
 override the default wasi-tls host image when a stack needs a different runtime.
+`insecureRegistry` gives only the platform host group `--allow-insecure-registries`;
+tenant hosts never run `--allow-insecure-registries` and instead get
+`--insecure-registry <host:port>` for the local platform registry (and each
+`insecureRegistries` entry on existing-cluster installs when `insecureRegistry`
+is enabled), so their other pulls stay TLS: an override image must be built
+with wash patch 0002 (see `platform/tenant-host/README.md` in the platform
+repository). `createPlatform` refuses the one published pre-0002 digest up front;
+other older builds (for example locally built images) reject that argument and
+the tenant hosts crash-loop.
 
 ## Shared implementation
 
@@ -213,7 +262,7 @@ changes belong in the shared package rather than copied tenancy files.
 Backing-service CRD contracts (`BackingServiceClass`, `BackingService`,
 `ServiceBinding`), authorization boundaries, and runtime feasibility notes live in
 the `@di-framework/platform` package README. Platform install seeds the approved
-default classes (`keyvalue-redis`, `messaging-nats`), retains CRDs on stack destroy,
+default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public`), retains CRDs on stack destroy,
 ships compiled controller scripts including `backing-services.js`, and enforces
 tenant RBAC / admission / quotas / backend NetworkPolicy isolation (#452).
 
