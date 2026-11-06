@@ -43,7 +43,11 @@ import {
 
 export const MANAGED_BY_LABEL = 'di-framework';
 export const WAIT_ATTEMPTS = 30;
+export const STORAGE_WAIT_ATTEMPTS = 90;
 export const WAIT_INTERVAL_MS = 2_000;
+export const DEFAULT_DEPLOY_TIMEOUT_SECONDS = 60;
+export const STORAGE_DEPLOY_TIMEOUT_SECONDS = 180;
+export const DEPLOY_TIMEOUT_ENV = 'DI_FRAMEWORK_DEPLOY_TIMEOUT_SECONDS';
 export const WORKLOAD_DEPLOYMENT_RESOURCE = 'workloaddeployment.runtime.wasmcloud.dev';
 export const WORKLOAD_REPLICA_SET_RESOURCE = 'workloadreplicaset.runtime.wasmcloud.dev';
 
@@ -800,7 +804,7 @@ function controlSecretWriteFailed(
   const stderr = sanitizePublicText(
     scrub.reduce((text, secret) => redact(text, secret), result.stderr).trim(),
   );
-  if (kubectlStatusReason(stderr) === 'Conflict') {
+  if (kubectlStatusReason(result.stderr) === 'Conflict') {
     return new CommandFailure(
       'WASMCLOUD_CONTROL_SECRET_CHANGED',
       `The control Secret ${name} in ${connection.namespace} changed while deploy was updating it; re-run deploy`,
@@ -877,11 +881,8 @@ export async function applyWorkload(
     cronJobs.length > 0 ||
     queueHandlers.length > 0 ||
     hasPersistentStorage;
-  const baseRequirements = needsHttp
-    ? defaultProjectRequirements()
-    : isWorker
-      ? queueProjectRequirements()
-      : [];
+  const workerRequirements = isWorker ? queueProjectRequirements() : [];
+  const baseRequirements = needsHttp ? defaultProjectRequirements() : workerRequirements;
   const requirements: WitRequirement[] = [
     ...baseRequirements,
     ...requirementsFromBindings(bindings),
@@ -937,7 +938,9 @@ export async function applyWorkload(
     await runKubectl(deps, connection, ['apply', '-f', path], project.projectRoot);
     await waitForReady(project, connection, deps, io);
   } catch (error) {
-    throw controlSecret?.revision === undefined ? error : withRotatedTokenNotice(error);
+    throw controlSecret?.revision === undefined
+      ? error
+      : withRotatedTokenNotice(error, hasPersistentStorage);
   }
   await cleanupManagedBindings(project, connection, associations, deps);
   if (egress === undefined) await removeWorkloadEgress(project, connection, deps);
@@ -950,13 +953,23 @@ export async function applyWorkload(
  * old token while its cron invokers (which read the Secret when they start) carry the new one,
  * so every cron invocation is refused until a deploy succeeds. Say so in the failure.
  */
-function withRotatedTokenNotice(error: unknown): unknown {
-  if (!isCommandFailure(error)) return error;
+function withRotatedTokenNotice(error: unknown, hasPersistentStorage = false): unknown {
+  if (!isCommandFailure(error)) {
+    if (error instanceof Error) {
+      error.message = `${error.message}; ${CONTROL_TOKEN_ROTATED_NOTICE}`;
+    }
+    return error;
+  }
   // Every failure on this path (kubectl, readiness) carries an object of details.
   const details = error.details as Record<string, JsonValue> | undefined;
+  const [headline = error.message] = error.message.split('. ');
+  const baseMessage =
+    !hasPersistentStorage && error.code === 'WASMCLOUD_DEPLOYMENT_NOT_READY'
+      ? headline
+      : error.message;
   return new CommandFailure(
     error.code,
-    `${error.message}; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
+    `${baseMessage}; ${CONTROL_TOKEN_ROTATED_NOTICE}`,
     error.exitCode,
     { ...details, controlTokenRotated: true },
   );
@@ -1030,14 +1043,51 @@ export async function deleteWorkload(
   await removeWorkloadEgress(project, connection, deps);
 }
 
+export function projectHasStorageOrPglite(
+  project: WasmcloudProject & { storage?: unknown },
+): boolean {
+  return (
+    project.pglite !== undefined ||
+    project.persistentStorage === true ||
+    project.storage !== undefined ||
+    project.actors === true ||
+    discoverActors(project).length > 0 ||
+    discoverQueueHandlers(project).length > 0
+  );
+}
+
+export function resolveDeployTimeoutSeconds(
+  project: WasmcloudProject & { storage?: unknown },
+  deps: Pick<WasmcloudDeps, 'env'>,
+  options?: { timeoutSeconds?: number },
+): number {
+  if (
+    options?.timeoutSeconds !== undefined &&
+    Number.isFinite(options.timeoutSeconds) &&
+    options.timeoutSeconds > 0
+  ) {
+    return Math.ceil(options.timeoutSeconds);
+  }
+  const raw = deps.env[DEPLOY_TIMEOUT_ENV] ?? process.env[DEPLOY_TIMEOUT_ENV];
+  if (raw !== undefined && /^[1-9]\d*$/.test(raw.trim())) {
+    return Number(raw.trim());
+  }
+  return projectHasStorageOrPglite(project)
+    ? STORAGE_DEPLOY_TIMEOUT_SECONDS
+    : DEFAULT_DEPLOY_TIMEOUT_SECONDS;
+}
+
 export async function waitForReady(
-  project: WasmcloudProject,
+  project: WasmcloudProject & { storage?: unknown },
   connection: ClusterConnection,
   deps: WasmcloudDeps,
   io?: CliIo,
+  options?: { timeoutSeconds?: number },
 ): Promise<void> {
   const name = deploymentResourceName(project);
-  for (let attempt = 0; attempt < WAIT_ATTEMPTS; attempt++) {
+  const timeoutSeconds = resolveDeployTimeoutSeconds(project, deps, options);
+  const attempts = Math.max(1, Math.ceil((timeoutSeconds * 1_000) / WAIT_INTERVAL_MS));
+  for (let attempt = 0; attempt < attempts; attempt++) {
     const result = await captureKubectl(
       deps,
       connection,
@@ -1048,19 +1098,24 @@ export async function waitForReady(
     await deps.wait(WAIT_INTERVAL_MS);
   }
   const diagnostics = await deploymentDiagnostics(project, connection, deps);
+  const recovery =
+    `The workload may still become Ready while the host finishes rolling; check status with ` +
+    `"kubectl get workloaddeployment ${name} -n ${connection.namespace}" or re-run ` +
+    `"di-framework platform deploy ${project.applicationName} --target ${connection.target}".`;
   if (io !== undefined) {
     io.stderr.write(
-      `WorkloadDeployment ${name} did not become ready. Kubernetes diagnostics follow:\n${diagnostics}\n`,
+      `WorkloadDeployment ${name} did not become ready. ${recovery} Kubernetes diagnostics follow:\n${diagnostics}\n`,
     );
   }
   throw new CommandFailure(
     'WASMCLOUD_DEPLOYMENT_NOT_READY',
-    `WorkloadDeployment ${name} in ${connection.namespace} did not become ready`,
+    `WorkloadDeployment ${name} in ${connection.namespace} did not become ready. ${recovery}`,
     3,
     {
       application: project.applicationName,
       namespace: connection.namespace,
       name,
+      timeoutSeconds,
       diagnostics,
     },
   );

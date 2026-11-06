@@ -17,7 +17,14 @@ import {
   withRouteUrls,
   workloadInTenantScope,
 } from '../src/console/catalog';
-import type { ConsoleCluster } from '../src/console/cluster';
+import {
+  type ConsoleCluster,
+  createKubectlConsoleCluster,
+  isPlatformManagedSecretName,
+  MANAGED_SECRET_DENIALS,
+  projectionSelector,
+  SECRET_UPDATE_KEYS_MESSAGE,
+} from '../src/console/cluster';
 import { platformSentence, sanitizePublicText } from '../src/console/errors';
 import { parseConsoleArgs, selectConsoleTenant } from '../src/console/run';
 import { startConsoleServer } from '../src/console/server';
@@ -1520,5 +1527,342 @@ registry = "registry.example.com/team"
     } finally {
       await server.close();
     }
+  });
+});
+
+describe('console kubectl cluster (#82, #59)', () => {
+  const clusterConn = {
+    target: 'warehouse',
+    kubeconfig: '/tmp/kubeconfig',
+    namespace: 'di-tenant-warehouse',
+    hostgroup: 'tenant-warehouse',
+    registry: { push: 'registry.example', pull: 'registry.example', insecure: false },
+  };
+
+  function makeCluster(
+    respond: (args: readonly string[]) => { exitCode?: number; stdout?: string; stderr?: string },
+  ) {
+    const logs: string[] = [];
+    const invocations: string[][] = [];
+    const base = fakeDeps({ cwd: '/tmp' });
+    const cluster = createKubectlConsoleCluster(
+      {
+        ...base,
+        runCaptured: async (_command, args) => {
+          invocations.push([...args]);
+          const result = respond(args);
+          return {
+            exitCode: result.exitCode ?? 0,
+            stdout: result.stdout ?? '',
+            stderr: result.stderr ?? '',
+          };
+        },
+      },
+      (line) => logs.push(line),
+    );
+    return { cluster, logs, invocations };
+  }
+
+  it('selects CLI projections with !platform.di-framework.dev/env and per-env projections when env is set (#82)', async () => {
+    expect(projectionSelector('logs', 'web')).toBe(
+      'di-framework.dev/projection=logs,di-framework.dev/application=web,!platform.di-framework.dev/env',
+    );
+    expect(projectionSelector('logs', 'web', 'prod')).toBe(
+      'di-framework.dev/projection=logs,di-framework.dev/application=web,platform.di-framework.dev/env=prod',
+    );
+    expect(projectionSelector('signals', 'web', 'staging')).toBe(
+      'di-framework.dev/projection=signals,di-framework.dev/application=web,platform.di-framework.dev/env=staging',
+    );
+
+    const { cluster, invocations } = makeCluster((args) => {
+      if (args.includes('configmap') && args.some((a) => a.includes('projection=logs'))) {
+        return {
+          stdout: JSON.stringify({
+            items: [{ data: { lines: 'cli-line-1\ncli-line-2', extra: 1 } }],
+          }),
+        };
+      }
+      return {
+        stdout: JSON.stringify({
+          items: [{ data: { success: '5', error: '1', compute: '10,20' } }],
+        }),
+      };
+    });
+
+    expect(await cluster.readLogs(clusterConn, 'web')).toEqual(['cli-line-1', 'cli-line-2']);
+    expect(invocations.at(-1)).toContain(
+      'di-framework.dev/projection=logs,di-framework.dev/application=web,!platform.di-framework.dev/env',
+    );
+
+    expect(await cluster.readLogs(clusterConn, 'web', 'prod')).toEqual([
+      'cli-line-1',
+      'cli-line-2',
+    ]);
+    expect(invocations.at(-1)).toContain(
+      'di-framework.dev/projection=logs,di-framework.dev/application=web,platform.di-framework.dev/env=prod',
+    );
+
+    expect(await cluster.readSignals(clusterConn, 'web')).toEqual({
+      success: 5,
+      error: 1,
+      compute: [10, 20],
+    });
+    expect(invocations.at(-1)).toContain(
+      'di-framework.dev/projection=signals,di-framework.dev/application=web,!platform.di-framework.dev/env',
+    );
+
+    expect(await cluster.readSignals(clusterConn, 'web', 'staging')).toEqual({
+      success: 5,
+      error: 1,
+      compute: [10, 20],
+    });
+    expect(invocations.at(-1)).toContain(
+      'di-framework.dev/projection=signals,di-framework.dev/application=web,platform.di-framework.dev/env=staging',
+    );
+  });
+
+  it('scrubs the submitted secret value and its base64 form from stderr before logging (#59 S9)', async () => {
+    const credentialValue = 'plain-secret-val';
+    const credentialBase64 = Buffer.from(credentialValue, 'utf8').toString('base64');
+    expect(isPlatformManagedSecretName('di-binding-db')).toBe(true);
+    expect(isPlatformManagedSecretName('db-password')).toBe(false);
+
+    const cases: Array<{ stderr: string; stdout?: string; status: number; code: string }> = [
+      {
+        stderr: `Error from server (NotFound): secrets "db-password" (${credentialValue} / ${credentialBase64}) not found`,
+        status: 404,
+        code: 'SECRET_NOT_FOUND',
+      },
+      {
+        stderr: `Error from server (Forbidden): ${SECRET_UPDATE_KEYS_MESSAGE} (${credentialValue} / ${credentialBase64})`,
+        status: 409,
+        code: 'SECRET_NOT_SINGLE_KEY',
+      },
+      {
+        stderr: `Error from server (Forbidden): ${MANAGED_SECRET_DENIALS[0]} (${credentialValue} / ${credentialBase64})`,
+        status: 403,
+        code: 'SECRET_MANAGED',
+      },
+      {
+        stderr: `The Secret "db-password" is invalid: type: Invalid value: "${credentialValue}": field is immutable (${credentialBase64})`,
+        status: 409,
+        code: 'SECRET_TYPE_MISMATCH',
+      },
+      {
+        stderr: `Error from server (Forbidden): User cannot update (${credentialValue} / ${credentialBase64})`,
+        status: 403,
+        code: 'WRITES_FORBIDDEN',
+      },
+      {
+        stderr: `Error from server (InternalError): echoed ${credentialValue} and ${credentialBase64}`,
+        status: 502,
+        code: 'REQUEST_FAILED',
+      },
+      {
+        stderr: '',
+        stdout: '',
+        status: 502,
+        code: 'REQUEST_FAILED',
+      },
+    ];
+
+    for (const entry of cases) {
+      const { cluster, logs } = makeCluster(() => ({
+        exitCode: 1,
+        stderr: entry.stderr,
+        stdout: entry.stdout ?? '',
+      }));
+      await expect(
+        cluster.reassignSecret(clusterConn, 'db-password', credentialValue),
+      ).rejects.toMatchObject({
+        status: entry.status,
+        code: entry.code,
+      });
+      const joined = logs.join('\n');
+      expect(joined).not.toContain(credentialValue);
+      expect(joined).not.toContain(credentialBase64);
+    }
+
+    const silentCluster = createKubectlConsoleCluster({
+      ...fakeDeps({ cwd: '/tmp' }),
+      runCaptured: async (_cmd, args) =>
+        args.includes('auth')
+          ? { exitCode: 1, stdout: '', stderr: 'auth failed' }
+          : { exitCode: 0, stdout: '', stderr: '' },
+    });
+    expect(await silentCluster.canWrite(clusterConn)).toBe(false);
+    await silentCluster.reassignSecret(clusterConn, 'db-password', credentialValue);
+    await expect(
+      silentCluster.reassignSecret(clusterConn, 'di-tenant-stock', credentialValue),
+    ).rejects.toMatchObject({ status: 403, code: 'SECRET_MANAGED' });
+  });
+
+  it('covers cluster operations, projections, route templates, failures, and bindings', async () => {
+    const listed = '{"items":[{"metadata":{"name":"greeter"}}]}';
+    const ok = makeCluster((args) => {
+      if (args.includes('auth')) return { stdout: 'yes\n' };
+      if (args.includes('di-platform-routes')) {
+        return { stdout: JSON.stringify({ data: { urlTemplate: 'http://{host}.local' } }) };
+      }
+      if (args.includes('configmap') && args.includes('di-framework.dev/projection=logs')) {
+        return {
+          stdout: JSON.stringify({
+            items: [
+              {
+                data: {
+                  failures: JSON.stringify({
+                    greeter: {
+                      workload: 'greeter-1',
+                      time: '2026-10-01T19:00:00Z',
+                      level: 'ERROR',
+                      message: 'failed',
+                    },
+                    older: {
+                      workload: 'older-1',
+                      time: '2026-10-01T18:00:00Z',
+                      level: 'WARN',
+                      message: 'warn',
+                    },
+                    bad: { workload: 1 },
+                  }),
+                },
+              },
+              {
+                data: {
+                  failures: JSON.stringify({
+                    greeter: {
+                      workload: 'greeter-2',
+                      time: '2026-10-01T20:00:00Z',
+                      level: 'WARN',
+                      message: 'newer',
+                    },
+                  }),
+                },
+              },
+              { data: { failures: '{' } },
+              { data: { failures: '[]' } },
+              { data: { failures: 1 } },
+            ],
+          }),
+        };
+      }
+      return { stdout: listed };
+    });
+
+    expect(await ok.cluster.listWorkloads(clusterConn)).toHaveLength(1);
+    expect(await ok.cluster.listBindings(clusterConn)).toHaveLength(1);
+    await ok.cluster.patchWorkload(clusterConn, 'greeter', []);
+    expect(await ok.cluster.canWrite(clusterConn)).toBe(true);
+    expect(await ok.cluster.readRouteTemplate(clusterConn)).toBe('http://{host}.local');
+    const failures = await ok.cluster.readFailures(clusterConn);
+    expect(failures.get('greeter')?.workload).toBe('greeter-2');
+    await ok.cluster.bindService(clusterConn, {
+      workload: 'greeter',
+      binding: 'orders-db',
+      service: 'orders',
+      capability: 'postgres',
+    });
+    await ok.cluster.unbindService(clusterConn, 'greeter', 'orders-db');
+
+    let egressCalls = 0;
+    const egressUnbind = makeCluster(() => {
+      egressCalls += 1;
+      return egressCalls === 1
+        ? { exitCode: 1, stderr: 'Error from server (NotFound): not found' }
+        : { exitCode: 0 };
+    });
+    await egressUnbind.cluster.unbindService(clusterConn, 'greeter', 'egress');
+    expect(egressCalls).toBe(2);
+
+    const notFoundUnbind = makeCluster(() => ({
+      exitCode: 1,
+      stderr: 'Error from server (NotFound): not found',
+    }));
+    await expect(
+      notFoundUnbind.cluster.unbindService(clusterConn, 'greeter', 'orders-db'),
+    ).rejects.toMatchObject({ status: 404 });
+    expect(await notFoundUnbind.cluster.readRouteTemplate(clusterConn)).toBeUndefined();
+    expect(await notFoundUnbind.cluster.readLogs(clusterConn, 'greeter')).toBeUndefined();
+    expect((await notFoundUnbind.cluster.readFailures(clusterConn)).size).toBe(0);
+    expect(await notFoundUnbind.cluster.listBindings(clusterConn)).toEqual([]);
+
+    const forbidden = makeCluster(() => ({
+      exitCode: 1,
+      stderr: 'Error from server (Forbidden): forbidden',
+    }));
+    await expect(forbidden.cluster.patchWorkload(clusterConn, 'greeter', [])).rejects.toMatchObject(
+      { status: 403 },
+    );
+    expect(await forbidden.cluster.canWrite(clusterConn)).toBe(false);
+
+    const genericFail = makeCluster(() => ({ exitCode: 1, stderr: '', stdout: '' }));
+    await expect(genericFail.cluster.listWorkloads(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+    await expect(genericFail.cluster.listBindings(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+    await expect(
+      genericFail.cluster.patchWorkload(clusterConn, 'greeter', []),
+    ).rejects.toMatchObject({ status: 502 });
+    expect(await genericFail.cluster.canWrite(clusterConn)).toBe(false);
+    expect(await genericFail.cluster.readRouteTemplate(clusterConn)).toBeUndefined();
+    await expect(genericFail.cluster.readLogs(clusterConn, 'greeter')).rejects.toMatchObject({
+      status: 502,
+    });
+    await expect(genericFail.cluster.readFailures(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+    await expect(
+      genericFail.cluster.unbindService(clusterConn, 'greeter', 'orders-db'),
+    ).rejects.toMatchObject({ status: 502 });
+
+    const invalidJson = makeCluster(() => ({ stdout: '{' }));
+    await expect(invalidJson.cluster.listWorkloads(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+    await expect(invalidJson.cluster.listBindings(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+    expect(await invalidJson.cluster.readRouteTemplate(clusterConn)).toBeUndefined();
+    await expect(invalidJson.cluster.readLogs(clusterConn, 'greeter')).rejects.toMatchObject({
+      status: 502,
+    });
+    await expect(invalidJson.cluster.readFailures(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+
+    const nonArrayItems = makeCluster(() => ({ stdout: '{"items":null}' }));
+    await expect(nonArrayItems.cluster.listBindings(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+    const noItemsKey = makeCluster(() => ({ stdout: '{}' }));
+    await expect(noItemsKey.cluster.listWorkloads(clusterConn)).rejects.toMatchObject({
+      status: 502,
+    });
+
+    const edgeProjections = makeCluster((args) => {
+      if (args.some((a) => a.includes('application=empty'))) return { stdout: '{"items":[]}' };
+      if (args.some((a) => a.includes('application=nodata')))
+        return { stdout: '{"items":[{"data":null}]}' };
+      if (args.some((a) => a.includes('application=nolines')))
+        return { stdout: '{"items":[{"data":{}}]}' };
+      if (args.some((a) => a.includes('application=badsignals')))
+        return { stdout: '{"items":[{"data":{"success":"abc","error":"1"}}]}' };
+      if (args.some((a) => a.includes('application=unsafe')))
+        return { stdout: '{"items":[{"data":{"success":"9007199254740993","error":"1"}}]}' };
+      return {
+        stdout: '{"items":[{"data":{"success":"1","error":"0","compute":"1,bad"}}]}',
+      };
+    });
+    expect(await edgeProjections.cluster.readLogs(clusterConn, 'empty')).toBeUndefined();
+    expect(await edgeProjections.cluster.readLogs(clusterConn, 'nodata')).toBeUndefined();
+    expect(await edgeProjections.cluster.readLogs(clusterConn, 'nolines')).toBeUndefined();
+    expect(await edgeProjections.cluster.readSignals(clusterConn, 'badsignals')).toBeUndefined();
+    expect(await edgeProjections.cluster.readSignals(clusterConn, 'unsafe')).toBeUndefined();
+    expect(await edgeProjections.cluster.readSignals(clusterConn, 'partial')).toEqual({
+      success: 1,
+      error: 0,
+    });
   });
 });
