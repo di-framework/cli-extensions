@@ -1,8 +1,11 @@
-import { invalidUsage, readOptionValue } from './support';
+import type { DeployEnvironment } from './manifest';
+import { invalidUsage, matchOption, readOptionValue } from './support';
 
 export type AppCommandOptions = {
   name?: string;
   target?: string;
+  env?: DeployEnvironment;
+  preview?: boolean;
   yes: boolean;
 };
 
@@ -15,31 +18,56 @@ export type PlatformCommandOptions = {
 export function parseAppCommandArgs(args: readonly string[], command: string): AppCommandOptions {
   let name: string | undefined;
   let target: string | undefined;
+  let env: DeployEnvironment | undefined;
+  let preview = false;
   let yes = false;
 
   for (let position = 0; position < args.length; position++) {
     const token = args[position] ?? '';
-    switch (token) {
-      case '--target':
-        if (target !== undefined) invalidUsage(`Option may be provided only once: ${token}`, token);
-        target = readOptionValue(args, ++position, token);
-        break;
-      case '--yes':
-        if (yes) invalidUsage(`Option may be provided only once: ${token}`, token);
-        yes = true;
-        break;
-      default:
-        if (token.startsWith('--')) {
-          invalidUsage(`Unknown option: ${token}`, token, { command });
-        }
-        if (name !== undefined) {
-          invalidUsage(`Unexpected argument: ${token}`, token, { command });
-        }
-        name = token;
+    const targetOpt = matchOption(args, position, token, '--target');
+    if (targetOpt) {
+      if (target !== undefined)
+        invalidUsage('Option may be provided only once: --target', '--target');
+      target = targetOpt.value;
+      position = targetOpt.consumedThrough;
+      continue;
     }
+    const envOpt = matchOption(args, position, token, '--env');
+    if (envOpt) {
+      if (env !== undefined) invalidUsage('Option may be provided only once: --env', '--env');
+      if (envOpt.value !== 'prod' && envOpt.value !== 'staging') {
+        invalidUsage('--env must be prod or staging', envOpt.value, { command });
+      }
+      env = envOpt.value;
+      position = envOpt.consumedThrough;
+      continue;
+    }
+    if (token === '--preview') {
+      if (preview) invalidUsage(`Option may be provided only once: ${token}`, token);
+      preview = true;
+      continue;
+    }
+    if (token === '--yes') {
+      if (yes) invalidUsage(`Option may be provided only once: ${token}`, token);
+      yes = true;
+      continue;
+    }
+    if (token.startsWith('--')) {
+      invalidUsage(`Unknown option: ${token}`, token, { command });
+    }
+    if (name !== undefined) {
+      invalidUsage(`Unexpected argument: ${token}`, token, { command });
+    }
+    name = token;
   }
 
-  return { name, target, yes };
+  return {
+    name,
+    target,
+    ...(env ? { env } : {}),
+    ...(preview ? { preview: true } : {}),
+    yes,
+  };
 }
 
 export type PlatformInitOptions = {

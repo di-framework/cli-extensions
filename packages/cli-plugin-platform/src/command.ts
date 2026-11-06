@@ -1,6 +1,14 @@
 import type { CommandNode } from '@di-framework/cli-extension';
 import { runWasmcloudBuild } from './build';
 import { runWasmcloudConsole } from './console/run';
+import {
+  runWasmcloudLogin,
+  runWasmcloudLogout,
+  runWasmcloudLogs,
+  runWasmcloudSecrets,
+  runWasmcloudVars,
+  runWasmcloudWhoami,
+} from './controller';
 import { runWasmcloudDeploy } from './deploy';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { runWasmcloudDestroy } from './destroy';
@@ -45,9 +53,12 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
       deploy: {
         description:
           'Build, publish, and apply a wasmCloud WorkloadDeployment for a project in di-framework.deploy.toml',
-        usage: 'di-framework platform deploy [name] [--target <name>] [--yes]',
+        usage:
+          'di-framework platform deploy [name] [--target <name>] [--env <prod|staging>] [--preview] [--yes]',
         options: [
           '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
+          '--env <prod|staging>  Deployment environment for account/controller targets (default: prod)',
+          '--preview  Preview deployment plan on account/controller targets without applying',
           '--yes  Accepted for compatibility; application deploy does not prompt',
         ],
         run: ({ args, io }) => runWasmcloudDeploy(args, io, deps),
@@ -55,12 +66,89 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
       destroy: {
         description:
           'Remove the generated WorkloadDeployment and Service for a project; does not destroy the platform',
-        usage: 'di-framework platform destroy [name] [--target <name>] [--yes]',
+        usage:
+          'di-framework platform destroy [name] [--target <name>] [--env <prod|staging>] [--yes]',
         options: [
           '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
+          '--env <prod|staging>  Deployment environment for account/controller targets (default: prod)',
           '--yes  Accepted for compatibility; application destroy does not prompt',
         ],
         run: ({ args, io }) => runWasmcloudDestroy(args, io, deps),
+      },
+      login: {
+        description: 'Log in to a tenant controller over /v1 (OIDC browser PKCE or API key)',
+        usage:
+          'di-framework platform login [--target <name>] [--controller <url>] [--account <tenant>] [--api-key <key>] [--ca-file <pem> | --no-ca] [--no-browser]',
+        options: [
+          '--target <name>  Account or controller target from di-framework.deploy.toml',
+          '--controller <url>  Explicit tenant controller URL',
+          '--account <tenant>  Tenant account name',
+          '--api-key <key>  Authenticate with a tenant API key instead of OIDC browser login',
+          '--ca-file <pem>  Trust a PEM certificate authority for the controller',
+          '--no-ca  Drop any previously stored certificate authority for the controller',
+          '--no-browser  Print the OIDC login URL without opening a browser',
+        ],
+        run: ({ args, io }) => runWasmcloudLogin(args, io, deps),
+      },
+      logout: {
+        description: 'Revoke and remove a stored tenant controller credential',
+        usage: 'di-framework platform logout [--target <name>] [--account <tenant>]',
+        options: [
+          '--target <name>  Account or controller target from di-framework.deploy.toml',
+          '--account <tenant>  Tenant account name',
+        ],
+        run: ({ args, io }) => runWasmcloudLogout(args, io, deps),
+      },
+      whoami: {
+        description: 'Show the authenticated user and role for a tenant controller credential',
+        usage: 'di-framework platform whoami [--target <name>] [--account <tenant>]',
+        options: [
+          '--target <name>  Account or controller target from di-framework.deploy.toml',
+          '--account <tenant>  Tenant account name',
+        ],
+        run: ({ args, io }) => runWasmcloudWhoami(args, io, deps),
+      },
+      logs: {
+        description: 'Read or follow service logs from the tenant controller over /v1',
+        usage:
+          'di-framework platform logs [service] [--service <name>] [--target <name>] [--account <tenant>] [--env <prod|staging>] [--deployment <id>] [--follow] [--since <dur>] [--tail <n>]',
+        options: [
+          '--service <name>  Service name (defaults to the current project service)',
+          '--target <name>  Account or controller target from di-framework.deploy.toml',
+          '--account <tenant>  Tenant account name',
+          '--env <prod|staging>  Deployment environment (default: prod)',
+          '--deployment <id>  Filter logs to one deployment ID',
+          '--follow  Follow log stream until disconnected',
+          '--since <dur>  Show logs since duration or timestamp',
+          '--tail <n>  Number of recent log lines to return',
+        ],
+        run: ({ args, io }) => runWasmcloudLogs(args, io, deps),
+      },
+      secrets: {
+        description: 'Manage environment secrets via the tenant controller /v1 API',
+        usage:
+          'di-framework platform secrets <list|set|update|unset> [name] [--target <name>] [--account <tenant>] [--env <prod|staging>] [--from-file <path|->] [--value <val>]',
+        options: [
+          '--target <name>  Account or controller target from di-framework.deploy.toml',
+          '--account <tenant>  Tenant account name',
+          '--env <prod|staging>  Deployment environment (default: prod)',
+          '--from-file <path|->  Read secret value from file or stdin (-)',
+          '--value <val>  Provide secret value directly',
+        ],
+        run: ({ args, io }) => runWasmcloudSecrets(args, io, deps),
+      },
+      vars: {
+        description: 'Manage environment variables via the tenant controller /v1 API',
+        usage:
+          'di-framework platform vars <list|set|update|unset> [name] [--target <name>] [--account <tenant>] [--env <prod|staging>] [--from-file <path|->] [--value <val>]',
+        options: [
+          '--target <name>  Account or controller target from di-framework.deploy.toml',
+          '--account <tenant>  Tenant account name',
+          '--env <prod|staging>  Deployment environment (default: prod)',
+          '--from-file <path|->  Read variable value from file or stdin (-)',
+          '--value <val>  Provide variable value directly',
+        ],
+        run: ({ args, io }) => runWasmcloudVars(args, io, deps),
       },
       cluster: {
         description: 'Initialize, provision, or tear down a managed wasmCloud platform target',

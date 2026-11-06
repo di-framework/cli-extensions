@@ -52,7 +52,27 @@ export type ExternalTarget = {
   secrets?: string[];
 };
 
-export type DeployTarget = ManagedTarget | ExternalTarget;
+export type AccountTarget = {
+  kind: 'account';
+  name: string;
+  account: string;
+  domain?: string;
+  env?: DeployEnvironment;
+  bindings?: ManifestBinding[];
+  secrets?: string[];
+};
+
+export type ControllerTarget = {
+  kind: 'controller';
+  name: string;
+  controller: string;
+  account?: string;
+  env?: DeployEnvironment;
+  bindings?: ManifestBinding[];
+  secrets?: string[];
+};
+
+export type DeployTarget = ManagedTarget | ExternalTarget | AccountTarget | ControllerTarget;
 
 export type DeployManifest = {
   path: string;
@@ -81,6 +101,50 @@ export function tenantNamespace(tenant: string): string {
 /** Host group the platform creates for a tenant. */
 export function tenantHostgroup(tenant: string): string {
   return `tenant-${tenant}`;
+}
+
+const DOMAIN_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const CONTROLLER_DOMAIN_PATTERN = new RegExp(
+  String.raw`^${DOMAIN_LABEL}(?:\.${DOMAIN_LABEL})*(?::([1-9][0-9]{0,4}))?$`,
+);
+const IPV6_HOST_PATTERN = /^\[[0-9a-f:.]+\]$/;
+
+/** Valid DNS domain (and optional port) used to derive `https://<account>.controller.<domain>`. */
+export function isControllerDomain(value: string): boolean {
+  const match = CONTROLLER_DOMAIN_PATTERN.exec(value);
+  if (match === null || value.length > 260) return false;
+  return match[1] === undefined || Number(match[1]) <= 65535;
+}
+
+function isPlainHttpAllowedControllerHost(hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '[::1]') return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  return hostname.endsWith('.svc') || hostname.endsWith('.svc.cluster.local');
+}
+
+/**
+ * Validates and normalizes a tenant controller URL (without trailing slash).
+ * Requires `https://`, or `http://` for loopback and in-cluster (`*.svc`) hosts only.
+ */
+export function normalizeControllerUrl(value: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
+  if (url.username || url.password || url.search || url.hash) return undefined;
+  const hostname = url.hostname.toLowerCase();
+  const validHost =
+    new RegExp(String.raw`^${DOMAIN_LABEL}(?:\.${DOMAIN_LABEL})*$`).test(hostname) ||
+    IPV6_HOST_PATTERN.test(hostname);
+  if (!validHost) return undefined;
+  if (url.protocol === 'http:' && !isPlainHttpAllowedControllerHost(hostname)) {
+    return undefined;
+  }
+  const path = url.pathname === '/' ? '' : url.pathname.replace(/\/+$/, '');
+  return `${url.origin}${path}`;
 }
 
 const ENV_TOKEN = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
@@ -293,6 +357,34 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     );
   }
   const registry = optionalRegistry(value.registry, `targets.${name}.registry`, manifestPath);
+  const account = optionalString(value.account, `targets.${name}.account`, manifestPath);
+  if (account !== undefined && !isTenantName(account)) {
+    manifestInvalid(
+      `targets.${name}.account must be a platform tenant name: 1-40 lowercase letters, digits, and single hyphens, starting with a letter (got "${account}")`,
+      { manifestPath, target: name, account },
+    );
+  }
+  const domain = optionalString(value.domain, `targets.${name}.domain`, manifestPath);
+  if (domain !== undefined && !isControllerDomain(domain)) {
+    manifestInvalid(`targets.${name}.domain must be a valid DNS domain (got "${domain}")`, {
+      manifestPath,
+      target: name,
+      domain,
+    });
+  }
+  const rawController = optionalString(
+    value.controller,
+    `targets.${name}.controller`,
+    manifestPath,
+  );
+  const controller =
+    rawController === undefined ? undefined : normalizeControllerUrl(rawController);
+  if (rawController !== undefined && controller === undefined) {
+    manifestInvalid(
+      `targets.${name}.controller must be an https:// URL (or http:// for loopback or in-cluster *.svc hosts)`,
+      { manifestPath, target: name, controller: rawController },
+    );
+  }
   const env = optionalDeployEnvironment(value.env, `targets.${name}.env`, manifestPath);
   const bindings = parseManifestBindings(value.bindings, `targets.${name}.bindings`, manifestPath);
   const secrets = parseManifestSecrets(value.secrets, `targets.${name}.secrets`, manifestPath);
@@ -307,6 +399,9 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     'registry',
     'hostgroup',
     'storage-hostgroup',
+    'account',
+    'controller',
+    'domain',
     'env',
     'bindings',
     'secrets',
@@ -314,7 +409,7 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
   const unknown = Object.keys(value).filter((key) => !known.has(key));
   if (unknown.length > 0) {
     manifestInvalid(
-      `Target "${name}" has unsupported fields: ${unknown.join(', ')}. Managed targets accept platform and stack; external targets accept kubeconfig, context, tenant, namespace, registry, hostgroup, and storage-hostgroup.`,
+      `Target "${name}" has unsupported fields: ${unknown.join(', ')}. Managed targets accept platform and stack; external targets accept kubeconfig, context, tenant, namespace, registry, hostgroup, and storage-hostgroup; tenant controller targets accept account, domain, and controller.`,
       { manifestPath, target: name, fields: unknown },
     );
   }
@@ -331,10 +426,36 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     namespace ? 'namespace' : undefined,
     registry ? 'registry' : undefined,
   ].filter((field): field is string => field !== undefined);
+  const controllerFields = [
+    account ? 'account' : undefined,
+    controller ? 'controller' : undefined,
+    domain ? 'domain' : undefined,
+  ].filter((field): field is string => field !== undefined);
 
   if (managedFields.length > 0 && externalFields.length > 0) {
     manifestInvalid(
       `Target "${name}" mixes managed-platform and kubeconfig fields (${[...managedFields, ...externalFields].join(', ')}). Use either platform (and optional stack), or kubeconfig + registry + tenant or namespace.`,
+      { manifestPath, target: name },
+    );
+  }
+
+  if (controllerFields.length > 0 && (managedFields.length > 0 || externalFields.length > 0)) {
+    manifestInvalid(
+      `Target "${name}" mixes controller/account fields with operator fields (${[...managedFields, ...externalFields, ...controllerFields].join(', ')}). Use account (and optional domain) or controller (and optional account) for tenant controller targets.`,
+      { manifestPath, target: name },
+    );
+  }
+
+  if (domain !== undefined && controller !== undefined) {
+    manifestInvalid(
+      `Target "${name}" sets domain with controller. domain is only valid on account targets without an explicit controller URL.`,
+      { manifestPath, target: name },
+    );
+  }
+
+  if (domain !== undefined && account === undefined) {
+    manifestInvalid(
+      `Target "${name}" sets domain without account. domain is only valid on account targets.`,
       { manifestPath, target: name },
     );
   }
@@ -351,6 +472,26 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     ...(bindings ? { bindings } : {}),
     ...(secrets ? { secrets } : {}),
   };
+
+  if (controller !== undefined) {
+    return {
+      kind: 'controller',
+      name,
+      controller,
+      ...(account ? { account } : {}),
+      ...bundleExtras,
+    };
+  }
+
+  if (account !== undefined) {
+    return {
+      kind: 'account',
+      name,
+      account,
+      ...(domain ? { domain } : {}),
+      ...bundleExtras,
+    };
+  }
 
   if (platform !== undefined) {
     return { kind: 'managed', name, platform, stack: stack ?? 'dev', ...bundleExtras };

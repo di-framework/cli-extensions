@@ -2,12 +2,18 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type CliIo, CommandFailure, type JsonValue } from '@di-framework/cli-extension';
+import { resolveControllerSession, wrapControllerError } from './controller';
 import { DEFAULT_DEPS, type WasmcloudDeps } from './deps';
 import { captureKubectl } from './kubernetes';
-import { loadDeployManifest } from './manifest';
+import { type DeployEnvironment, loadDeployManifest, tenantNamespace } from './manifest';
 import { isNamespace } from './namespace';
 import { invalidUsage, matchOption } from './support';
-import { type ClusterConnection, resolveConnection, resolveTarget } from './target';
+import {
+  type ClusterConnection,
+  isControllerBackedTarget,
+  resolveConnection,
+  resolveTarget,
+} from './target';
 
 export const BACKING_SERVICE_API_VERSION = 'platform.di-framework.dev/v1alpha1';
 export const BACKING_SERVICE_KIND = 'BackingService';
@@ -59,6 +65,7 @@ export type ServiceCreateOptions = {
   /** Egress only: hosts the workload may reach. */
   destinations?: string[];
   target?: string;
+  env?: DeployEnvironment;
   namespace?: string;
   context?: string;
   wait: boolean;
@@ -68,6 +75,7 @@ export type ServiceCreateOptions = {
 export type ServiceNameOptions = {
   name?: string;
   target?: string;
+  env?: DeployEnvironment;
   namespace?: string;
   context?: string;
 };
@@ -178,6 +186,7 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
   let className: string | undefined;
   let deletionPolicy: DeletionPolicy | undefined;
   let target: string | undefined;
+  let env: DeployEnvironment | undefined;
   let namespace: string | undefined;
   let context: string | undefined;
   let wait = false;
@@ -209,6 +218,18 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
         invalidUsage('Option may be provided only once: --target', '--target');
       target = targetOpt.value;
       position = targetOpt.consumedThrough;
+      continue;
+    }
+    const envOpt = matchOption(args, position, token, '--env');
+    if (envOpt) {
+      if (env !== undefined) invalidUsage('Option may be provided only once: --env', '--env');
+      if (envOpt.value !== 'prod' && envOpt.value !== 'staging') {
+        invalidUsage('--env must be prod or staging', envOpt.value, {
+          command: 'platform service create',
+        });
+      }
+      env = envOpt.value;
+      position = envOpt.consumedThrough;
       continue;
     }
     const namespaceOpt = matchOption(args, position, token, '--namespace');
@@ -315,6 +336,7 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
     className,
     deletionPolicy,
     target,
+    ...(env ? { env } : {}),
     namespace,
     context,
     wait,
@@ -327,6 +349,7 @@ export function parseServiceCreateArgs(args: readonly string[]): ServiceCreateOp
 export function parseServiceNameArgs(args: readonly string[], command: string): ServiceNameOptions {
   let name: string | undefined;
   let target: string | undefined;
+  let env: DeployEnvironment | undefined;
   let namespace: string | undefined;
   let context: string | undefined;
 
@@ -338,6 +361,16 @@ export function parseServiceNameArgs(args: readonly string[], command: string): 
         invalidUsage('Option may be provided only once: --target', '--target');
       target = targetOpt.value;
       position = targetOpt.consumedThrough;
+      continue;
+    }
+    const envOpt = matchOption(args, position, token, '--env');
+    if (envOpt) {
+      if (env !== undefined) invalidUsage('Option may be provided only once: --env', '--env');
+      if (envOpt.value !== 'prod' && envOpt.value !== 'staging') {
+        invalidUsage('--env must be prod or staging', envOpt.value, { command });
+      }
+      env = envOpt.value;
+      position = envOpt.consumedThrough;
       continue;
     }
     const namespaceOpt = matchOption(args, position, token, '--namespace');
@@ -365,7 +398,7 @@ export function parseServiceNameArgs(args: readonly string[], command: string): 
     name = token;
   }
 
-  return { name, target, namespace, context };
+  return { name, target, ...(env ? { env } : {}), namespace, context };
 }
 
 export function parseServiceListArgs(args: readonly string[]): ServiceListOptions {
@@ -742,6 +775,45 @@ export async function runWasmcloudServiceCreate(
 ) {
   const options = parseServiceCreateArgs(args);
   const { type, name } = validateCreateOptions(options);
+  const deployManifest = loadDeployManifest(deps.cwd(), deps.env);
+  const target = resolveTarget(deployManifest, options.target);
+
+  if (isControllerBackedTarget(target)) {
+    try {
+      const { credential, client } = await resolveControllerSession({ target }, deps);
+      const env = options.env ?? target.env ?? deployManifest.env ?? 'prod';
+      const created = await client.createService({
+        env,
+        type,
+        name,
+        className: options.className,
+        parameters: options.parameters,
+        deletionPolicy: options.deletionPolicy,
+        destinations: options.destinations,
+      });
+      const data = {
+        name: created.name,
+        type: created.type,
+        className: created.className,
+        env: created.env,
+        account: credential.account,
+        namespace: tenantNamespace(credential.account),
+        target: target.name,
+        ...(created.parameters ? { parameters: created.parameters } : {}),
+        ...(created.deletionPolicy ? { deletionPolicy: created.deletionPolicy } : {}),
+        ...(created.destinations ? { destinations: created.destinations } : {}),
+        wait: options.wait,
+        ready: 'True',
+        createdAt: created.createdAt,
+        resource: { apiVersion: BACKING_SERVICE_API_VERSION, kind: BACKING_SERVICE_KIND },
+      };
+      const text = `Created ${created.type} service ${created.name} (${created.className}) in ${created.env} (${credential.account}).`;
+      return { data, text };
+    } catch (error) {
+      wrapControllerError(error);
+    }
+  }
+
   const connection = await resolveServiceConnection(options, deps);
   const existing = await captureKubectl(
     deps,
@@ -919,6 +991,28 @@ export async function runWasmcloudServiceDelete(
       { command: 'platform service delete' },
     );
   }
+  const deployManifest = loadDeployManifest(deps.cwd(), deps.env);
+  const target = resolveTarget(deployManifest, options.target);
+  if (isControllerBackedTarget(target)) {
+    try {
+      const { credential, client } = await resolveControllerSession({ target }, deps);
+      const env = options.env ?? target.env ?? deployManifest.env ?? 'prod';
+      await client.deleteService(env, options.name);
+      const data = {
+        name: options.name,
+        env,
+        account: credential.account,
+        namespace: tenantNamespace(credential.account),
+        target: target.name,
+        deleted: true,
+      };
+      const text = `Deleted BackingService ${options.name} from ${env} (${credential.account}).`;
+      return { data, text };
+    } catch (error) {
+      wrapControllerError(error);
+    }
+  }
+
   const connection = await resolveServiceConnection(options, deps);
   let deletionPolicy: string | undefined;
   try {

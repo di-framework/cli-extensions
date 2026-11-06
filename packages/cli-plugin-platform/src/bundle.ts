@@ -43,7 +43,12 @@ import {
   registryUsesPlainHttp,
 } from './registry';
 import { invalidUsage, toolFailed } from './support';
-import { type ClusterConnection, resolveConnection, resolveTarget } from './target';
+import {
+  type ClusterConnection,
+  isControllerBackedTarget,
+  resolveConnection,
+  resolveTarget,
+} from './target';
 import { parseToml } from './toml';
 import { deploymentResourceName, renderWorkloadManifest } from './workload';
 
@@ -689,7 +694,9 @@ export async function buildDeployBundle(
   );
   if (manifest !== undefined && shouldResolveTarget) {
     target = resolveTarget(manifest, options.target);
-    connection = await resolveConnection(target, manifest.workspaceRoot, manifest.path, deps);
+    if (!isControllerBackedTarget(target)) {
+      connection = await resolveConnection(target, manifest.workspaceRoot, manifest.path, deps);
+    }
   }
 
   const registryOverride = options.registry ?? resolvedCredentials?.registry;
