@@ -22,7 +22,15 @@ export function createWasmcloudCommand(deps: WasmcloudDeps = DEFAULT_DEPS): Comm
     children: {
       build: {
         description: 'Bundle the app entry and componentize it for WASI HTTP',
-        usage: 'di-framework platform build',
+        usage:
+          'di-framework platform build [--bundle <out.json>] [--env <prod|staging>] [--target <name>] [--registry <registry>] [--tag <tag>] [name]',
+        options: [
+          '--bundle <out.json>  Build, push, and write a controller-compatible DeployBundle JSON file',
+          '--env <prod|staging>  Target deployment environment for --bundle (default: prod)',
+          '--target <name>  Deployment target from di-framework.deploy.toml (default: default-target)',
+          '--registry <registry>  OCI registry override when building a DeployBundle',
+          '--tag <tag>  OCI image tag override when building a DeployBundle',
+        ],
         run: ({ args, io }) => runWasmcloudBuild(args, io, deps),
       },
       dev: {

@@ -17,11 +17,23 @@ export type DiscoveryConfig = {
   exclude: string[];
 };
 
+export type DeployEnvironment = 'prod' | 'staging';
+
+export type ManifestBinding = {
+  name: string;
+  capability: string;
+  serviceName: string;
+  config?: Record<string, string>;
+};
+
 export type ManagedTarget = {
   kind: 'managed';
   name: string;
   platform: string;
   stack: string;
+  env?: DeployEnvironment;
+  bindings?: ManifestBinding[];
+  secrets?: string[];
 };
 
 export type ExternalTarget = {
@@ -35,6 +47,9 @@ export type ExternalTarget = {
   context?: string;
   hostgroup?: string;
   storageHostgroup?: string;
+  env?: DeployEnvironment;
+  bindings?: ManifestBinding[];
+  secrets?: string[];
 };
 
 export type DeployTarget = ManagedTarget | ExternalTarget;
@@ -45,6 +60,9 @@ export type DeployManifest = {
   defaultTarget?: string;
   discovery: DiscoveryConfig;
   targets: Record<string, DeployTarget>;
+  env?: DeployEnvironment;
+  bindings?: ManifestBinding[];
+  secrets?: string[];
 };
 
 /** Tenant names follow the platform's Tenant resource: a DNS label of at most 40 characters. */
@@ -122,6 +140,9 @@ export function parseDeployManifest(
   const interpolated = interpolateEnv(parsed, env, path) as Record<string, unknown>;
   const defaultTarget = optionalString(interpolated['default-target'], 'default-target', path);
   const discovery = parseDiscovery(interpolated.discovery, path);
+  const manifestEnv = optionalDeployEnvironment(interpolated.env, 'env', path);
+  const bindings = parseManifestBindings(interpolated.bindings, 'bindings', path);
+  const secrets = parseManifestSecrets(interpolated.secrets, 'secrets', path);
   const targetsValue = interpolated.targets;
   if (targetsValue === undefined) {
     manifestInvalid(`${DEPLOY_MANIFEST_NAME} must declare at least one [targets.<name>] table`, {
@@ -146,11 +167,18 @@ export function parseDeployManifest(
     );
   }
 
-  const knownKeys = new Set(['default-target', 'discovery', 'targets']);
+  const knownKeys = new Set([
+    'default-target',
+    'discovery',
+    'targets',
+    'env',
+    'bindings',
+    'secrets',
+  ]);
   const unknown = Object.keys(interpolated).filter((key) => !knownKeys.has(key));
   if (unknown.length > 0) {
     manifestInvalid(
-      `${DEPLOY_MANIFEST_NAME} has unsupported fields: ${unknown.join(', ')}. Valid fields are default-target, discovery, and targets.`,
+      `${DEPLOY_MANIFEST_NAME} has unsupported fields: ${unknown.join(', ')}. Valid fields are default-target, discovery, targets, env, bindings, and secrets.`,
       { manifestPath: path, fields: unknown },
     );
   }
@@ -161,6 +189,9 @@ export function parseDeployManifest(
     defaultTarget,
     discovery,
     targets,
+    ...(manifestEnv ? { env: manifestEnv } : {}),
+    ...(bindings ? { bindings } : {}),
+    ...(secrets ? { secrets } : {}),
   };
 }
 
@@ -262,6 +293,9 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     );
   }
   const registry = optionalRegistry(value.registry, `targets.${name}.registry`, manifestPath);
+  const env = optionalDeployEnvironment(value.env, `targets.${name}.env`, manifestPath);
+  const bindings = parseManifestBindings(value.bindings, `targets.${name}.bindings`, manifestPath);
+  const secrets = parseManifestSecrets(value.secrets, `targets.${name}.secrets`, manifestPath);
 
   const known = new Set([
     'platform',
@@ -273,6 +307,9 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     'registry',
     'hostgroup',
     'storage-hostgroup',
+    'env',
+    'bindings',
+    'secrets',
   ]);
   const unknown = Object.keys(value).filter((key) => !known.has(key));
   if (unknown.length > 0) {
@@ -309,8 +346,14 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     );
   }
 
+  const bundleExtras = {
+    ...(env ? { env } : {}),
+    ...(bindings ? { bindings } : {}),
+    ...(secrets ? { secrets } : {}),
+  };
+
   if (platform !== undefined) {
-    return { kind: 'managed', name, platform, stack: stack ?? 'dev' };
+    return { kind: 'managed', name, platform, stack: stack ?? 'dev', ...bundleExtras };
   }
 
   if (
@@ -345,6 +388,7 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
       ...(tenant ? { tenant } : {}),
       ...(resolvedHostgroup ? { hostgroup: resolvedHostgroup } : {}),
       ...(storageHostgroup ? { storageHostgroup } : {}),
+      ...bundleExtras,
     };
   }
 
@@ -352,6 +396,95 @@ function parseTarget(name: string, value: unknown, manifestPath: string): Deploy
     `Target "${name}" is empty. Set platform (and optional stack) for a managed Pulumi platform, or kubeconfig, registry, and tenant (or namespace) for an external cluster.`,
     { manifestPath, target: name },
   );
+}
+
+export function optionalDeployEnvironment(
+  value: unknown,
+  label: string,
+  manifestPath: string,
+): DeployEnvironment | undefined {
+  if (value === undefined) return undefined;
+  if (value !== 'prod' && value !== 'staging') {
+    manifestInvalid(`${label} must be "prod" or "staging"`, { manifestPath, field: label });
+  }
+  return value;
+}
+
+export function parseManifestSecrets(
+  value: unknown,
+  label: string,
+  manifestPath: string,
+): string[] | undefined {
+  const entries = optionalStringArray(value, label, manifestPath);
+  return entries === undefined ? undefined : [...new Set(entries)];
+}
+
+export function parseManifestBindings(
+  value: unknown,
+  label: string,
+  manifestPath: string,
+): ManifestBinding[] | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    manifestInvalid(`${label} must be a table of named bindings`, { manifestPath, field: label });
+  }
+  const result: ManifestBinding[] = [];
+  for (const [name, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) {
+      manifestInvalid(`${label}.${name} must be a table`, {
+        manifestPath,
+        field: `${label}.${name}`,
+      });
+    }
+    const known = new Set(['capability', 'service', 'serviceName', 'service-name', 'config']);
+    const unknown = Object.keys(entry).filter((key) => !known.has(key));
+    if (unknown.length > 0) {
+      manifestInvalid(`${label}.${name} has unsupported fields: ${unknown.join(', ')}`, {
+        manifestPath,
+        field: `${label}.${name}`,
+        fields: unknown,
+      });
+    }
+    const capability = optionalString(
+      entry.capability,
+      `${label}.${name}.capability`,
+      manifestPath,
+    );
+    if (capability === undefined) {
+      manifestInvalid(`${label}.${name}.capability is required`, {
+        manifestPath,
+        field: `${label}.${name}.capability`,
+      });
+    }
+    const serviceName =
+      optionalString(
+        entry.serviceName ?? entry['service-name'] ?? entry.service,
+        `${label}.${name}.serviceName`,
+        manifestPath,
+      ) ?? name;
+    let config: Record<string, string> | undefined;
+    if (entry.config !== undefined) {
+      if (
+        !isRecord(entry.config) ||
+        Object.values(entry.config).some((v) => typeof v !== 'string')
+      ) {
+        manifestInvalid(`${label}.${name}.config must be a table of string values`, {
+          manifestPath,
+          field: `${label}.${name}.config`,
+        });
+      }
+      if (Object.keys(entry.config).length > 0) {
+        config = { ...(entry.config as Record<string, string>) };
+      }
+    }
+    result.push({
+      name,
+      capability,
+      serviceName,
+      ...(config ? { config } : {}),
+    });
+  }
+  return result;
 }
 
 function optionalString(value: unknown, label: string, manifestPath: string): string | undefined {

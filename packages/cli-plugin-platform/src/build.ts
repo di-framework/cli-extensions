@@ -10,9 +10,15 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { type CliIo, CommandFailure, type CommandResult } from '@di-framework/cli-extension';
+import {
+  type CliIo,
+  CommandFailure,
+  type CommandResult,
+  type JsonValue,
+} from '@di-framework/cli-extension';
 import { discoverActors, renderActorsModule } from './actors';
 import { type BindingRecord, discoverBindings, requirementsFromBindings } from './bindings';
+import { buildDeployBundle, parseBuildArgs } from './bundle';
 import {
   type ComponentProvider,
   copyProviderWit,
@@ -48,7 +54,7 @@ import {
 import { loadProject, type WasmcloudProject } from './project';
 import { discoverQueueHandlers, isQueueWorkerProject } from './queues';
 import { renderQueuesModule } from './queues-module';
-import { invalidUsage, requireNodeBinary, toolFailed } from './support';
+import { requireNodeBinary, toolFailed } from './support';
 import {
   buildWitLock,
   COMPONENT_MODEL,
@@ -869,8 +875,24 @@ export async function runWasmcloudBuild(
   io: CliIo,
   deps: WasmcloudDeps = DEFAULT_DEPS,
 ): Promise<CommandResult> {
-  if (args.length > 0) {
-    invalidUsage(`platform build does not accept arguments: ${args[0]}`, args[0] ?? '');
+  const parsed = parseBuildArgs(args);
+  if (parsed.bundle !== undefined) {
+    const bundle = await buildDeployBundle(
+      {
+        outputPath: parsed.bundle,
+        env: parsed.env,
+        target: parsed.target,
+        registry: parsed.registry,
+        tag: parsed.tag,
+        name: parsed.name,
+      },
+      io,
+      deps,
+    );
+    return {
+      data: bundle as unknown as JsonValue,
+      text: `Wrote DeployBundle for ${bundle.service} (${bundle.env}) to ${parsed.bundle}`,
+    };
   }
   const project = loadProject(deps.cwd());
   const summary = await buildComponent(project, io, deps);

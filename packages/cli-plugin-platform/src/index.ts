@@ -41,6 +41,25 @@ export {
   WASI_HTTP_INTERFACE,
   WASI_HTTP_VERSION,
 } from './build';
+export {
+  type BuildDeployBundleOptions,
+  type BundlePublishContext,
+  type BundleRegistryCredentials,
+  buildDeployBundle,
+  type ComponentReference,
+  type DeployBinding,
+  type DeployBundle,
+  type DeployEnvironment,
+  type ManifestBinding,
+  normalizeSha256Digest,
+  PASSTHROUGH_LABEL_PREFIX,
+  type ParsedBuildArgs,
+  parseBuildArgs,
+  parseWorkloadDeploymentYaml,
+  pinImageToDigest,
+  type SanitizeWorkloadOptions,
+  sanitizeWorkloadForBundle,
+} from './bundle';
 export { createWasmcloudCommand } from './command';
 export { runWasmcloudConsole } from './console/run';
 export {
